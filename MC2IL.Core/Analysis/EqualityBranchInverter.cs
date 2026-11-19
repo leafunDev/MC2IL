@@ -35,6 +35,11 @@ public static class EqualityBranchInverter
         && IsUnityObjectType(method.DeclaringType)
         && ReferenceEquals(method.Parameters[0].ParameterType, method.DeclaringType);
 
+    internal static bool IsUnityObjectComparison(MethodAnalysisContext method) =>
+        method is { Name: "op_Equality" or "op_Inequality", IsStatic: true, ReturnType.FullName: "System.Boolean", Parameters.Count: 2 }
+        && IsUnityObjectType(method.DeclaringType)
+        && method.Parameters.All(parameter => ReferenceEquals(parameter.ParameterType, method.DeclaringType));
+
     private static bool IsUnityObjectType(TypeAnalysisContext? type) =>
         type is { FullName: "UnityEngine.Object", DeclaringAssembly.CleanAssemblyName: "UnityEngine.CoreModule" or "UnityEngine" };
 

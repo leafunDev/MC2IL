@@ -752,7 +752,7 @@ public static class IlGenerator
         return true;
     }
 
-    private static bool IsManagedReference(TypeAnalysisContext type) =>
+    internal static bool IsManagedReference(TypeAnalysisContext type) =>
         !type.IsValueType && type is not (GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext
             or PointerTypeAnalysisContext or RuntimeClassTypeAnalysisContext
             or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext

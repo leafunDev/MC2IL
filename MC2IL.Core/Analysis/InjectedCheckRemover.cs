@@ -19,7 +19,7 @@ public static class InjectedCheckRemover
     private static void Run(ISILControlFlowGraph cfg, bool removeNullChecks, bool removeBoundsChecks,
         IEnumerable<LocalVariable>? parameters = null)
     {
-        var defOf = BuildDefMap(cfg, parameters);
+        var defOf = BuildDefMap(cfg, parameters, out var stableParameters);
         var ignoredExceptionConstructions = FindUnusedExceptionConstructions(cfg);
         var removedAny = false;
 
@@ -55,7 +55,7 @@ public static class InjectedCheckRemover
 
             if (terminator.Operands[1] is not LocalVariable condition
                 || !defOf.TryGetValue(condition, out var definition)
-                || !IsInjectedCheck(block, definition, thrown, throwOnTrue, defOf, throwOnTrue ? falseTarget : trueTarget,
+                || !IsInjectedCheck(block, definition, thrown, throwOnTrue, defOf, stableParameters, throwOnTrue ? falseTarget : trueTarget,
                     removeNullChecks, removeBoundsChecks))
                 continue;
 
@@ -82,7 +82,7 @@ public static class InjectedCheckRemover
     }
 
     private static bool IsInjectedCheck(Block checkedBlock, Instruction definition, InjectedThrow thrown, bool throwOnTrue,
-        Dictionary<LocalVariable, Instruction> defOf, Block continuation,
+        Dictionary<LocalVariable, Instruction> defOf, HashSet<LocalVariable> stableParameters, Block continuation,
         bool removeNullChecks, bool removeBoundsChecks)
     {
         if (IsNullComparison(definition, out var receiver) && IsNullEdge(definition.OpCode, throwOnTrue)
@@ -102,7 +102,7 @@ public static class InjectedCheckRemover
                         knownNonNullThis: knownNonNullThis)
                     || thrown.ExceptionType == "System.NullReferenceException"
                     && (IsObjectAllocationCheck(checkedBlock, definition, continuation, receiver, defOf)
-                        || IsAlreadyCheckedByUnity(checkedBlock, receiver, defOf)));
+                        || HasEarlierNonNullCheck(checkedBlock, definition, receiver, defOf, stableParameters)));
         }
 
         return removeBoundsChecks && thrown.ExceptionType == "System.IndexOutOfRangeException"
@@ -143,31 +143,86 @@ public static class InjectedCheckRemover
                 pointer => defOf.TryGetValue(pointer, out var def) ? def : null, []) != null;
     }
 
-    private static bool IsAlreadyCheckedByUnity(Block guard, IOperand receiver,
-        Dictionary<LocalVariable, Instruction> defOf)
+    private static bool HasEarlierNonNullCheck(Block block, Instruction comparison, IOperand receiver,
+        Dictionary<LocalVariable, Instruction> defOf, HashSet<LocalVariable> stableParameters)
     {
-        // A successful Unity conversion proves this captured reference is nonnull.
-        // A fresh field read can produce a different reference.
-        if (receiver is not LocalVariable local || !defOf.ContainsKey(local)
-            || guard.Predecessors is not [var previous]
-            || previous.Successors.Count != 2
-            || previous.Instructions.LastOrDefault() is not
-                { OpCode: OpCode.ConditionalJump, Operands: [Block taken, LocalVariable condition] }
-            || !defOf.TryGetValue(condition, out var test))
+        if (comparison.Operands.Count != 3
+            || receiver is not LocalVariable { Type: { } type } local || !IlGenerator.IsManagedReference(type)
+            || !defOf.ContainsKey(local) && !stableParameters.Contains(local))
             return false;
 
-        var expectsTrue = ReferenceEquals(taken, guard);
-        if (test is { OpCode: OpCode.Not, Operands: [_, LocalVariable original] })
+        var index = block.Instructions.IndexOf(comparison);
+        if (index < 0)
+            return false;
+
+        // Follow only paths with no alternate entry to the current guard. A reload,
+        // assignment, or addressable local can invalidate an earlier null check.
+        var visited = new HashSet<Block>();
+        for (var remaining = 12; remaining > 0 && visited.Add(block); remaining--)
         {
-            if (!defOf.TryGetValue(original, out test))
+            for (var i = index - 1; i >= 0; i--)
+                if (ReferenceEquals(block.Instructions[i].Destination, local))
+                    return false;
+
+            if (block.Predecessors is not [var previous] || visited.Contains(previous))
                 return false;
-            expectsTrue = !expectsTrue;
+
+            if (previous.Successors.Count == 2 && previous.Successors.Contains(block)
+                && previous.Instructions.LastOrDefault() is
+                    { OpCode: OpCode.ConditionalJump, Operands: [Block taken, LocalVariable condition] }
+                && previous.Successors.Contains(taken)
+                && IsNonNullEdge(previous, condition, taken == block, local, defOf))
+                return true;
+
+            block = previous;
+            index = block.Instructions.Count;
         }
 
-        return expectsTrue
-            && test is { OpCode: OpCode.Call, Operands: [MethodAnalysisContext conversion, _, LocalVariable argument, ..] }
-            && ReferenceEquals(argument, local)
-            && EqualityBranchInverter.IsUnityObjectBooleanConversion(conversion);
+        return false;
+    }
+
+    private static bool IsNonNullEdge(Block block, LocalVariable condition, bool truth, LocalVariable receiver,
+        Dictionary<LocalVariable, Instruction> defOf)
+    {
+        // Evaluate definitions in this block in execution order. Never infer a fact
+        // from another branch or from a receiver overwritten after the comparison.
+        for (var i = block.Instructions.Count - 2; i >= 0; i--)
+        {
+            var instruction = block.Instructions[i];
+            if (ReferenceEquals(instruction.Destination, receiver))
+                return false;
+
+            if (!defOf.TryGetValue(condition, out var definition) || instruction != definition)
+                continue;
+
+            if (instruction is { OpCode: OpCode.Not, Operands: [_, LocalVariable { Type.FullName: "System.Boolean" } inner] })
+            {
+                condition = inner;
+                truth = !truth;
+                continue;
+            }
+
+            if (instruction.Operands.Count == 3
+                && IsNullComparison(instruction, out var compared) && ReferenceEquals(compared, receiver))
+                return !IsNullEdge(instruction.OpCode, truth);
+
+            if (instruction is { OpCode: OpCode.Call, Operands: [MethodAnalysisContext called, _, var left, ..] })
+            {
+                if (EqualityBranchInverter.IsUnityObjectBooleanConversion(called))
+                    return truth && ReferenceEquals(left, receiver);
+                if (EqualityBranchInverter.IsUnityObjectComparison(called) && instruction.Operands.Count == 4)
+                {
+                    var right = instruction.Operands[3];
+                    return truth == (called.Name == "op_Inequality")
+                        && (ReferenceEquals(left, receiver) && right is Immediate { Value: 0 }
+                            || ReferenceEquals(right, receiver) && left is Immediate { Value: 0 });
+                }
+            }
+
+            return false;
+        }
+
+        return false;
     }
 
     private static LocalVariable? GetCheckedReceiverOwner(Block block, Instruction comparison, IOperand receiver,
@@ -611,15 +666,17 @@ public static class InjectedCheckRemover
     }
 
     private static Dictionary<LocalVariable, Instruction> BuildDefMap(ISILControlFlowGraph cfg,
-        IEnumerable<LocalVariable>? parameters)
+        IEnumerable<LocalVariable>? parameters, out HashSet<LocalVariable> stableParameters)
     {
         var defs = new Dictionary<LocalVariable, Instruction>();
-        var unstable = parameters != null ? new HashSet<LocalVariable>(parameters) : [];
+        stableParameters = parameters != null ? new HashSet<LocalVariable>(parameters) : [];
+        var unstable = new HashSet<LocalVariable>(stableParameters);
 
         foreach (var instruction in cfg.Instructions)
         {
             if (instruction.Destination is LocalVariable local)
             {
+                stableParameters.Remove(local);
                 if (defs.ContainsKey(local))
                     unstable.Add(local);
                 else
@@ -628,7 +685,10 @@ public static class InjectedCheckRemover
             foreach (var operand in instruction.Operands)
             {
                 if (operand is AddressOf { Target: LocalVariable addressed })
+                {
                     unstable.Add(addressed);
+                    stableParameters.Remove(addressed);
+                }
             }
         }
 
