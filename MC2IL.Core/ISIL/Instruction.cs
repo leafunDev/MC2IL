@@ -20,6 +20,9 @@ public class Instruction : IOperand
     // Number of bytes read or written by a native load/store, when known.
     public int? MemoryAccessSize;
 
+    // This immediate address came from a PC-relative native instruction, not an integer literal.
+    public bool IsPcRelativeAddress;
+
     // A removed native receiver guard must still be enforced by the emitted CIL call.
     public bool NullCheckReceiver;
 

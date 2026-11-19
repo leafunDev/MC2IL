@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
@@ -594,6 +595,54 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
             throw new InvalidOperationException($"No file-backed Elf PHT segment contains raw address 0x{offset:X}");
 
         return 0;
+    }
+
+    // Read all bytes from one file-backed load segment. RELRO/GOT slots can be changed by
+    // the loader, so they are excluded along with every other writable segment.
+    public bool TryReadReadOnlyScalar(ulong address, int size, out ulong bits)
+    {
+        const ulong dfTextRel = 4;
+        bits = 0;
+        if (size is not (sizeof(uint) or sizeof(ulong)) || address > ulong.MaxValue - (uint)size
+            || _dynamicSection.Any(entry => entry.Tag == ElfDynamicType.DT_TEXTREL
+                || entry.Tag == ElfDynamicType.DT_FLAGS && (entry.Value & dfTextRel) != 0))
+            return false;
+
+        ulong? raw = null;
+        foreach (var segment in _elfProgramHeaderEntries)
+        {
+            if (segment.Type != ElfProgramEntryType.PT_LOAD || segment.VirtualSize == 0
+                || address + (uint)size <= segment.VirtualAddress
+                || address >= segment.VirtualAddress && address - segment.VirtualAddress >= segment.VirtualSize)
+                continue;
+
+            if ((segment.Flags & ElfProgramHeaderFlags.PF_W) != 0)
+                return false;
+            if ((segment.Flags & ElfProgramHeaderFlags.PF_R) == 0 || address < segment.VirtualAddress)
+                continue;
+
+            var offset = address - segment.VirtualAddress;
+            if (segment.VirtualSize - offset < (uint)size || offset >= segment.RawSize
+                || segment.RawSize - offset < (uint)size || segment.RawAddress > ulong.MaxValue - offset)
+                continue;
+
+            var candidate = segment.RawAddress + offset;
+            if (candidate >= (ulong)_raw.LongLength || (ulong)_raw.LongLength - candidate < (uint)size)
+                continue;
+            if (raw is { } previous && previous != candidate)
+                return false;
+            raw = candidate;
+        }
+
+        if (raw is not { } rawAddress)
+            return false;
+
+        var bytes = _raw.AsSpan((int)rawAddress, size);
+        var bigEndian = _elfFileIdent?.Endianness == 2;
+        bits = size == sizeof(uint)
+            ? bigEndian ? BinaryPrimitives.ReadUInt32BigEndian(bytes) : BinaryPrimitives.ReadUInt32LittleEndian(bytes)
+            : bigEndian ? BinaryPrimitives.ReadUInt64BigEndian(bytes) : BinaryPrimitives.ReadUInt64LittleEndian(bytes);
+        return true;
     }
 
     public override byte GetByteAtRawAddress(ulong addr) => _raw[addr];

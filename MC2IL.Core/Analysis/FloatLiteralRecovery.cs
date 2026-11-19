@@ -1,5 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
+using LibMC2IL.Elf;
+using MC2IL.Core.InstructionSets;
 using MC2IL.Core.ISIL;
 using MC2IL.Core.Model.Contexts;
 
@@ -11,6 +14,42 @@ namespace MC2IL.Core.Analysis;
 /// </summary>
 public static class FloatLiteralRecovery
 {
+    internal static void RecoverNativeLoads(MethodAnalysisContext method)
+    {
+        if (method.AppContext.Binary is not ElfFile elf || method.AppContext.InstructionSet is not NewArmV8InstructionSet)
+            return;
+
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var addresses = new Dictionary<LocalVariable, long>();
+        foreach (var instruction in instructions)
+            if (instruction is { OpCode: OpCode.Move, IsPcRelativeAddress: true,
+                    Operands: [LocalVariable destination, Immediate address] })
+                addresses.Add(destination, address.Value);
+
+        foreach (var instruction in instructions)
+        {
+            // The lifter retains the native width, even though S and D share the same Vn local.
+            if (instruction is not { OpCode: OpCode.Move, MemoryAccessSize: 4 or 8,
+                    Operands: [LocalVariable { Register.Name: var register }, MemoryOperand { Index: null, Scale: 0 } load] }
+                || !register.StartsWith("V", StringComparison.Ordinal))
+                continue;
+
+            if (load.Base is LocalVariable baseLocal && addresses.TryGetValue(baseLocal, out var baseAddress))
+            {
+                load = new MemoryOperand(addend: unchecked(baseAddress + load.Addend));
+                instruction.SetOperand(1, load);
+            }
+            if (!load.IsConstant || load.Addend <= 0
+                || !elf.TryReadReadOnlyScalar((ulong)load.Addend, instruction.MemoryAccessSize.Value, out var bits))
+                continue;
+
+            instruction.SetOperand(1, instruction.MemoryAccessSize == 4
+                ? new FloatLiteral(BitConverter.ToSingle(BitConverter.GetBytes(unchecked((int)bits)), 0))
+                : new DoubleLiteral(BitConverter.Int64BitsToDouble(unchecked((long)bits))));
+            instruction.MemoryAccessSize = null;
+        }
+    }
+
     public static void Run(MethodAnalysisContext method)
     {
         foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))

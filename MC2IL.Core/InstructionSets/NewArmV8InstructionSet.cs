@@ -9,6 +9,7 @@ using MC2IL.Core.ISIL;
 using MC2IL.Core.Model.Contexts;
 using MC2IL.Core.Utils;
 using Disarm.InternalDisassembly;
+using LibMC2IL.Elf;
 
 namespace MC2IL.Core.InstructionSets;
 
@@ -349,7 +350,7 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
         }
 
         // the memory operand for the current instruction's access, offset by extraOffset (for the second reg of a pair)
-        IOperand MemOperand(long extraOffset = 0)
+        IOperand MemOperand(long extraOffset = 0, bool foldPageAddress = true)
         {
             var baseReg = instruction.MemBase;
             // writeback modes apply the offset to the base register itself, the access is at [base]
@@ -365,7 +366,7 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                 return new MemoryOperand(Reg(baseReg), Reg(instruction.MemAddendReg), offset, 1 << instruction.MemExtendOrShiftAmount);
 
             // a load through a register holding an ADRP page address is really an absolute load
-            if (adrpOffsets!.TryGetValue(NormalizeRegister(baseReg), out var page))
+            if (foldPageAddress && adrpOffsets!.TryGetValue(NormalizeRegister(baseReg), out var page))
                 return new MemoryOperand(addend: (long)page + offset);
 
             return new MemoryOperand(Reg(baseReg), addend: offset);
@@ -654,7 +655,7 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                 if (DiscardZeroRegisterDestination())
                     break;
 
-                Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1)).IsPcRelativeAddress = true;
                 break;
             case Arm64Mnemonic.ADRP:
                 {
@@ -662,7 +663,7 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                         break;
 
                     var target = (long)(address & ~0xFFFUL) + instruction.Op1Imm;
-                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(target));
+                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(target)).IsPcRelativeAddress = true;
                     adrpOffsets![NormalizeRegister(instruction.Op0Reg)] = (ulong)target;
                     break;
                 }
@@ -681,10 +682,15 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                 {
                     EmitWriteback(beforeAccess: true);
 
-                    // ldr with a pc-relative literal is an absolute load
+                    // Preserve the base for ELF scalar SIMD loads so SSA can identify its actual
+                    // PC-relative definition, even when a branch jumps over a different ADRP.
+                    var scalarElfLoad = context.AppContext.Binary is ElfFile
+                        && instruction.Mnemonic is Arm64Mnemonic.LDR or Arm64Mnemonic.LDUR
+                        && instruction.Op0Reg is (>= Arm64Register.S0 and <= Arm64Register.S31)
+                            or (>= Arm64Register.D0 and <= Arm64Register.D31);
                     var source = instruction.Op1Kind == Arm64OperandKind.ImmediatePcRelative
                         ? new MemoryOperand(addend: (long)address + instruction.Op1Imm)
-                        : MemOperand();
+                        : MemOperand(foldPageAddress: !scalarElfLoad);
 
                     if (instruction.Op0Kind == Arm64OperandKind.Register && IsReg31(instruction.Op0Reg))
                         Add(address, OpCode.Nop); // load to xzr = prefetch, discard

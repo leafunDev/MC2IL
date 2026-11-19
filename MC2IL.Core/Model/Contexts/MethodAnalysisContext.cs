@@ -380,6 +380,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Create locals
         SsaForm.Build(this);
         LocalVariables.CreateAll(this);
+        FloatLiteralRecovery.RecoverNativeLoads(this);
 
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
