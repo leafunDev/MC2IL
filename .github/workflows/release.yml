@@ -1,0 +1,70 @@
+name: Build preview release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v1.0.0-preview.*'
+
+permissions:
+  contents: write
+
+jobs:
+  package-and-draft:
+    name: Package and prepare GitHub draft
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v7
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.x
+
+      - name: Build platform packages
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $suffix = 'preview.1'
+          } else {
+            $tag = $env:GITHUB_REF_NAME
+            if ($tag -notmatch '^v1\.0\.0-(?<suffix>preview\.\d+)$') {
+              throw "Unexpected preview tag: $tag"
+            }
+            $suffix = $Matches.suffix
+          }
+          ./do-release.ps1 -version $suffix
+
+      - name: Upload preview packages for inspection
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: MC2IL-1.0.0-preview.1-packages
+          path: |
+            artifacts/1.0.0-preview.1/*.zip
+            artifacts/1.0.0-preview.1/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Create draft release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $releaseVersion = $tag.Substring(1)
+          $assetRoot = Join-Path $PWD "artifacts/$releaseVersion"
+          $notes = Join-Path $PWD "docs/releases/$tag.md"
+          if (-not (Test-Path -LiteralPath $notes)) {
+            throw "Release notes not found: $notes"
+          }
+          $archives = @(Get-ChildItem -LiteralPath $assetRoot -Filter '*.zip' | Select-Object -ExpandProperty FullName)
+          if ($archives.Count -ne 6) {
+            throw "Expected six platform archives, found $($archives.Count)"
+          }
+          $assets = $archives + @((Join-Path $assetRoot 'SHA256SUMS.txt'))
+          & gh release create $tag @assets --title "MC2IL $releaseVersion" --notes-file $notes --prerelease --draft --verify-tag
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub CLI failed to create the draft release (exit code $LASTEXITCODE)"
+          }

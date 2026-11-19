@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/leafunDev/MC2IL/actions/workflows/dotnet-core.yml"><img src="https://github.com/leafunDev/MC2IL/actions/workflows/dotnet-core.yml/badge.svg?branch=main" alt="Build status"></a>
-  <img src="https://img.shields.io/badge/version-1.0.0-7468E8?style=flat-square" alt="Version 1.0.0">
+  <img src="https://img.shields.io/badge/version-1.0.0--preview.1-7468E8?style=flat-square" alt="Version 1.0.0 Preview 1">
   <img src="https://img.shields.io/badge/license-MIT-20A889?style=flat-square" alt="MIT license">
   <img src="https://img.shields.io/badge/.NET-10-512BD4?style=flat-square" alt=".NET 10">
 </p>

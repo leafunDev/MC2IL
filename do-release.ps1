@@ -1,218 +1,99 @@
-param (
-    [switch]$help,
-    [string]$version
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9A-Za-z][0-9A-Za-z.-]*$')]
+    [string] $version
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 
-$NugetPackages = @(
-    "MC2IL.Core"
-    "LibMC2IL"
-    "StableNameDotNet"
-    "WasmDisassembler"
+$projectRoot = $PSScriptRoot
+$appProject = Join-Path $projectRoot 'MC2IL/MC2IL.csproj'
+$baseVersion = (Select-Xml -XPath '//Project/PropertyGroup/VersionPrefix' -Path $appProject).Node.InnerText
+$releaseVersion = "$baseVersion-$version"
+$artifactRoot = Join-Path $projectRoot "artifacts/$releaseVersion"
+
+if (Test-Path -LiteralPath $artifactRoot) {
+    throw "Output already exists: $artifactRoot. Move it aside before rebuilding this version."
+}
+
+$null = New-Item -ItemType Directory -Path $artifactRoot -Force
+
+function Invoke-DotNet {
+    param([Parameter(Mandatory = $true)][string[]] $Arguments)
+
+    Write-Host ("> dotnet " + ($Arguments -join ' '))
+    & dotnet @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "dotnet exited with code $LASTEXITCODE"
+    }
+}
+
+$plugins = @(
+    @{ Project = 'Plugins/BuildReport/MC2IL.Plugin.BuildReport.csproj'; Framework = 'net10.0'; Assembly = 'MC2IL.Plugin.BuildReport.dll' },
+    @{ Project = 'Plugins/ControlFlowGraph/MC2IL.Plugin.ControlFlowGraph.csproj'; Framework = 'net10.0'; Assembly = 'MC2IL.Plugin.ControlFlowGraph.dll' },
+    @{ Project = 'Plugins/Mfuscator/MC2IL.Plugin.Mfuscator.csproj'; Framework = 'net10.0'; Assembly = 'MC2IL.Plugin.Mfuscator.dll' },
+    @{ Project = 'Plugins/OrbisPkg/MC2IL.Plugin.OrbisPkg.csproj'; Framework = 'netstandard2.0'; Assembly = 'MC2IL.Plugin.OrbisPkg.dll' },
+    @{ Project = 'Plugins/Pdb/MC2IL.Plugin.Pdb.csproj'; Framework = 'net10.0'; Assembly = 'MC2IL.Plugin.Pdb.dll' },
+    @{ Project = 'Plugins/StrippedCodeRegSupport/MC2IL.Plugin.StrippedCodeRegSupport.csproj'; Framework = 'net10.0'; Assembly = 'MC2IL.Plugin.StrippedCodeRegSupport.dll' }
 )
 
-$Plugins = @(
-    "Plugins\BuildReport"
-    "Plugins\OrbisPkg"
-    "Plugins\Pdb"
-    "Plugins\StrippedCodeRegSupport"
-)
+Write-Host "Building MC2IL plugins for $releaseVersion"
+foreach ($plugin in $plugins) {
+    $projectPath = Join-Path $projectRoot $plugin.Project
+    Invoke-DotNet -Arguments @('build', $projectPath, '--configuration', 'Release', "-p:Version=$releaseVersion")
 
-$ZippedPlugins = @(
-    "Plugins\ControlFlowGraph"
-)
-
-if ($help) {
-    Write-Host "Usage: do-release.ps1 [-help] [-version <version>]"
-    Write-Host "  -help: Display this help message"
-    Write-Host "  -version: The version to build"
-    exit
-}
-
-if (-not $version) {
-    Write-Host "You must specify a version to build"
-    exit
-}
-
-Write-Host "===MC2IL RELEASE SCRIPT==="
-
-$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$MainCommandLineAppDir = Join-Path $ProjectRoot "MC2IL"
-$ArtifactsDir = Join-Path $ProjectRoot "artifacts"
-$BuildDir = Join-Path $MainCommandLineAppDir "bin"
-$ReleaseBuildDir = Join-Path $BuildDir "Release"
-
-Write-Host "Cleaning up old bin and artifacts directories"
-
-foreach($proj in $NugetPackages) 
-{
-    $projDir = Join-Path $ProjectRoot $proj
-    $projBuildDir = Join-Path $projDir "bin"
-    
-    if(Test-Path $projBuildDir)
-    {
-        Remove-Item -Recurse -Force $projBuildDir
+    $pluginFolder = Split-Path -Parent $projectPath
+    $pluginAssembly = Join-Path $pluginFolder "bin/Release/$($plugin.Framework)/$($plugin.Assembly)"
+    if (-not (Test-Path -LiteralPath $pluginAssembly)) {
+        throw "Plugin assembly was not produced: $pluginAssembly"
     }
+    $plugin['BuiltAssembly'] = $pluginAssembly
 }
 
-if(Test-Path $ArtifactsDir)
-{
-    Remove-Item -Recurse -Force $ArtifactsDir
+$orbisDependency = Join-Path $projectRoot 'Plugins/OrbisPkg/Deps/LibOrbisPkg.Core.dll'
+if (-not (Test-Path -LiteralPath $orbisDependency)) {
+    throw "Required OrbisPkg dependency was not found: $orbisDependency"
 }
 
-$null = New-Item -ItemType Directory -Force -Path $ArtifactsDir
+$runtimeIds = @('win-x64', 'win-arm64', 'linux-x64', 'linux-arm64', 'osx-x64', 'osx-arm64')
+foreach ($runtimeId in $runtimeIds) {
+    Write-Host "Publishing self-contained build for $runtimeId"
 
-Write-Host "Building all Nuget packages..."
+    $packageRoot = Join-Path $artifactRoot "staging/$runtimeId"
+    $pluginOutput = Join-Path $packageRoot 'Plugins'
+    $null = New-Item -ItemType Directory -Path $pluginOutput -Force
 
-foreach($proj in $NugetPackages) 
-{
-    Write-Host "    Building $proj..."
-    $projDir = Join-Path $ProjectRoot $proj
-    $projBuildDir = Join-Path $projDir "bin\Release"
-    
-    $null = dotnet build -c Release /p:VersionSuffix=$version $projDir
-    
-    # Should only be one nupkg file in the bin directory 
-    $files = Get-ChildItem $projBuildDir -Filter "*.nupkg"
-   
-    if($files.Count -ne 1)
-    {
-        Write-Host "Error: Expected 1 nupkg file in $projBuildDir, found $($files.Count)"
-        exit 1
+    Invoke-DotNet -Arguments @(
+        'publish', $appProject,
+        '--configuration', 'Release',
+        '--framework', 'net10.0',
+        '--runtime', $runtimeId,
+        '--self-contained', 'true',
+        "-p:Version=$releaseVersion",
+        '-p:PublishSingleFile=true',
+        '-p:PublishTrimmed=false',
+        '--output', $packageRoot
+    )
+
+    foreach ($plugin in $plugins) {
+        Copy-Item -LiteralPath $plugin.BuiltAssembly -Destination $pluginOutput
     }
-    
-    $nupkgFileName = $files[0].Name
-    $nupkgFile = $files[0].FullName
-    $nupkgDestFile = Join-Path $ArtifactsDir $nupkgFileName
-   
-    Write-Host "    Copying $nupkgFileName to artifacts directory..."
-    
-    Copy-Item $nupkgFile $nupkgDestFile
+    Copy-Item -LiteralPath $orbisDependency -Destination $pluginOutput
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md') -Destination $packageRoot
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $packageRoot
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'NOTICE') -Destination $packageRoot
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSES') -Destination $packageRoot -Recurse
+
+    $archive = Join-Path $artifactRoot "MC2IL-$releaseVersion-$runtimeId.zip"
+    $packageFiles = Get-ChildItem -LiteralPath $packageRoot -Force | Select-Object -ExpandProperty FullName
+    Compress-Archive -Path $packageFiles -DestinationPath $archive -CompressionLevel Optimal
 }
 
-cd $MainCommandLineAppDir
-
-$baseVersion = (Select-Xml -XPath "//Project/PropertyGroup/VersionPrefix" -Path ".\MC2IL.csproj").Node.InnerText
-$fullVersionString = "$baseVersion-$version"
-Write-Host "Building MC2IL command line executable, release version $fullVersionString"
-
-Write-Host "    Building MC2IL - Windows x64, Standalone .NET"
-
-$null = dotnet publish -c Release -f "net10.0" -r "win-x64" /p:VersionSuffix=$version /p:PublishSingleFile=true --self-contained
-
-Write-Host "    Building MC2IL - Windows ARM64, Standalone .NET"
-
-$null = dotnet publish -c Release -f "net10.0" -r "win-arm64" /p:VersionSuffix=$version /p:PublishSingleFile=true --self-contained
-
-Write-Host "    Building MC2IL - Linux x64, Standalone .NET"
-
-$null = dotnet publish -c Release -f "net10.0" -r "linux-x64" /p:VersionSuffix=$version /p:PublishSingleFile=true --self-contained
-
-Write-Host "    Building MC2IL - Linux ARM64, Standalone .NET"
-
-$null = dotnet publish -c Release -f "net10.0" -r "linux-arm64" /p:VersionSuffix=$version /p:PublishSingleFile=true --self-contained
-
-Write-Host "    Building MC2IL - MacOS x64, Standalone .NET"
-
-$null = dotnet publish -c Release -f "net10.0" -r "osx-x64" /p:VersionSuffix=$version /p:PublishSingleFile=true --self-contained
-
-Write-Host "    Building MC2IL - MacOS ARM64, Standalone .NET"
-
-$null = dotnet publish -c Release -f "net10.0" -r "osx-arm64" /p:VersionSuffix=$version /p:PublishSingleFile=true --self-contained
-
-Write-Host "    Building MC2IL - Windows, .NET Framework"
-
-$null = dotnet publish -c Release -f "net472" -r "win-x64" /p:VersionSuffix=$version
-
-function CopyAndRename($rid, $platform, $releasePlatformString, $extension)
-{
-    $ridDir = Join-Path $ReleaseBuildDir $rid
-    $platformDir = Join-Path $ridDir $platform
-    $publishDir = Join-Path $platformDir "publish"
-    $file = Join-Path $publishDir "MC2IL$extension"
-    
-    if(Test-Path $file)
-    {
-        # MC2IL-1.0.0-alpha.17-Windows.exe
-        $destFileName = "MC2IL-$fullVersionString-$releasePlatformString$extension"
-        Write-Host "    Copying $destFileName..."
-        $newFile = Join-Path $ArtifactsDir $destFileName 
-        Copy-Item $file $newFile
-    }
+$checksums = foreach ($archive in Get-ChildItem -LiteralPath $artifactRoot -Filter '*.zip') {
+    $hash = (Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    "$hash  $($archive.Name)"
 }
+Set-Content -LiteralPath (Join-Path $artifactRoot 'SHA256SUMS.txt') -Value $checksums -Encoding utf8
 
-function ZipAndRename($rid, $platform, $releasePlatformString, $extension)
-{
-    $ridDir = Join-Path $ReleaseBuildDir $rid
-    $platformDir = Join-Path $ridDir $platform
-    $publishDir = Join-Path $platformDir "publish"
-    
-    # Zip all files in the publish directory
-    $zipFileName = "MC2IL-$fullVersionString-$releasePlatformString.zip"
-    Write-Host "    Zipping $zipFileName..."
-    $zipFile = Join-Path $ArtifactsDir $zipFileName
-    $null = Compress-Archive -Path $publishDir -DestinationPath $zipFile
-}
-
-Write-Host "Moving files to artifacts directory"
-
-CopyAndRename "net10.0" "win-x64" "Windows" ".exe"
-CopyAndRename "net10.0" "win-arm64" "Windows-ARM64" ".exe"
-CopyAndRename "net10.0" "linux-x64" "Linux" ""
-CopyAndRename "net10.0" "linux-arm64" "Linux-ARM64" ""
-CopyAndRename "net10.0" "osx-x64" "OSX" ""
-CopyAndRename "net10.0" "osx-arm64" "OSX-ARM64" ""
-ZipAndRename "net472" "win-x64" "Windows-Netframework472" ".exe"
-
-Set-Location $ProjectRoot
-
-Write-Host "Building plugins..."
-
-foreach($plugin in $Plugins) 
-{
-    Write-Host "    Building $plugin..."
-    $pluginDir = Join-Path $ProjectRoot $plugin
-    $pluginBuildDir = Join-Path $pluginDir "bin\Release"
-    
-    if(Test-Path $pluginBuildDir)
-    {
-        Remove-Item -Recurse -Force $pluginBuildDir
-    }
-    
-    $null = dotnet build -c Release $pluginDir
-    
-    $directories = Get-ChildItem $pluginBuildDir -Directory
-    $pluginBuildDir = $directories[0].FullName
-    
-    $pluginFileName = "$plugin.dll"
-    $pluginFile = Join-Path $pluginBuildDir $pluginFileName
-    $pluginDestFile = Join-Path $ArtifactsDir $pluginFileName
-    
-    Write-Host "    Copying $pluginFileName to artifacts directory..."
-    Copy-Item $pluginFile $pluginDestFile
-}
-
-foreach($plugin in $ZippedPlugins) 
-{
-    Write-Host "    Building $plugin..."
-    $pluginDir = Join-Path $ProjectRoot $plugin
-    $pluginBuildDir = Join-Path $pluginDir "bin\Release"
-    
-    if(Test-Path $pluginBuildDir)
-    {
-        Remove-Item -Recurse -Force $pluginBuildDir
-    }
-    
-    $null = dotnet build -c Release $pluginDir
-    
-    $directories = Get-ChildItem $pluginBuildDir -Directory
-    $pluginBuildDir = $directories[0].FullName
-   
-    Write-Host "    Zipping $pluginFileName to artifacts directory..."
-    $zipFileName = "$plugin.zip"
-    $zipFile = Join-Path $ArtifactsDir $zipFileName
-    $null = Compress-Archive -Path $pluginBuildDir\* -DestinationPath $zipFile
-}
-
-Write-Host "Done!"
+Write-Host "Release assets are ready in $artifactRoot"
