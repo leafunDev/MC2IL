@@ -464,6 +464,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // The resolved signature tells which register values are actually used by a call.
         CallArgumentTrimmer.Run(this);
         ValueTypeReceiverRecovery.Run(this);
+        IteratorFactoryRecovery.Run(this);
 
         // Only remove guards once the managed operations that replace their checks are known.
         InjectedCheckRemover.Run(this);

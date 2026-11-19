@@ -1752,9 +1752,10 @@ public static class IlGenerator
         var newObject = newobj.Operands[0];
         var graph = context.ControlFlowGraph!;
 
-        if (newobj.Operands[1] is TypeAnalysisContext allocatedType && IsDelegateType(allocatedType)
-            && FindDelegateConstructorCall(graph, newobj, allocatedType) is { } delegateConstructor)
-            return delegateConstructor;
+        if (newobj.Operands[1] is TypeAnalysisContext allocatedType
+            && (IsDelegateType(allocatedType) || IteratorFactoryRecovery.IsIteratorType(allocatedType))
+            && FindConstructorOnSuccessorPath(graph, newobj, allocatedType) is { } pathConstructor)
+            return pathConstructor;
 
         // The allocation and the constructor call routinely end up in different blocks
         var instructions = graph.Instructions;
@@ -1779,7 +1780,7 @@ public static class IlGenerator
         return null;
     }
 
-    private static Instruction? FindDelegateConstructorCall(ISILControlFlowGraph graph, Instruction allocation,
+    private static Instruction? FindConstructorOnSuccessorPath(ISILControlFlowGraph graph, Instruction allocation,
         TypeAnalysisContext allocatedType)
     {
         var block = graph.FindBlockByInstruction(allocation);
@@ -1795,12 +1796,15 @@ public static class IlGenerator
                 var candidate = block.Instructions[index];
                 if (candidate.OpCode is OpCode.Nop or OpCode.Jump)
                     continue;
-                if (!candidate.IsCall || candidate.Operands[0] is not MethodAnalysisContext constructor
-                    || !IsDelegateConstructor(constructor) || !MatchesDelegateAllocation(constructor, allocatedType))
+                if (!candidate.IsCall || candidate.Operands[0] is not MethodAnalysisContext
+                        { Name: ".ctor", IsStatic: false, DeclaringType: { } owner } constructor
+                    || !(IsDelegateType(allocatedType)
+                        ? IsDelegateConstructor(constructor) && MatchesDelegateAllocation(constructor, allocatedType)
+                        : SameType(owner, allocatedType)))
                     return null;
 
                 var receiver = ConstructorReceiverIndex(candidate);
-                return candidate.Operands.Count > receiver + 2
+                return candidate.Operands.Count > receiver + constructor.Parameters.Count
                     && ReferenceEquals(candidate.Operands[receiver], allocation.Operands[0]) ? candidate : null;
             }
 
@@ -1939,9 +1943,11 @@ public static class IlGenerator
             return;
 
         var destination = move.Operands[0];
-        // ldlen + conv.i4 already yields the managed Array.Length value. A 32-bit
-        // destination does not observe the extension of the underlying W register.
-        if (move.Operands[1] is ArrayLength && OperandType(destination)?.FullName == "System.Int32")
+        // CIL uses the same stack width for both signed and unsigned 32-bit values.
+        // An extra conv.u4 hides direct parameter and constant stores from iterator recovery.
+        if (OperandType(destination)?.FullName is "System.Int32" or "System.UInt32"
+            && (move.Operands[1] is ArrayLength or Immediate
+                || OperandType(move.Operands[1])?.FullName is "System.Int32" or "System.UInt32"))
             return;
 
         EmitZeroExtend32Result(destination, instructions);
@@ -1993,8 +1999,7 @@ public static class IlGenerator
         }
 
         // Integer constants must have the same evaluation-stack width as their typed destination.
-        // In particular, ldc.i4 followed by stloc of an Int64 is invalid CIL, while a wide immediate
-        // assigned to Int32 needs an explicit narrowing conversion.
+        // A typed Int32/UInt32 immediate has already been narrowed to its low 32 bits.
         if (operand is Immediate typedImmediate)
         {
             var expectedPrimitiveType = expectedType is { IsEnumType: true }
@@ -2023,15 +2028,8 @@ public static class IlGenerator
                     return;
 
                 case "System.Int32":
-                    LoadIntegerImmediate(typedImmediate.Value);
-                    if (typedImmediate.Value is < int.MinValue or > int.MaxValue)
-                        instructions.Add(CilOpCodes.Conv_I4);
-                    return;
-
                 case "System.UInt32":
-                    LoadIntegerImmediate(typedImmediate.Value);
-                    if (typedImmediate.Value is < int.MinValue or > int.MaxValue)
-                        instructions.Add(CilOpCodes.Conv_U4);
+                    instructions.Add(CilOpCodes.Ldc_I4, unchecked((int)typedImmediate.Value));
                     return;
 
                 case "System.SByte":
