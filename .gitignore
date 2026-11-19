@@ -1,0 +1,39 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+artifacts/
+[Pp]ackages/
+
+# Test and coverage output
+TestResults/
+**/TestResults/
+coverage/
+*.trx
+*.coverage
+*.coveragexml
+
+# IDE state
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+**/[Ll]aunch[Ss]ettings.json
+
+# Local analysis output
+mc2il_out/
+
+# User-provided game packages
+*.apk
+
+# Local logs and secrets
+*.log
+.env
+.env.*
+!.env.example
+
+# Operating system files
+.DS_Store
+Thumbs.db

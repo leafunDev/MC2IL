@@ -1,0 +1,41 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path=".editorconfig" />
+    <File Path=".github/workflows/codeql.yml" />
+    <File Path=".github/workflows/dotnet-core.yml" />
+    <File Path=".gitignore" />
+    <File Path="CODE_OF_CONDUCT.md" />
+    <File Path="CONTRIBUTING.md" />
+    <File Path="CONTRIBUTORS.md" />
+    <File Path="do-release.ps1" />
+    <File Path="global.json" />
+    <File Path="LICENSE" />
+    <File Path="NOTICE" />
+    <File Path="nuget.config" />
+    <File Path="README.md" />
+    <File Path="SECURITY.md" />
+    <File Path="SUPPORT.md" />
+  </Folder>
+  <Folder Name="/Solution Items/Project Docs/">
+    <File Path="LibMC2IL/README.md" />
+    <File Path="MC2IL.Core/README.md" />
+  </Folder>
+  <Folder Name="/Solution Items/Docs/">
+    <File Path="docs/ARCHITECTURE.md" />
+    <File Path="docs/CallAnalyzer.md" />
+    <File Path="docs/GITHUB_SETUP.md" />
+  </Folder>
+  <Project Path="MC2IL.Core.Tests/MC2IL.Core.Tests.csproj" />
+  <Project Path="MC2IL.Core/MC2IL.Core.csproj" />
+  <Project Path="Plugins/BuildReport/MC2IL.Plugin.BuildReport.csproj" />
+  <Project Path="Plugins/ControlFlowGraph/MC2IL.Plugin.ControlFlowGraph.csproj" />
+  <Project Path="Plugins/Mfuscator/MC2IL.Plugin.Mfuscator.csproj" />
+  <Project Path="Plugins/OrbisPkg/MC2IL.Plugin.OrbisPkg.csproj" />
+  <Project Path="Plugins/Pdb/MC2IL.Plugin.Pdb.csproj" />
+  <Project Path="Plugins/StrippedCodeRegSupport/MC2IL.Plugin.StrippedCodeRegSupport.csproj" />
+  <Project Path="MC2IL/MC2IL.csproj" />
+  <Project Path="LibMC2IL/LibMC2IL.csproj" />
+  <Project Path="LibMC2ILTests/LibMC2ILTests.csproj" />
+  <Project Path="StableNameDotNet/StableNameDotNet.csproj" />
+  <Project Path="WasmDisassembler/WasmDisassembler.csproj" />
+</Solution>

@@ -1,0 +1,3 @@
+<linker>
+    <assembly fullname="MC2IL.Core" preserve="all"/>
+</linker>

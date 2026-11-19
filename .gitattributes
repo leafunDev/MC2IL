@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+*.apk binary
+*.dll binary
+*.pdb binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.zip binary

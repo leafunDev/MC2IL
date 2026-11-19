@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="380" viewBox="0 0 1100 380" role="img" aria-labelledby="title desc">
+  <title id="title">Illustrative native-code to C# method flow</title>
+  <desc id="desc">A simple ARM64 listing, three control-flow blocks, and a reconstructed C#-style method.</desc>
+
+  <text x="30" y="34" fill="#454a4f" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="13" font-weight="600" letter-spacing="1">ARM64</text>
+  <path d="M330 29h58m-8-5 8 5-8 5" fill="none" stroke="#858b91" stroke-width="1.5"/>
+  <text x="410" y="34" fill="#454a4f" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="13" font-weight="600" letter-spacing="1">FLOW</text>
+  <path d="M665 29h58m-8-5 8 5-8 5" fill="none" stroke="#858b91" stroke-width="1.5"/>
+  <text x="745" y="34" fill="#454a4f" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="13" font-weight="600" letter-spacing="1">C#</text>
+
+  <g font-family="Consolas,Menlo,monospace" font-size="14">
+    <text x="30" y="91" fill="#8a9096">01A4</text><text x="82" y="91" fill="#30353a">CBZ X0, loc_exit</text>
+    <text x="30" y="123" fill="#8a9096">01A8</text><text x="82" y="123" fill="#30353a">LDR W8, [X0,#18]</text>
+    <text x="30" y="155" fill="#8a9096">01AC</text><text x="82" y="155" fill="#30353a">SUB W8, W8, W1</text>
+    <text x="30" y="187" fill="#8a9096">01B0</text><text x="82" y="187" fill="#30353a">STR W8, [X0,#18]</text>
+    <text x="30" y="219" fill="#8a9096">01B4</text><text x="82" y="219" fill="#30353a">CMP W8, #0</text>
+    <text x="30" y="251" fill="#8a9096">01B8</text><text x="82" y="251" fill="#30353a">B.GT loc_exit</text>
+    <text x="30" y="283" fill="#8a9096">01BC</text><text x="82" y="283" fill="#30353a">MOV W8, #1</text>
+    <text x="30" y="315" fill="#8a9096">01C0</text><text x="82" y="315" fill="#30353a">STRB W8, [X0,#20]</text>
+  </g>
+
+  <g fill="none" stroke="#8a9096" stroke-width="1.4">
+    <rect x="410" y="67" width="238" height="44"/>
+    <rect x="410" y="145" width="238" height="44"/>
+    <rect x="410" y="223" width="238" height="44"/>
+    <rect x="478" y="300" width="170" height="38"/>
+    <path d="M529 111v24m-4-4 4 4 4-4"/>
+    <path d="M529 189v24m-4-4 4 4 4-4"/>
+    <path d="M529 267v28m-4-4 4 4 4-4"/>
+  </g>
+  <g font-family="Inter,Segoe UI,Arial,sans-serif" fill="#30353a">
+    <text x="428" y="94" font-size="13">1  null → return</text>
+    <text x="428" y="172" font-size="13">2  health -= amount</text>
+    <text x="428" y="250" font-size="13">3  health &lt;= 0?</text>
+    <text x="496" y="324" font-size="13">set IsDead</text>
+    <text x="541" y="289" fill="#777e84" font-size="10">yes</text>
+  </g>
+
+  <g font-family="Consolas,Menlo,monospace" font-size="13" fill="#30353a">
+    <text x="745" y="91">void ApplyDamage(Player target, int amount)</text>
+    <text x="745" y="123">{</text>
+    <text x="765" y="155">if (target == null) return;</text>
+    <text x="765" y="187">target.Health -= amount;</text>
+    <text x="765" y="219">if (target.Health &lt;= 0)</text>
+    <text x="785" y="251">target.IsDead = true;</text>
+    <text x="745" y="283">}</text>
+  </g>
+  <text x="30" y="363" fill="#777e84" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="11">Illustrative example only — not output from a specific game.</text>
+</svg>
