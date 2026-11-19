@@ -415,52 +415,62 @@ public static class LocalVariables
         }
     }
 
-    // The ARM64 caller can inline Vector3.zero as three scalar reads from the same
-    // readonly static field used by Unity's getter. Restore that getter at the call site.
+    // ARM64 may pass a Unity constant as separate reads of its readonly backing field.
     internal static void RecoverFloatAggregateSources(MethodAnalysisContext method)
     {
-        foreach (var block in method.ControlFlowGraph!.Blocks)
+        var graph = method.ControlFlowGraph!;
+        foreach (var block in graph.Blocks)
         {
             for (var i = 0; i < block.Instructions.Count; i++)
             {
                 var pack = block.Instructions[i];
                 if (pack is not { OpCode: OpCode.PackFloatAggregate,
-                        Operands: [LocalVariable result, TypeAnalysisContext { FullName: "UnityEngine.Vector3" } type,
-                            LocalVariable x, LocalVariable y, LocalVariable z] }
+                        Operands: [LocalVariable result, TypeAnalysisContext type, ..] }
                     || type.DeclaringAssembly.CleanAssemblyName != "UnityEngine.CoreModule")
                     continue;
 
-                var getter = type.Properties.FirstOrDefault(property => property.Name == "zero")?.Getter;
-                if (getter is not { IsStatic: true, Parameters.Count: 0 }
-                    || getter.ReturnType != type)
+                var (propertyName, fieldName, laneCount) = type.FullName switch
+                {
+                    "UnityEngine.Vector3" => ("zero", "zeroVector", 3),
+                    "UnityEngine.Quaternion" => ("identity", "identityQuaternion", 4),
+                    _ => (null, null, 0),
+                };
+                if (propertyName == null || pack.Operands.Count != laneCount + 2
+                    || !pack.Operands.Skip(2).All(operand => operand is LocalVariable))
                     continue;
 
+                var getter = type.Properties.FirstOrDefault(property => property.Name == propertyName)?.Getter;
+                if (getter is not { IsStatic: true, Parameters.Count: 0 } || getter.ReturnType != type)
+                    continue;
+
+                var lanes = pack.Operands.Skip(2).Cast<LocalVariable>().ToArray();
                 var loads = new Dictionary<LocalVariable, Instruction>();
-                for (var j = i - 1; j >= 0 && loads.Count < 3; j--)
+                for (var j = i - 1; j >= 0 && loads.Count < laneCount; j--)
                 {
                     var candidate = block.Instructions[j];
                     if (candidate.OpCode == OpCode.Nop)
                         continue;
                     if (candidate is not { OpCode: OpCode.Move, Operands: [LocalVariable lane, var source] })
                         break;
-                    if (ReferenceEquals(lane, x) || ReferenceEquals(lane, y) || ReferenceEquals(lane, z))
-                        loads[lane] = candidate;
+                    if (lanes.Any(input => ReferenceEquals(input, lane)))
+                    {
+                        if (loads.ContainsKey(lane))
+                            break;
+                        loads.Add(lane, candidate);
+                    }
                     else if (source is not (Immediate or LocalVariable))
                         break;
                 }
 
-                if (!loads.TryGetValue(x, out var xLoad) || !loads.TryGetValue(y, out var yLoad)
-                    || !loads.TryGetValue(z, out var zLoad)
-                    || xLoad.Operands[1] is not FieldReference { Parent: null, Field: { IsStatic: true } field } first
-                    || field.Name != "zeroVector" || field.DeclaringType != type || field.FieldType != type
+                if (loads.Count != laneCount
+                    || loads[lanes[0]].Operands[1] is not FieldReference { Parent: null, Field: { IsStatic: true } field } first
+                    || field.Name != fieldName || field.DeclaringType != type || field.FieldType != type
                     || (field.Attributes & System.Reflection.FieldAttributes.InitOnly) == 0
-                    || !IsLaneAt(yLoad, first, sizeof(float))
-                    || !IsLaneAt(zLoad, first, 2 * sizeof(float)))
+                    || lanes.Skip(1).Where((lane, index) => !IsLaneAt(loads[lane], first, (index + 1) * sizeof(float))).Any())
                     continue;
 
-                var instructions = method.ControlFlowGraph.Instructions;
-                if (loads.Keys.Any(lane => instructions.Any(instruction => !ReferenceEquals(instruction, pack)
-                    && instruction.Sources.Any(source => ReferenceEquals(source, lane)))))
+                if (graph.Instructions.Any(instruction => !ReferenceEquals(instruction, pack)
+                    && DeadCodeEliminator.UsedLocals(instruction).Any(loads.ContainsKey)))
                     continue;
 
                 foreach (var load in loads.Values)
