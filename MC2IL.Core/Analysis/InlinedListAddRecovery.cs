@@ -150,7 +150,9 @@ internal static class InlinedListAddRecovery
         while (length > 0 && operations[length - 1] is
                { Index: < 0, OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable] })
             length--;
-        return length == operations.Length ? operations : operations[..length];
+        if (length != operations.Length)
+            System.Array.Resize(ref operations, length);
+        return operations;
     }
 
     private static bool IsRead(MemoryOperand operand, LocalVariable address, long offset) =>
