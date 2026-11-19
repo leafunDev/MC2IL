@@ -13,6 +13,7 @@ using MC2IL.Core.Graphs;
 using MC2IL.Core.Logging;
 using MC2IL.Core.Model.Contexts;
 using MC2IL.Core.Utils;
+using MC2IL.Core.Utils.AsmResolver;
 
 namespace MC2IL.Core.OutputFormats;
 
@@ -54,7 +55,8 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
         if (shouldSkip)
         {
-            FillMethodBodyWithStub(methodDefinition);
+            if (!ListCountRecovery.TryEmitGetter(methodContext, methodDefinition))
+                FillMethodBodyWithStub(methodDefinition);
             return;
         }
 

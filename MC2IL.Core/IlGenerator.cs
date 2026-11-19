@@ -2151,6 +2151,13 @@ public static class IlGenerator
                     break;
                 }
 
+                if (ListCountRecovery.GetGetterForRead(field, method) is { } listCountGetter)
+                {
+                    LoadFieldReceiver(field, method, locals);
+                    instructions.Add(CilOpCodes.Callvirt, listCountGetter);
+                    break;
+                }
+
                 if (field.Field.IsStatic)
                 {
                     instructions.Add(CilOpCodes.Ldsfld, field.Field.ToFieldDescriptor());
