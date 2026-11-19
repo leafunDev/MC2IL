@@ -135,6 +135,7 @@ public static class IlGenerator
         Dictionary<Instruction, List<CilInstruction>> instructionMap = [];
         Dictionary<Block, CilInstruction> blockEntryMap = [];
         List<(CilInstruction BranchInstruction, Block TargetBlock)> pendingBlockBranchFixups = [];
+        HashSet<LocalVariable>? fieldReadLocals = null;
 
         foreach (var block in graph.Blocks)
         {
@@ -148,6 +149,11 @@ public static class IlGenerator
             {
                 var generated = GenerateInstructions(instruction, context, definition, locals, writeLine, instructionMap);
                 instructionMap.Add(instruction, generated);
+
+                if (instruction is { OpCode: OpCode.Move, Operands:
+                    [LocalVariable { Type: { } localType } destination, FieldReference { Field.IsStatic: false }] }
+                    && IsManagedReference(localType))
+                    (fieldReadLocals ??= []).Add(destination);
 
                 if (!blockEntryMap.ContainsKey(block) && generated.Count > 0)
                     blockEntryMap[block] = generated[0];
@@ -187,6 +193,8 @@ public static class IlGenerator
                 InlineSingleUseFirstInput(block, i, graph, instructionMap, locals);
                 InlineSingleUseArrayLengthReceiver(block, i, graph, instructionMap, locals, body);
                 InlineSingleUseCallArguments(block, i, graph, instructionMap, locals, body);
+                if (fieldReadLocals != null)
+                    InlineSingleUseFieldReceiver(block, i, graph, fieldReadLocals, instructionMap, locals, body);
                 InlineSingleUseLogArgument(block, i, graph, instructionMap, locals);
                 InlineSingleUseBranchCondition(block, i, graph, instructionMap, locals);
                 InlineSingleUseReturnValue(block, i, graph, instructionMap, locals);
@@ -524,6 +532,44 @@ public static class IlGenerator
         RelocateSingleUseExpression(producer, producerIl, consumerIl, index - 1, instructionMap, body);
     }
 
+    private static void InlineSingleUseFieldReceiver(Block block, int consumerIndex, ISILControlFlowGraph graph,
+        HashSet<LocalVariable> fieldReadLocals, Dictionary<Instruction, List<CilInstruction>> instructionMap,
+        Dictionary<LocalVariable, CilLocalVariable> locals, CilMethodBody body)
+    {
+        var consumer = block.Instructions[consumerIndex];
+        var receiver = consumer switch
+        {
+            { OpCode: OpCode.Call, Operands: [MethodAnalysisContext { IsStatic: false }, _, LocalVariable instance, ..] }
+                => instance,
+            { OpCode: OpCode.CallVoid, Operands: [MethodAnalysisContext { IsStatic: false }, LocalVariable instance, ..] }
+                => instance,
+            { OpCode: OpCode.Move, Operands: [FieldReference { Field.IsStatic: false } destination, _] }
+                => destination.Local,
+            { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.IsStatic: false } source] }
+                => source.Local,
+            _ => null
+        };
+
+        if (receiver?.Type is not { } receiverType || !fieldReadLocals.Contains(receiver)
+            || !locals.TryGetValue(receiver, out var ilLocal)
+            || !instructionMap.TryGetValue(consumer, out var consumerIl)
+            || consumerIl.Count == 0 || consumerIl[0].OpCode != CilOpCodes.Ldloc
+            || !ReferenceEquals(consumerIl[0].Operand, ilLocal)
+            || !TryFindSingleUseProducer(block, consumerIndex, receiver, out _, out _, out var producer, CanCross)
+            || producer is not { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.IsStatic: false } field] }
+            || !MetadataResolver.IsSameType(receiverType, field.Field.FieldType)
+            || CountLocalUses(graph, receiver) != 1)
+            return;
+
+        // Leave the field read at its original evaluation point. Argument preparation and calls
+        // may throw or change that field. The saved reference can stay below their stack values.
+        TryInlineStackValue(producer, consumer, receiver, instructionMap, locals);
+
+        bool CanCross(Instruction instruction) =>
+            instructionMap.TryGetValue(instruction, out var generated)
+            && HasStandaloneStackEffect(generated, body, generated.Count, 0);
+    }
+
     private static void RelocateSingleUseExpression(Instruction producer, List<CilInstruction> producerIl,
         List<CilInstruction> consumerIl, int loadIndex,
         Dictionary<Instruction, List<CilInstruction>> instructionMap, CilMethodBody body)
@@ -635,10 +681,16 @@ public static class IlGenerator
     {
         // Stack forwarding may have removed a load from the producer. It can only be
         // relocated if the remaining instructions still compute a value on their own.
+        return HasStandaloneStackEffect(producerIl, body, producerIl.Count - 1, 1);
+    }
+
+    private static bool HasStandaloneStackEffect(List<CilInstruction> instructions, CilMethodBody body,
+        int count, int expectedDepth)
+    {
         var depth = 0;
-        for (var i = 0; i < producerIl.Count - 1; i++)
+        for (var i = 0; i < count; i++)
         {
-            var instruction = producerIl[i];
+            var instruction = instructions[i];
             if (instruction.OpCode.FlowControl is not (CilFlowControl.Next or CilFlowControl.Call))
                 return false;
 
@@ -647,7 +699,7 @@ public static class IlGenerator
                 return false;
             depth += instruction.GetStackPushCount();
         }
-        return depth == 1;
+        return depth == expectedDepth;
     }
 
     private static bool HasAddressedArgumentLoad(CilInstructionCollection body, List<CilInstruction> consumerIl,
@@ -796,7 +848,8 @@ public static class IlGenerator
     }
 
     private static bool TryFindSingleUseProducer(Block consumerBlock, int consumerIndex, LocalVariable local,
-        out Block producerBlock, out int producerIndex, out Instruction producer)
+        out Block producerBlock, out int producerIndex, out Instruction producer,
+        Func<Instruction, bool>? canCross = null)
     {
         producerBlock = consumerBlock;
         producerIndex = consumerIndex - 1;
@@ -809,10 +862,13 @@ public static class IlGenerator
                 var candidate = producerBlock.Instructions[producerIndex];
                 if (candidate.OpCode == OpCode.Nop)
                     continue;
-                if (!ReferenceEquals(candidate.Destination, local))
+                if (ReferenceEquals(candidate.Destination, local))
+                {
+                    producer = candidate;
+                    return true;
+                }
+                if (canCross?.Invoke(candidate) != true)
                     return false;
-                producer = candidate;
-                return true;
             }
 
             // A folded null guard leaves an unconditional jump between a field read and its
