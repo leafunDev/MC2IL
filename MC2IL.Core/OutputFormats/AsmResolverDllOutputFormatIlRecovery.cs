@@ -55,7 +55,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
         if (shouldSkip)
         {
-            if (!ListCountRecovery.TryEmitGetter(methodContext, methodDefinition))
+            if (!FrameworkPropertyRecovery.TryEmitGetter(methodContext, methodDefinition))
                 FillMethodBodyWithStub(methodDefinition);
             return;
         }

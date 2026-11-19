@@ -2274,10 +2274,10 @@ public static class IlGenerator
                     break;
                 }
 
-                if (ListCountRecovery.GetGetterForRead(field, method) is { } listCountGetter)
+                if (FrameworkPropertyRecovery.GetGetterForRead(field, method) is { } listCountGetter)
                 {
                     LoadFieldReceiver(field, method, locals);
-                    instructions.Add(CilOpCodes.Callvirt, listCountGetter);
+                    instructions.Add(field.Field.DeclaringType.IsValueType ? CilOpCodes.Call : CilOpCodes.Callvirt, listCountGetter);
                     break;
                 }
 
