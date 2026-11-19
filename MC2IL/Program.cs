@@ -607,6 +607,14 @@ internal static class Program
         Console.WriteLine("Unity IL2CPP analysis and managed-code recovery.");
         Console.WriteLine($"Version {MC2ILVersionString}\n");
 
+        if (args.Length == 0)
+        {
+            Console.WriteLine("Specify a Unity game folder or package on the command line. Example:");
+            Console.WriteLine("  MC2IL.exe --game-path \"C:\\Games\\My Game\" --output-as dll_il_recovery --output-to mc2il_out");
+            Console.WriteLine("Run with --help for all options.");
+            return 0;
+        }
+
         ConsoleLogger.Initialize();
 
         Logger.InfoNewline("Running on " + Environment.OSVersion.Platform);
