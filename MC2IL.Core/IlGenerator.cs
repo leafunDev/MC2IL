@@ -137,7 +137,7 @@ public static class IlGenerator
         List<(CilInstruction BranchInstruction, Block TargetBlock)> pendingBlockBranchFixups = [];
         HashSet<LocalVariable>? fieldReadLocals = null;
 
-        foreach (var block in graph.Blocks)
+        foreach (var block in GetCilBlockOrder(graph))
         {
             if (block == graph.EntryBlock || block == graph.ExitBlock)
                 continue;
@@ -272,6 +272,7 @@ public static class IlGenerator
             EmitUnrecoveredReturn(context, definition, writeLine);
         }
 
+        CilBranchCleanup.Run(body);
         SetRecoveredMaxStack(body);
     }
 
@@ -1063,6 +1064,23 @@ public static class IlGenerator
         AddressOf address => CountLocalReads(address.Target, local),
         _ => 0
     };
+
+    private static IEnumerable<Block> GetCilBlockOrder(ISILControlFlowGraph graph)
+    {
+        // Analysis can move the entry's first real block to the end when it splits
+        // edges. Start there, while preserving the relative layout of other blocks.
+        var first = graph.EntryBlock;
+        var visited = new HashSet<Block>();
+        while (first.Instructions.Count == 0 && first.Successors is [var successor] && visited.Add(first))
+            first = successor;
+
+        if (first != graph.EntryBlock && first != graph.ExitBlock && graph.Blocks.Contains(first))
+            yield return first;
+
+        foreach (var block in graph.Blocks)
+            if (block != first)
+                yield return block;
+    }
 
     private static Block? TryResolveJumpTargetBlock(Instruction jumpInstruction, ISILControlFlowGraph cfg)
     {
