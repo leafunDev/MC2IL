@@ -10,6 +10,7 @@ namespace MC2IL.Core.Utils;
 // Oversized struct returns go via a pointer in X8, which is not an argument register.
 public class Arm64CallingConventionResolver : BaseCallingConventionResolver
 {
+    internal const string AggregateParameterPrefix = "ARG_FLOAT_AGGREGATE";
     private const int PtrSize = 8;
 
     private static readonly string[] IntegerRegisters = ["X0", "X1", "X2", "X3", "X4", "X5", "X6", "X7"];
@@ -43,14 +44,27 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
     protected override bool HiddenBufferConsumesArgumentSlot => false;
 
     public override IOperand[] ResolveForManaged(MethodAnalysisContext ctx)
-        => ResolveParameters(ctx, null);
+        => ResolveForManagedEntry(ctx);
+
+    internal IOperand[] ResolveForManagedEntry(MethodAnalysisContext ctx,
+        Action<Register, FieldAnalysisContext[], IOperand[]>? bindLanes = null)
+        => ResolveParameters(ctx, (_, fields, lanes, index) =>
+        {
+            var argument = new Register(null, $"{AggregateParameterPrefix}{index}");
+            bindLanes?.Invoke(argument, fields, lanes);
+            return argument;
+        });
 
     public IOperand[] ResolveForManagedCall(MethodAnalysisContext ctx,
         Func<TypeAnalysisContext, IOperand[], IOperand> packAggregate)
-        => ResolveParameters(ctx, packAggregate);
+        => ResolveParameters(ctx, (type, _, lanes, _) => packAggregate(type, lanes));
+
+    // When the native address is shared, the selected signature is only a guess.
+    internal IOperand[] ResolveForAmbiguousManagedCall(MethodAnalysisContext ctx)
+        => ResolveParameters(ctx, null);
 
     private static IOperand[] ResolveParameters(MethodAnalysisContext ctx,
-        Func<TypeAnalysisContext, IOperand[], IOperand>? packAggregate)
+        Func<TypeAnalysisContext, FieldAnalysisContext[], IOperand[], int, IOperand>? bindAggregate)
     {
         var args = new List<IOperand>();
 
@@ -60,25 +74,24 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
 
         void AddParameter(ParameterAnalysisContext? par)
         {
-            if (packAggregate != null && par != null && GetFloatAggregateFields(par.ParameterType) is { } fields)
+            if (bindAggregate != null && par != null && GetFloatAggregateFields(par.ParameterType) is { } fields)
             {
+                var lanes = new IOperand[fields.Length];
                 if (floating <= FloatRegisters.Length - fields.Length)
                 {
-                    var registers = new IOperand[fields.Length];
-                    for (var i = 0; i < registers.Length; i++)
-                        registers[i] = new Register(null, FloatRegisters[floating++]);
-                    args.Add(packAggregate(par.ParameterType, registers));
-                    return;
+                    for (var i = 0; i < lanes.Length; i++)
+                        lanes[i] = new Register(null, FloatRegisters[floating++]);
                 }
-
-                // An aggregate that cannot fit in the SIMD register bank goes on the stack as a unit.
-                floating = FloatRegisters.Length;
-                var laneSize = fields[0].FieldType.FullName == "System.Double" ? 8 : 4;
-                var stackFields = new IOperand[fields.Length];
-                for (var i = 0; i < stackFields.Length; i++)
-                    stackFields[i] = new StackOffset(stack + i * laneSize);
-                stack += (fields.Length * laneSize + PtrSize - 1) & ~(PtrSize - 1);
-                args.Add(packAggregate(par.ParameterType, stackFields));
+                else
+                {
+                    // An aggregate which does not fit in the SIMD bank goes on the stack as a unit.
+                    floating = FloatRegisters.Length;
+                    var laneSize = fields[0].FieldType.FullName == "System.Double" ? 8 : 4;
+                    for (var i = 0; i < lanes.Length; i++)
+                        lanes[i] = new StackOffset(stack + i * laneSize);
+                    stack += (lanes.Length * laneSize + PtrSize - 1) & ~(PtrSize - 1);
+                }
+                args.Add(bindAggregate(par.ParameterType, fields, lanes, args.Count));
                 return;
             }
 

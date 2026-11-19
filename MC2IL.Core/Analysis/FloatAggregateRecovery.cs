@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -39,7 +40,9 @@ internal static class FloatAggregateRecovery
             return;
 
         var graph = method.ControlFlowGraph!;
-        if (!graph.Instructions.Any(instruction => instruction.OpCode == OpCode.PackFloatAggregate
+        if (!method.ParameterOperands.Any(operand => operand is Register register
+                && IsAggregateParameter(register))
+            && !graph.Instructions.Any(instruction => instruction.OpCode == OpCode.PackFloatAggregate
                 || instruction is { OpCode: OpCode.Call, Destination: LocalVariable { Register.Name: "TEMP_CALL_RESULT" } }))
             return;
         var definitions = new Dictionary<LocalVariable, Instruction>();
@@ -103,6 +106,61 @@ internal static class FloatAggregateRecovery
                 foreach (var store in stores)
                     Remove(store);
             }
+            else if (instruction is { OpCode: OpCode.Move,
+                         Operands: [FieldReference { Parent: null, Field.IsStatic: false, Local.IsThis: true } field, _] })
+            {
+                RecoverInstanceStore(block, i, field, definitions);
+            }
+        }
+    }
+
+    private static bool IsAggregateParameter(Register register) =>
+        register.Name.StartsWith(Arm64CallingConventionResolver.AggregateParameterPrefix, StringComparison.Ordinal);
+
+    private static void RecoverInstanceStore(Block block, int index, FieldReference target,
+        Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var first = block.Instructions[index];
+        if (first.MemoryAccessSize is not (4 or 8)
+            || Arm64CallingConventionResolver.GetFloatAggregateFields(target.Field.FieldType) is not { } fields)
+            return;
+
+        var size = fields[0].FieldType.FullName == "System.Double" ? 8 : 4;
+        var argument = GetProjection(first.Operands[1], fields[0], definitions);
+        if (first.MemoryAccessSize != size || argument == null || !IsAggregateParameter(argument.Register)
+            || argument.Type != target.Field.FieldType)
+            return;
+
+        var lane = 1;
+        var end = index + 1;
+        for (; end < block.Instructions.Count && lane < fields.Length; end++)
+        {
+            var store = block.Instructions[end];
+            if (store.OpCode == OpCode.Nop)
+                continue;
+
+            var field = fields[lane];
+            if (store is not { OpCode: OpCode.Move, MemoryAccessSize: var width,
+                    Operands: [FieldReference { Parent: { Parent: null } parent } destination, var value] }
+                || width != size || parent.Field != target.Field || !ReferenceEquals(destination.Local, target.Local)
+                || destination.Field != field || destination.Offset != target.Offset + field.Offset
+                || GetProjection(value, field, definitions) != argument)
+                break;
+            lane++;
+        }
+
+        if (lane == fields.Length)
+        {
+            first.SetOperand(1, argument);
+            first.MemoryAccessSize = null;
+            for (var j = index + 1; j < end; j++)
+                Remove(block.Instructions[j]);
+        }
+        else
+        {
+            // An exact offset match resolved the first scalar store to its enclosing struct.
+            // If the other lanes do not form a copy, keep the write to the first lane only.
+            first.SetOperand(0, new FieldReference(fields[0], target.Local, target.Offset, target));
         }
     }
 

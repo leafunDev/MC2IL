@@ -1123,18 +1123,15 @@ public static class LocalVariables
         if (method.Parameters.Count == 0)
             return;
 
-        // Normal params
-        var paramIndex = 0;
-        foreach (var local in method.ParameterLocals)
+        // ParameterLocals is sparse: unused parameters may have no local. Use the ABI slot,
+        // so a later argument is never assigned the type of a skipped one.
+        var offset = method.IsStatic ? 0 : 1;
+        for (var i = 0; i < method.Parameters.Count && i + offset < method.ParameterOperands.Count; i++)
         {
-            if (local.IsThis || local.IsMethodInfo)
-                continue;
-
-            if (paramIndex >= method.Parameters.Count)
-                break;
-
-            local.Type = method.Parameters[paramIndex].ParameterType;
-            paramIndex++;
+            if (method.ParameterOperands[i + offset] is Register register
+                && method.ParameterLocals.FirstOrDefault(local => local.Register == register
+                    && !local.IsThis && !local.IsMethodInfo) is { } argument)
+                argument.Type = method.Parameters[i].ParameterType;
         }
     }
 

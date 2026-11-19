@@ -202,7 +202,32 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
         }
 
         adrpOffsets.Clear();
+        if (instructions.Count != 0)
+            BindIncomingAggregateLanes(context, instructions);
+
         return instructions;
+    }
+
+    private static void BindIncomingAggregateLanes(MethodAnalysisContext context, List<Instruction> instructions)
+    {
+        if (context.Parameters.Count == 0)
+            return;
+
+        List<Instruction>? entry = null;
+        CallingConventions.ResolveForManagedEntry(context, (argument, fields, lanes) =>
+        {
+            entry ??= [];
+            for (var i = 0; i < fields.Length; i++)
+                entry.Add(new Instruction(entry.Count, OpCode.Move, lanes[i],
+                    new MemoryOperand(argument, addend: fields[i].Offset)));
+        });
+        if (entry == null)
+            return;
+
+        // Existing branches target the original instructions, so a loop never reloads its arguments.
+        foreach (var instruction in instructions)
+            instruction.Index += entry.Count;
+        instructions.InsertRange(0, entry);
     }
 
     private void ConvertInstructionStatement(Arm64Instruction instruction, List<Instruction> instructions, List<ulong> addresses, MethodAnalysisContext context)
@@ -266,7 +291,7 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                         pack.AddOperands(lanes);
                         return packed;
                     })
-                    : CallingConventions.ResolveForManaged(ctx);
+                    : CallingConventions.ResolveForAmbiguousManagedCall(ctx);
 
                 var returnFields = possibleMethods.Count == 1 && !ctx.IsVoid
                     ? Arm64CallingConventionResolver.GetFloatAggregateFields(ctx.ReturnType)
@@ -727,8 +752,11 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
 
                     if (instruction.Mnemonic == Arm64Mnemonic.STP)
                     {
-                        Add(address, OpCode.Move, MemOperand(), ConvertOperand(instruction, 0));
-                        Add(address, OpCode.Move, MemOperand(pairSize), ConvertOperand(instruction, 1));
+                        var first = Add(address, OpCode.Move, MemOperand(), ConvertOperand(instruction, 0));
+                        var second = Add(address, OpCode.Move, MemOperand(pairSize), ConvertOperand(instruction, 1));
+                        if (instruction.Op0Reg is >= Arm64Register.S0 and <= Arm64Register.S31
+                            or >= Arm64Register.D0 and <= Arm64Register.D31)
+                            first.MemoryAccessSize = second.MemoryAccessSize = pairSize;
                     }
                     else
                     {
