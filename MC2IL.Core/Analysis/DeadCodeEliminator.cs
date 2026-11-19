@@ -131,8 +131,8 @@ public static class DeadCodeEliminator
                     break;
                 // A static field access doesn't read the storage pointer it was resolved from, so that
                 // pointer (and the class load feeding it) is free to die.
-                case FieldReference { Field.IsStatic: false, Local: { } fieldLocal }:
-                    yield return fieldLocal;
+                case FieldReference field when !IsStaticFieldPath(field):
+                    yield return field.Local;
                     break;
                 // Handing out a slot's address is a read of it as far as we can tell, whatever the callee then does with it.
                 case AddressOf { Target: LocalVariable addressed }:
@@ -142,8 +142,8 @@ public static class DeadCodeEliminator
                     foreach (var used in ArrayAccessLocals(addressedElement))
                         yield return used;
                     break;
-                case AddressOf { Target: FieldReference { Local: var addressedReceiver } }:
-                    yield return addressedReceiver;
+                case AddressOf { Target: FieldReference addressedField } when !IsStaticFieldPath(addressedField):
+                    yield return addressedField.Local;
                     break;
                 case ArrayAccess access:
                     foreach (var used in ArrayAccessLocals(access))
@@ -154,6 +154,15 @@ public static class DeadCodeEliminator
                     break;
             }
         }
+    }
+
+    private static bool IsStaticFieldPath(FieldReference field)
+    {
+        for (var current = field; current != null; current = current.Parent)
+            if (current.Field.IsStatic)
+                return true;
+
+        return false;
     }
 
     private static IEnumerable<LocalVariable> ArrayAccessLocals(ArrayAccess access)

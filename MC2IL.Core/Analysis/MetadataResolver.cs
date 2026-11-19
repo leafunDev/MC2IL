@@ -539,11 +539,33 @@ public static class MetadataResolver
                     }
                 }
 
-                List<FieldAnalysisContext>? fieldPath = field == null
-                    ? staticOwner == null && genericOwner == null
+                List<FieldAnalysisContext>? fieldPath;
+                if (field != null)
+                {
+                    fieldPath = [field];
+                    if (instruction.MemoryAccessSize is { } accessSize
+                        && field.FieldType.IsValueType
+                        && accessSize < TypeSizes.UnboxedSize(field.FieldType, pointerSize)
+                        && field.BackingData?.FieldOffset is { } fieldOffset
+                        && FindInlineValueFieldPath(field.FieldType, lookupOffset - fieldOffset, pointerSize,
+                            new HashSet<TypeAnalysisContext>()) is { } nestedPath
+                        && TypeSizes.UnboxedSize(nestedPath[^1].FieldType, pointerSize) == accessSize)
+                    {
+                        fieldPath.AddRange(nestedPath);
+                    }
+                }
+                else if (staticOwner != null
+                         && instruction.MemoryAccessSize is { } staticAccessSize
+                         && FindNestedStaticFieldPath(owner, lookupOffset, staticAccessSize, pointerSize) is { } staticPath)
+                {
+                    fieldPath = staticPath;
+                }
+                else
+                {
+                    fieldPath = staticOwner == null && genericOwner == null
                         ? FindNestedFieldPath(owner, lookupOffset, pointerSize)
-                        : null
-                    : [field];
+                        : null;
+                }
 
                 if (fieldPath == null)
                     continue;
@@ -608,6 +630,39 @@ public static class MetadataResolver
         }
 
         return match;
+    }
+
+    private static List<FieldAnalysisContext>? FindNestedStaticFieldPath(TypeAnalysisContext owner,
+        long targetOffset, int accessSize, int pointerSize)
+    {
+        List<FieldAnalysisContext>? match = null;
+        foreach (var candidateOwner in EnumerateTypeHierarchy(owner))
+        foreach (var field in candidateOwner.Fields)
+        {
+            if (!field.IsStatic || (field.Attributes & FieldAttributes.Literal) != 0
+                || field.BackingData?.FieldOffset is not { } fieldOffset
+                || !field.FieldType.IsValueType || targetOffset < fieldOffset)
+                continue;
+
+            var nestedOffset = targetOffset - fieldOffset;
+            if (FindInlineValueFieldPath(field.FieldType, nestedOffset, pointerSize,
+                    new HashSet<TypeAnalysisContext>()) is not { } nestedPath
+                || TypeSizes.UnboxedSize(nestedPath[^1].FieldType, pointerSize) != accessSize)
+                continue;
+
+            nestedPath.Insert(0, field);
+            if (match != null)
+                return null;
+            match = nestedPath;
+        }
+
+        return match;
+    }
+
+    private static IEnumerable<TypeAnalysisContext> EnumerateTypeHierarchy(TypeAnalysisContext owner)
+    {
+        for (var current = owner; current != null; current = current.BaseType)
+            yield return current;
     }
 
     private static List<FieldAnalysisContext>? FindInlineValueFieldPath(TypeAnalysisContext valueType, long targetOffset,

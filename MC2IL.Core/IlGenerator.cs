@@ -2315,8 +2315,13 @@ public static class IlGenerator
                     ((SzArrayTypeAnalysisContext)elementAddress.Array.Type!).ElementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
             case AddressOf { Target: FieldReference fieldAddress }:
-                LoadFieldReceiver(fieldAddress, method, locals);
-                instructions.Add(CilOpCodes.Ldflda, fieldAddress.Field.ToFieldDescriptor());
+                if (fieldAddress.Parent == null && fieldAddress.Field.IsStatic)
+                    instructions.Add(CilOpCodes.Ldsflda, fieldAddress.Field.ToFieldDescriptor());
+                else
+                {
+                    LoadFieldReceiver(fieldAddress, method, locals);
+                    instructions.Add(CilOpCodes.Ldflda, fieldAddress.Field.ToFieldDescriptor());
+                }
                 break;
             case ArrayAccess arrayAccess:
                 LoadLocal(arrayAccess.Array, method, locals);
@@ -2732,6 +2737,25 @@ public static class IlGenerator
     private static void LoadFieldReceiver(FieldReference field, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals)
     {
+        var path = new Stack<FieldReference>();
+        for (var parent = field.Parent; parent != null; parent = parent.Parent)
+            path.Push(parent);
+
+        if (path.Count > 0 && path.Peek().Field.IsStatic)
+        {
+            var root = path.Pop();
+            method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldsflda, root.Field.ToFieldDescriptor());
+            while (path.Count > 0)
+                method.CilMethodBody.Instructions.Add(CilOpCodes.Ldflda, path.Pop().Field.ToFieldDescriptor());
+            return;
+        }
+
+        if (field.Parent == null && field.Field.IsStatic)
+        {
+            method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldsfld, field.Field.ToFieldDescriptor());
+            return;
+        }
+
         if (!field.Local.IsThis
             && field.Local.Type is { IsValueType: true } and not ByRefTypeAnalysisContext)
         {
@@ -2745,13 +2769,6 @@ public static class IlGenerator
         {
             LoadLocal(field.Local, method, locals);
         }
-
-        if (field.Parent == null)
-            return;
-
-        var path = new Stack<FieldReference>();
-        for (var parent = field.Parent; parent != null; parent = parent.Parent)
-            path.Push(parent);
 
         var instructions = method.CilMethodBody!.Instructions;
         while (path.Count > 0)

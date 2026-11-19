@@ -182,8 +182,9 @@ public static class LocalVariables
                 usedLocals.Add(definedVar);
 
             foreach (var operand in block.Use)
-                if (operand is AddressOf { Target: FieldReference { Local: var receiver } })
-                    usedLocals.Add(receiver);
+                if (operand is AddressOf { Target: FieldReference receiverField }
+                    && !HasStaticFieldRoot(receiverField))
+                    usedLocals.Add(receiverField.Local);
         }
 
         method.Locals.RemoveAll(x => !usedLocals.Contains(x));
@@ -216,6 +217,15 @@ public static class LocalVariables
                 }
             }
         }
+    }
+
+    private static bool HasStaticFieldRoot(FieldReference field)
+    {
+        for (var current = field; current != null; current = current.Parent)
+            if (current.Field.IsStatic)
+                return true;
+
+        return false;
     }
 
     /// <summary>

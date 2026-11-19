@@ -386,12 +386,13 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
         // flag/temporary has a single, version-stable definition.
         FlagConditionRecovery.Run(this);
-        DeadCodeEliminator.Run(this);
 
         // Resolve call targets, strings and getters, then run the combined type-propagation and
         // field-resolution fixpoint - all while still in SSA form, so every local is
         // single-assignment and a type, once known, is stable for that value.
         MetadataResolver.ResolveAll(this);
+        FloatAggregateRecovery.RecoverAggregateStackReceivers(this);
+        DeadCodeEliminator.Run(this);
 
         // Resolve KeyFunctionAddress calls, then collect what removing the write barriers left dead.
         KeyFunctionRecovery.Run(this);
