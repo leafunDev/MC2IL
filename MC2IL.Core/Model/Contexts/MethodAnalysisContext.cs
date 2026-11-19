@@ -456,6 +456,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // drop dead locals.
         Simplifier.Simplify(this);
 
+        Arm64ZeroStoreRecovery.Run(this);
+
         // Fix float literals
         FloatLiteralRecovery.Run(this);
 

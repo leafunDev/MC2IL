@@ -757,6 +757,14 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                         if (instruction.Op0Reg is >= Arm64Register.S0 and <= Arm64Register.S31
                             or >= Arm64Register.D0 and <= Arm64Register.D31)
                             first.MemoryAccessSize = second.MemoryAccessSize = pairSize;
+                        else
+                        {
+                            // STP XZR, XZR can clear several adjacent fields in one instruction.
+                            if (IsReg31(instruction.Op0Reg))
+                                first.MemoryAccessSize = pairSize;
+                            if (IsReg31(instruction.Op1Reg))
+                                second.MemoryAccessSize = pairSize;
+                        }
                     }
                     else
                     {

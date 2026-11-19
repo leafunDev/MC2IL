@@ -1128,6 +1128,14 @@ public static class IlGenerator
                     if (!field.Field.IsStatic)
                         LoadFieldReceiver(field, method, locals);
 
+                    if (instruction.Operands[1] is DefaultValue { Type: var zeroType })
+                    {
+                        instructions.Add(field.Field.IsStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda,
+                            field.Field.ToFieldDescriptor());
+                        instructions.Add(CilOpCodes.Initobj, zeroType.ToTypeSignature().ToTypeDefOrRef());
+                        break;
+                    }
+
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType);
                     EmitMoveWidthConversion(instruction, instructions);
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
