@@ -33,22 +33,32 @@ public sealed class LibMC2ILContextBuilder
         }
         catch (Exception e) when (_context.Settings.MetadataFixupFunc is { } fixupFunc)
         {
+            LibLogger.WarnNewline("Metadata read failed, but a fixup function is registered. Calling fixup function and then will attempt to read again.");
+
+            byte[]? fixedBytes;
             try
             {
-                LibLogger.WarnNewline("Metadata read failed, but a fixup function is registered. Calling fixup function and then will attempt to read again...");
-                
-                var fixedBytes = fixupFunc(metadataBytes, unityVersion);
-                
-                if(fixedBytes == null)
-                    throw new Exception("Metadata fixup function returned null, cannot proceed with metadata loading. Original exception follows.", e);
-                
+                fixedBytes = fixupFunc(metadataBytes, unityVersion);
+            }
+            catch (Exception fixupError)
+            {
+                throw new AggregateException("The metadata fixup function failed.", e, fixupError);
+            }
+
+            if (fixedBytes == null)
+            {
+                LibLogger.VerboseNewline("No metadata fixup accepted the input.");
+                throw;
+            }
+
+            try
+            {
                 metadata = Il2CppMetadata.ReadFrom(fixedBytes, unityVersion);
-                
                 LibLogger.InfoNewline("Metadata read succeeded after fixup.");
             }
-            catch (Exception ex2)
+            catch (Exception retryError)
             {
-                throw new Exception("Failed to read metadata, even after attempted fixup.", ex2);
+                throw new AggregateException("Metadata is unreadable after fixup.", e, retryError);
             }
         }
 
@@ -133,9 +143,9 @@ public sealed class LibMC2ILContextBuilder
 
     public static LibMC2ILContext BuildFromFiles(string pePath, string metadataPath, UnityVersion unityVersion)
     {
-        var metadataBytes = File.ReadAllBytes(metadataPath);
-        var peBytes = File.ReadAllBytes(pePath);
-
-        return Build(peBytes, metadataBytes, unityVersion);
+        var builder = new LibMC2ILContextBuilder();
+        builder.LoadMetadata(File.ReadAllBytes(metadataPath), unityVersion);
+        builder.LoadBinary(File.ReadAllBytes(pePath));
+        return builder.Build();
     }
 }

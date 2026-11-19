@@ -80,7 +80,7 @@ public class Il2CppMetadata : ClassReadingBinaryReader
     public int TypeDefinitionCount => typeDefs.Length;
     public int MethodDefinitionCount => methodDefs.Length;
 
-    public static bool HasMetadataHeader(byte[] bytes) => bytes.Length >= 4 && BitConverter.ToUInt32(bytes, 0) == 0xFAB11BAF;
+    public static bool HasMetadataHeader(byte[] bytes) => bytes.Length >= 4 && BitConverter.ToUInt32(bytes, 0) == MetadataMagic;
     
     internal static int GetIndexWidth(int elementCount)
     {
@@ -96,9 +96,12 @@ public class Il2CppMetadata : ClassReadingBinaryReader
     {
         if (!HasMetadataHeader(bytes))
         {
-            //Magic number is wrong
-            throw new FormatException("Invalid or corrupt metadata (magic number check failed)");
+            var prefix = bytes.Length == 0 ? "(empty)" : BitConverter.ToString(bytes, 0, Math.Min(bytes.Length, 4)).Replace('-', ' ');
+            throw new InvalidMetadataHeaderException($"Expected IL2CPP signature AF 1B B1 FA; found {prefix} ({bytes.Length:N0} bytes total).");
         }
+
+        if (bytes.Length < 8)
+            throw new InvalidMetadataHeaderException($"The IL2CPP signature is present, but the metadata version field is incomplete ({bytes.Length} bytes total).");
 
         var version = BitConverter.ToInt32(bytes, 4);
         if (version is < 23 or > 108)

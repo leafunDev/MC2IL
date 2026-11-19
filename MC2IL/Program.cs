@@ -11,10 +11,9 @@ using MC2IL.Core;
 using MC2IL.Core.Api;
 using MC2IL.Core.Logging;
 using MC2IL.Core.Utils;
-#if !DEBUG
 using MC2IL.Core.Exceptions;
-#endif
 using LibMC2IL;
+using LibMC2IL.Metadata;
 using AssetRipper.Primitives;
 using MC2IL.Core.Extensions;
 
@@ -689,7 +688,19 @@ internal static class Program
         else
             LibMC2ILBinaryRegistry.WasmRemappedDynCallFunctions = null;
 
-        MC2ILApi.InitializeLibMC2IL(runtimeArgs.PathToAssembly, runtimeArgs.PathToMetadata, runtimeArgs.UnityVersion);
+        Logger.VerboseNewline($"Loading IL2CPP metadata from \"{runtimeArgs.PathToMetadata}\" for \"{runtimeArgs.PathToAssembly}\".");
+        try
+        {
+            MC2ILApi.InitializeLibMC2IL(runtimeArgs.PathToAssembly, runtimeArgs.PathToMetadata, runtimeArgs.UnityVersion);
+        }
+        catch (InvalidMetadataHeaderException e)
+        {
+            return ReportInvalidMetadataHeader(runtimeArgs, e);
+        }
+        catch (LibMC2ILInitializationException e) when (e.InnerException is InvalidMetadataHeaderException invalidHeader)
+        {
+            return ReportInvalidMetadataHeader(runtimeArgs, invalidHeader);
+        }
         MC2ILApi.CurrentAppContext.ReuseSingletonInstances = runtimeArgs.ReuseSingletonInstances;
 
         if (runtimeArgs.LowMemoryMode)
@@ -732,6 +743,15 @@ internal static class Program
 
         Logger.InfoNewline($"Done. Total execution time: {(DateTime.Now - executionStart).TotalMilliseconds}ms");
         return 0;
+    }
+
+    private static int ReportInvalidMetadataHeader(MC2ILRuntimeArgs args, InvalidMetadataHeaderException error)
+    {
+        Logger.ErrorNewline($"Cannot load IL2CPP metadata from \"{Path.GetFullPath(args.PathToMetadata)}\". {error.Message}");
+        Logger.ErrorNewline("Use the metadata and game binary from the same build. If the file is incomplete, extract the game again. If the game uses a modified metadata format, a compatible metadata plugin is required.");
+        Logger.VerboseNewline(error.ToString());
+        CleanupExtractedFiles();
+        return -1;
     }
 
     private static void RunProcessingLayers(MC2ILRuntimeArgs runtimeArgs, Action<MC2ILProcessingLayer> run)
