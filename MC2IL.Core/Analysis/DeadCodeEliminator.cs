@@ -176,6 +176,9 @@ public static class DeadCodeEliminator
             // diagnostic in generated C#; an absolute image/global read has no managed null or
             // bounds behavior to preserve. Base-relative reads can still throw for a null object,
             // so leave those in the graph even when their result is unused.
+            OpCode.Move when instruction.Operands is [_, FieldReference
+                { Parent: null, Field.IsStatic: false, Local: { IsThis: false,
+                    Type: { IsValueType: true } and not ByRefTypeAnalysisContext } }] => true,
             OpCode.Move when instruction.Operands is [_, MemoryOperand { IsConstant: false }
                 or FieldReference or ArrayAccess or ArrayLength] => false,
             OpCode.Move => true,

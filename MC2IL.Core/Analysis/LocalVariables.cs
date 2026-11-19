@@ -473,6 +473,8 @@ public static class LocalVariables
             }
         }
 
+        FloatAggregateRecovery.Run(method);
+
         static bool IsLaneAt(Instruction load, FieldReference first, int byteOffset) =>
             load.Operands[1] is MemoryOperand { Index: null, Scale: 0, Base: LocalVariable storage } memory
             && ReferenceEquals(first.Local, storage)

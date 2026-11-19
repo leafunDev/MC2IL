@@ -231,7 +231,7 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
             return newInstruction;
         }
 
-        void AddCallAt(ulong target)
+        Register? AddCallAt(ulong target)
         {
             if (context.AppContext.MethodsByAddress.TryGetValue(target, out var possibleMethods) && possibleMethods.Count > 0)
             {
@@ -267,11 +267,27 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                     })
                     : CallingConventions.ResolveForManaged(ctx);
 
+                var returnFields = possibleMethods.Count == 1 && !ctx.IsVoid
+                    ? Arm64CallingConventionResolver.GetFloatAggregateFields(ctx.ReturnType)
+                    : null;
+                var aggregateResult = new Register(null, "TEMP_CALL_RESULT");
                 var call = ctx.IsVoid
                     ? Add(address, OpCode.CallVoid, Imm(target))
-                    : Add(address, OpCode.Call, Imm(target), CallingConventions.ReturnRegister(ctx));
+                    : Add(address, OpCode.Call, Imm(target), returnFields == null
+                        ? CallingConventions.ReturnRegister(ctx)
+                        : aggregateResult);
 
                 call.AddOperands(callArguments);
+
+                if (returnFields != null)
+                {
+                    // An HFA returns one member in each of V0-V3. Keep the managed result whole
+                    // and expose its lanes to the subsequent native instructions.
+                    for (var i = 0; i < returnFields.Length; i++)
+                        Add(address, OpCode.Move, new Register(null, $"V{i}"),
+                            new MemoryOperand(aggregateResult, addend: returnFields[i].Offset));
+                    return ctx.ReturnType == context.ReturnType ? aggregateResult : null;
+                }
             }
             else
             {
@@ -279,6 +295,8 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                 var call = Add(address, OpCode.Call, Imm(target), new Register(null, "X0"));
                 call.AddOperands(CallingConventions.ResolveForUnmanaged(context.AppContext, target));
             }
+
+            return null;
         }
 
         void AddFloatArithmetic(OpCode opCode)
@@ -298,12 +316,12 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
             Add(address, opCode, operands);
         }
 
-        void AddReturn()
+        void AddReturn(Register? tailCallResult = null)
         {
             if (context.IsVoid)
                 Add(address, OpCode.Return);
             else
-                Add(address, OpCode.Return, CallingConventions.ReturnValueSourceRegister(context));
+                Add(address, OpCode.Return, tailCallResult ?? CallingConventions.ReturnValueSourceRegister(context));
         }
 
         bool DiscardZeroRegisterDestination()
@@ -1278,8 +1296,7 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                     if (target < context.UnderlyingPointer || target >= context.UnderlyingPointer + (ulong)context.RawBytes.Length)
                     {
                         // unconditional branch out of the method is a tail call
-                        AddCallAt(target);
-                        AddReturn();
+                        AddReturn(AddCallAt(target));
                     }
                     else
                     {
