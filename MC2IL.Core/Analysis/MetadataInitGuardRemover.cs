@@ -39,9 +39,10 @@ public static class MetadataInitGuardRemover
             ? new[] { InitialisedFlagOffset32, CctorFinishedOffset32 }
             : new[] { InitialisedFlagOffset64, CctorFinishedOffset64 };
         var cfg = method.ControlFlowGraph!;
-        if (method.AppContext.InstructionSet is NewArmV8InstructionSet && method.AppContext.MetadataVersion == 29)
+        var supportsClassReloads = SupportsClassReloads(method);
+        if (supportsClassReloads)
             RemoveArm64ClassMetadataGuards(method, cfg);
-        Run(cfg, flagOffsets);
+        Run(cfg, flagOffsets, keepBareCalls: supportsClassReloads);
     }
 
     // The ARM64 metadata initialization slow path returns the same Il2CppClass*
@@ -292,7 +293,8 @@ public static class MetadataInitGuardRemover
     public static void Run(ISILControlFlowGraph cfg, long initialisedFlagOffset)
         => Run(cfg, [initialisedFlagOffset]);
 
-    private static void Run(ISILControlFlowGraph cfg, IReadOnlyCollection<long> initialisedFlagOffsets)
+    private static void Run(ISILControlFlowGraph cfg, IReadOnlyCollection<long> initialisedFlagOffsets,
+        bool keepBareCalls = false)
     {
         var definitions = new Dictionary<LocalVariable, Instruction>();
         foreach (var instruction in cfg.Instructions)
@@ -305,10 +307,125 @@ public static class MetadataInitGuardRemover
         foreach (var guard in cfg.Blocks.ToList())
             removedAny |= TryRemoveGuard(cfg, guard, initialisedFlagOffsets, definitions, discardedGuardLoads);
 
-        removedAny |= RemoveBareClassInitCalls(cfg);
+        if (!keepBareCalls)
+            removedAny |= RemoveBareClassInitCalls(cfg);
 
         if (removedAny)
             DeadCodeEliminator.Run(cfg, discardedGuardLoads);
+    }
+
+    internal static void RunClassReloads(MethodAnalysisContext method)
+    {
+        if (!SupportsClassReloads(method))
+            return;
+
+        var cfg = method.ControlFlowGraph!;
+        var instructions = cfg.Instructions;
+        if (!instructions.Any(IsClassInitCall))
+            return;
+
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        foreach (var instruction in instructions)
+            if (instruction.Destination is LocalVariable local)
+                definitions[local] = instruction;
+
+        var discardedLoads = new HashSet<Instruction>();
+        foreach (var guard in cfg.Blocks)
+            TryKeepManagedReload(guard, definitions, discardedLoads);
+
+        if (RemoveBareClassInitCalls(cfg) || discardedLoads.Count != 0)
+            DeadCodeEliminator.Run(cfg, discardedLoads);
+    }
+
+    private static bool SupportsClassReloads(MethodAnalysisContext method) =>
+        method.AppContext.InstructionSet is NewArmV8InstructionSet && method.AppContext.MetadataVersion == 29;
+
+    // IL2CPP may reuse an earlier static field read when the class is ready and reload
+    // it after the class initializer otherwise. In managed IL the reload itself handles
+    // class initialization. Keep that read and its null check, and remove the native fork.
+    private static void TryKeepManagedReload(Block guard, Dictionary<LocalVariable, Instruction> definitions,
+        HashSet<Instruction> discardedLoads)
+    {
+        if (guard.Successors.Count != 2 || guard.Instructions.LastOrDefault() is not
+                { OpCode: OpCode.ConditionalJump, Operands: [Block merge, LocalVariable condition] } branch
+            || !definitions.TryGetValue(condition, out var nonzero)
+            || nonzero is not { OpCode: OpCode.Not, Operands: [_, LocalVariable isZero] }
+            || !definitions.TryGetValue(isZero, out var comparison)
+            || comparison is not { OpCode: OpCode.CheckEqual, Operands: [_, LocalVariable flag, Immediate { Value: 0 }] }
+            || !definitions.TryGetValue(flag, out var flagLoad)
+            || flagLoad is not { OpCode: OpCode.Move, MemoryAccessSize: 4, Operands: [_, MemoryOperand
+                { Base: LocalVariable klass, Index: null, Scale: 0, Addend: CctorFinishedOffset64 }] }
+            || FollowCopies(klass, definitions) is not LocalVariable originalClass
+            || !definitions.TryGetValue(originalClass, out var classLoad)
+            || classLoad is not { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext classType] })
+            return;
+
+        if (!guard.Successors.Contains(merge)
+            || guard.Successors.FirstOrDefault(successor => successor != merge) is not { } reload
+            || reload.Predecessors is not [var predecessor] || predecessor != guard
+            || reload.Successors.Count != 2 || !reload.Successors.Contains(merge)
+            || reload.Instructions.LastOrDefault() is not { OpCode: OpCode.ConditionalJump,
+                Operands: [Block failure, LocalVariable isNull] } || failure == merge || !reload.Successors.Contains(failure))
+            return;
+
+        if (!definitions.TryGetValue(isNull, out var nullCheck)
+            || nullCheck is not { OpCode: OpCode.CheckEqual, Operands: [_, LocalVariable receiver, Immediate { Value: 0 }] }
+            || !definitions.TryGetValue(receiver, out var read)
+            || read is not { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.IsStatic: true, Parent: null } field] }
+            || !MetadataResolver.IsSameType(field.Field.DeclaringType, classType))
+            return;
+
+        var operations = reload.Instructions.Where(instruction => instruction.OpCode != OpCode.Nop).ToArray();
+        if (operations.Length < 4 || !InitializesClass(operations[0], klass, definitions)
+            || operations[operations.Length - 3] != read || operations[operations.Length - 2] != nullCheck)
+            return;
+
+        // The only extra values on the initializer edge are metadata handles.
+        for (var i = 1; i < operations.Length - 3; i++)
+            if (operations[i] is not { OpCode: OpCode.Move, Operands: [LocalVariable, TypeAnalysisContext] })
+                return;
+
+        if (failure.Instructions.Where(instruction => instruction.OpCode != OpCode.Nop).ToArray() is not
+            [{ OpCode: OpCode.Throw, Operands: [TypeAnalysisContext { FullName: "System.NullReferenceException" }] }])
+            return;
+
+        var fastIndex = merge.Predecessors.IndexOf(guard);
+        var slowIndex = merge.Predecessors.IndexOf(reload);
+        if (fastIndex < 0 || slowIndex < 0)
+            return;
+
+        var phis = merge.Instructions.Where(instruction => instruction.OpCode == OpCode.Phi).ToArray();
+        var mergesReloadedField = false;
+        foreach (var phi in phis)
+        {
+            if (phi.Operands.Count != merge.Predecessors.Count + 1)
+                return;
+
+            var fast = FollowCopies(phi.Operands[fastIndex + 1], definitions);
+            var slow = FollowCopies(phi.Operands[slowIndex + 1], definitions);
+            if (Equals(fast, slow))
+                continue;
+
+            if (!ReferenceEquals(slow, receiver)
+                || fast is not LocalVariable cached || !definitions.TryGetValue(cached, out var cachedRead)
+                || cachedRead is not { OpCode: OpCode.Move, Operands: [_, FieldReference { Parent: null } cachedField] }
+                || !ReferenceEquals(cachedField.Field, field.Field))
+                return;
+
+            mergesReloadedField = true;
+        }
+
+        if (!mergesReloadedField)
+            return;
+
+        foreach (var phi in phis)
+            phi.RemoveOperandAt(fastIndex + 1);
+        merge.Predecessors.RemoveAt(fastIndex);
+        guard.Successors.Remove(merge);
+        branch.OpCode = OpCode.Jump;
+        branch.SetOperands(reload);
+        guard.CalculateBlockType();
+        discardedLoads.Add(flagLoad);
     }
 
     // wasm keeps the initialized-flag check inside the class-init function, so callers make bare unguarded

@@ -410,6 +410,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+        MetadataInitGuardRemover.RunClassReloads(this);
         MetadataResolver.RecoverDelegateTargets(this);
         LocalVariables.RecoverFloatAggregateSources(this);
 
