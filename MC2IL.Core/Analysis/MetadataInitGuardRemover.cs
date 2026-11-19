@@ -303,15 +303,92 @@ public static class MetadataInitGuardRemover
 
         var removedAny = false;
         var discardedGuardLoads = new HashSet<Instruction>();
+        List<(Block Continuation, TypeAnalysisContext Type)>? completedCctors = null;
 
         foreach (var guard in cfg.Blocks.ToList())
-            removedAny |= TryRemoveGuard(cfg, guard, initialisedFlagOffsets, definitions, discardedGuardLoads);
+        {
+            var established = keepBareCalls && MatchCctorGuard(guard, definitions) is { } match
+                && match.Slow.Successors is [var continuation] && continuation == match.Fast ? match : null;
+            if (!TryRemoveGuard(cfg, guard, initialisedFlagOffsets, definitions, discardedGuardLoads))
+                continue;
+            removedAny = true;
+            if (established is { } proof && guard.Successors is [var remaining] && remaining == proof.Fast
+                && remaining.Predecessors is [var predecessor] && predecessor == guard)
+                (completedCctors ??= []).Add((remaining, proof.Type));
+        }
 
+        if (completedCctors != null)
+            RemoveRepeatedCctorReloads(cfg, definitions, completedCctors, discardedGuardLoads);
         if (!keepBareCalls)
             removedAny |= RemoveBareClassInitCalls(cfg);
 
         if (removedAny)
             DeadCodeEliminator.Run(cfg, discardedGuardLoads);
+    }
+
+    private sealed record CctorGuard(TypeAnalysisContext Type, Instruction FlagLoad,
+        Block Fast, Block Slow, Instruction Branch);
+
+    private static CctorGuard? MatchCctorGuard(Block guard, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        if (guard.Successors.Count != 2 || guard.Instructions.LastOrDefault() is not
+                { OpCode: OpCode.ConditionalJump, Operands: [Block taken, LocalVariable condition] } branch
+            || !guard.Successors.Contains(taken)
+            || !definitions.TryGetValue(condition, out var nonzero)
+            || nonzero is not { OpCode: OpCode.Not, Operands: [_, LocalVariable isZero] }
+            || !definitions.TryGetValue(isZero, out var comparison)
+            || comparison is not { OpCode: OpCode.CheckEqual, Operands: [_, LocalVariable flag, Immediate { Value: 0 }] }
+            || !definitions.TryGetValue(flag, out var flagLoad)
+            || flagLoad is not { OpCode: OpCode.Move, MemoryAccessSize: 4, Operands: [_, MemoryOperand
+                { Base: LocalVariable klass, Index: null, Scale: 0, Addend: CctorFinishedOffset64 }] }
+            || FollowCopies(klass, definitions) is not LocalVariable originalClass
+            || !definitions.TryGetValue(originalClass, out var classLoad)
+            || classLoad is not { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext classType] }
+            || guard.Successors.FirstOrDefault(successor => successor != taken) is not { } slow
+            || slow.Predecessors is not [var predecessor] || predecessor != guard
+            || slow.Instructions.FirstOrDefault(instruction => instruction.OpCode != OpCode.Nop) is not { } init
+            || !InitializesClass(init, klass, definitions))
+            return null;
+
+        return new CctorGuard(classType, flagLoad, taken, slow, branch);
+    }
+
+    private static void RemoveRepeatedCctorReloads(ISILControlFlowGraph cfg,
+        Dictionary<LocalVariable, Instruction> definitions,
+        List<(Block Continuation, TypeAnalysisContext Type)> completedCctors, HashSet<Instruction> discardedLoads)
+    {
+        // Prefer the cached value when the preceding guard checked the same class
+        // and there is no call or store between the two cctor checks.
+        var removed = false;
+        foreach (var guard in cfg.Blocks.ToArray())
+        {
+            if (MatchCctorGuard(guard, definitions) is not { } match
+                || guard.Predecessors is not [var previous]
+                || !completedCctors.Any(proof => proof.Continuation == previous && ReferenceEquals(proof.Type, match.Type))
+                || !previous.Instructions.All(IsCctorCheckStep) || !guard.Instructions.All(IsCctorCheckStep)
+                || !match.Slow.Instructions.SkipWhile(instruction => instruction.OpCode == OpCode.Nop)
+                    .Skip(1).All(IsCctorCheckStep)
+                || match.Slow.Successors.Count != 2 || !match.Slow.Successors.Contains(match.Fast)
+                || match.Slow.Successors.FirstOrDefault(successor => successor != match.Fast) is not { } failure
+                || failure.Instructions.Where(instruction => instruction.OpCode != OpCode.Nop).ToArray() is not
+                    [{ OpCode: OpCode.Throw, Operands: [TypeAnalysisContext { FullName: "System.NullReferenceException" }] }])
+                continue;
+
+            HashSet<Block> region = [match.Slow];
+            if (HasEscapingValues(cfg, region, match.Fast))
+                continue;
+
+            Excise(cfg, guard, match.Slow, match.Fast, region);
+            discardedLoads.Add(match.FlagLoad);
+            removed = true;
+        }
+
+        if (removed)
+            cfg.RemoveUnreachableBlocks();
+
+        static bool IsCctorCheckStep(Instruction instruction) => instruction.OpCode is
+            OpCode.Nop or OpCode.Jump or OpCode.ConditionalJump or OpCode.Phi or OpCode.Not or OpCode.CheckEqual
+            || instruction is { OpCode: OpCode.Move, Destination: LocalVariable };
     }
 
     internal static void RunClassReloads(MethodAnalysisContext method)
@@ -346,23 +423,7 @@ public static class MetadataInitGuardRemover
     private static void TryKeepManagedReload(Block guard, Dictionary<LocalVariable, Instruction> definitions,
         HashSet<Instruction> discardedLoads)
     {
-        if (guard.Successors.Count != 2 || guard.Instructions.LastOrDefault() is not
-                { OpCode: OpCode.ConditionalJump, Operands: [Block merge, LocalVariable condition] } branch
-            || !definitions.TryGetValue(condition, out var nonzero)
-            || nonzero is not { OpCode: OpCode.Not, Operands: [_, LocalVariable isZero] }
-            || !definitions.TryGetValue(isZero, out var comparison)
-            || comparison is not { OpCode: OpCode.CheckEqual, Operands: [_, LocalVariable flag, Immediate { Value: 0 }] }
-            || !definitions.TryGetValue(flag, out var flagLoad)
-            || flagLoad is not { OpCode: OpCode.Move, MemoryAccessSize: 4, Operands: [_, MemoryOperand
-                { Base: LocalVariable klass, Index: null, Scale: 0, Addend: CctorFinishedOffset64 }] }
-            || FollowCopies(klass, definitions) is not LocalVariable originalClass
-            || !definitions.TryGetValue(originalClass, out var classLoad)
-            || classLoad is not { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext classType] })
-            return;
-
-        if (!guard.Successors.Contains(merge)
-            || guard.Successors.FirstOrDefault(successor => successor != merge) is not { } reload
-            || reload.Predecessors is not [var predecessor] || predecessor != guard
+        if (MatchCctorGuard(guard, definitions) is not (var classType, var flagLoad, var merge, var reload, var branch)
             || reload.Successors.Count != 2 || !reload.Successors.Contains(merge)
             || reload.Instructions.LastOrDefault() is not { OpCode: OpCode.ConditionalJump,
                 Operands: [Block failure, LocalVariable isNull] } || failure == merge || !reload.Successors.Contains(failure))
@@ -376,7 +437,7 @@ public static class MetadataInitGuardRemover
             return;
 
         var operations = reload.Instructions.Where(instruction => instruction.OpCode != OpCode.Nop).ToArray();
-        if (operations.Length < 4 || !InitializesClass(operations[0], klass, definitions)
+        if (operations.Length < 4
             || operations[operations.Length - 3] != read || operations[operations.Length - 2] != nullCheck)
             return;
 
