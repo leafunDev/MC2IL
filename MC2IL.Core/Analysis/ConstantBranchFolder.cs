@@ -11,6 +11,7 @@ public static class ConstantBranchFolder
     public static void Run(MethodAnalysisContext method)
     {
         var graph = method.ControlFlowGraph!;
+        var removedEdge = false;
 
         foreach (var block in graph.Blocks)
         {
@@ -22,19 +23,25 @@ public static class ConstantBranchFolder
             if (branch is not { OpCode: OpCode.ConditionalJump, Operands: [_, Immediate condition] })
                 continue;
 
-            if (ResolveTarget(branch, graph) is not { } taken)
+            if (block.Successors.Count != 2
+                || ResolveTarget(branch, graph) is not { } taken
+                || !block.Successors.Contains(taken))
                 continue;
 
-            var destination = condition.Value != 0
-                ? taken
-                : block.Successors.FirstOrDefault(s => s != taken && s != graph.ExitBlock);
-
-            if (destination == null)
-                continue;
+            var fallthrough = block.Successors.First(s => s != taken);
+            var destination = condition.Value != 0 ? taken : fallthrough;
+            var discarded = condition.Value != 0 ? fallthrough : taken;
 
             branch.OpCode = OpCode.Jump;
             branch.SetOperands(destination);
+            block.Successors.Remove(discarded);
+            discarded.Predecessors.Remove(block);
+            block.CalculateBlockType();
+            removedEdge = true;
         }
+
+        if (removedEdge)
+            graph.RemoveUnreachableBlocks();
     }
 
     private static Block? ResolveTarget(Instruction branch, ISILControlFlowGraph graph) => branch.Operands[0] switch

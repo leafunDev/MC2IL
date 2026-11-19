@@ -24,6 +24,21 @@ public static class ConstantFolder
 
     private static bool TryFold(Instruction instruction, int pointerSize)
     {
+        if (instruction is { OpCode: OpCode.Call, Operands: [MethodAnalysisContext
+                { IsStatic: true, Name: "IsNullOrEmpty", Parameters.Count: 1 } target,
+                LocalVariable result, StringLiteral or Immediate { Value: 0 }, ..] }
+            && target.AppContext.SystemTypes is { SystemStringType: { } stringType, SystemBooleanType: { } boolType }
+            && ReferenceEquals(target.DeclaringType, stringType)
+            && ReferenceEquals(target.Parameters[0].ParameterType, stringType)
+            && ReferenceEquals(target.ReturnType, boolType))
+        {
+            var isNullOrEmpty = instruction.Operands[2] is not StringLiteral { Value.Length: > 0 };
+            result.Type ??= boolType;
+            instruction.OpCode = OpCode.Move;
+            instruction.SetOperands(result, new Immediate(isNullOrEmpty ? 1 : 0));
+            return true;
+        }
+
         // FMOV across register banks preserves every bit, including infinities,
         // signed zero and subnormals. The numeric literal heuristics do not apply.
         if (instruction is { OpCode: OpCode.Convert, Operands: [_, var input, NumericConversion { Kind: var kind }] })
@@ -48,10 +63,18 @@ public static class ConstantFolder
         }
 
         // Unary constant folds.
-        if (instruction is { OpCode: OpCode.Not, Operands: [_, Immediate n] })
-            return ToConstant(instruction, ~n.Value);
+        if (instruction is { OpCode: OpCode.Not, Operands: [LocalVariable { Type.FullName: "System.Boolean" }, Immediate n] })
+            return ToConstant(instruction, n.Value == 0 ? 1 : 0);
+        if (instruction is { OpCode: OpCode.Not, Operands: [_, Immediate notInput] })
+            return ToConstant(instruction, ~notInput.Value);
         if (instruction is { OpCode: OpCode.Negate, Operands: [_, Immediate m] })
             return ToConstant(instruction, -m.Value);
+
+        // A managed string literal always denotes a non-null reference, including "".
+        if (instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual
+            && instruction.Operands is [_, StringLiteral, Immediate { Value: 0 }]
+                or [_, Immediate { Value: 0 }, StringLiteral])
+            return ToConstant(instruction, instruction.OpCode == OpCode.CheckEqual ? 0 : 1);
 
         // metadata handles are by definition never null
         if (instruction is { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [_, TypeAnalysisContext, var against] }
