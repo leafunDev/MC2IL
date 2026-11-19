@@ -490,9 +490,28 @@ public static class IlGenerator
             if (!ReferenceEquals(localEntry.Value, inputLocal))
                 continue;
 
-            InlineSingleUseTemporary(block, consumerIndex, consumer, localEntry.Key, graph, instructionMap, locals);
+            // Keep a receiver on the stack while the following field load evaluates another
+            // argument. The field load still runs in its original place.
+            var isReceiver = consumer.IsCall && consumer.Operands[0] is MethodAnalysisContext { IsStatic: false }
+                && consumer.Operands.Count > ConstructorReceiverIndex(consumer)
+                && ReferenceEquals(consumer.Operands[ConstructorReceiverIndex(consumer)], localEntry.Key);
+            InlineSingleUseTemporary(block, consumerIndex, consumer, localEntry.Key, graph, instructionMap, locals,
+                isReceiver ? candidate => IsStackNeutralArgumentFieldLoad(candidate, consumer, instructionMap, locals) : null);
             return;
         }
+    }
+
+    private static bool IsStackNeutralArgumentFieldLoad(Instruction candidate, Instruction consumer,
+        Dictionary<Instruction, List<CilInstruction>> instructionMap, Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        return candidate is { OpCode: OpCode.Move, Operands: [LocalVariable argument, FieldReference
+                { Parent: null, Local.IsThis: true, Field.IsStatic: false }] }
+            && consumer.Operands.Skip(ConstructorReceiverIndex(consumer) + 1).Any(value => ReferenceEquals(value, argument))
+            && locals.TryGetValue(argument, out var slot)
+            && instructionMap.TryGetValue(candidate, out var emitted)
+            && emitted is [var load, var field, var store]
+            && load.OpCode == CilOpCodes.Ldarg_0 && field.OpCode == CilOpCodes.Ldfld && store.OpCode == CilOpCodes.Stloc
+            && ReferenceEquals(store.Operand, slot);
     }
 
     private static void InlineSingleUseCallArguments(Block block, int consumerIndex, ISILControlFlowGraph graph,
@@ -546,6 +565,12 @@ public static class IlGenerator
                 || producerIl[^1] is not { OpCode: var storeOpcode, Operand: var storedLocal }
                 || storeOpcode != CilOpCodes.Stloc
                 || !ReferenceEquals(storedLocal, ilLocal))
+                continue;
+
+            // The receiver may already be on the stack. In that case a field argument
+            // produced immediately before this call can also stay on the stack.
+            if (IsStackNeutralArgumentFieldLoad(producer, consumer, instructionMap, locals)
+                && TryInlineStackValue(producer, consumer, argument, instructionMap, locals))
                 continue;
 
             var purePrefix = HasOnlyPureLoadsBefore(consumerIl, loadIndex);
@@ -907,10 +932,10 @@ public static class IlGenerator
     private static void InlineSingleUseTemporary(Block block, int consumerIndex, Instruction consumer,
         LocalVariable local, ISILControlFlowGraph graph,
         Dictionary<Instruction, List<CilInstruction>> instructionMap,
-        Dictionary<LocalVariable, CilLocalVariable> locals)
+        Dictionary<LocalVariable, CilLocalVariable> locals, Func<Instruction, bool>? canCross = null)
     {
         if (CountLocalUses(graph, local) != 1
-            || !TryFindSingleUseProducer(block, consumerIndex, local, out _, out _, out var producer))
+            || !TryFindSingleUseProducer(block, consumerIndex, local, out _, out _, out var producer, canCross))
             return;
 
         TryInlineStackValue(producer, consumer, local, instructionMap, locals);
@@ -973,18 +998,17 @@ public static class IlGenerator
             || storeOpcode != CilOpCodes.Stloc
             || !ReferenceEquals(storedLocal, ilLocal)
             || !instructionMap.TryGetValue(consumer, out var consumerIl)
-            || consumerIl.Count == 0
-            || consumerIl[0] is not { OpCode: var loadOpcode, Operand: var loadedLocal }
-            || loadOpcode != CilOpCodes.Ldloc
-            || !ReferenceEquals(loadedLocal, ilLocal))
+            || consumerIl.FirstOrDefault(instruction => instruction.OpCode != CilOpCodes.Nop)
+                is not { OpCode: var loadOpcode, Operand: var loadedLocal } load
+            || loadOpcode != CilOpCodes.Ldloc || !ReferenceEquals(loadedLocal, ilLocal))
             return false;
 
         // The producer's result is already on the stack. Remove its store and the matching load so
         // the consumer can use the value directly.
         producerIl[^1].OpCode = CilOpCodes.Nop;
         producerIl[^1].Operand = null;
-        consumerIl[0].OpCode = CilOpCodes.Nop;
-        consumerIl[0].Operand = null;
+        load.OpCode = CilOpCodes.Nop;
+        load.Operand = null;
         return true;
     }
 

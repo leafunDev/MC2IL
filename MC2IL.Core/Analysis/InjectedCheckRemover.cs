@@ -118,11 +118,10 @@ public static class InjectedCheckRemover
             || allocation is not { OpCode: OpCode.Newobj, Operands: [_, TypeAnalysisContext { IsValueType: false } allocatedType] })
             return false;
 
-        var comparedAt = checkedBlock.Instructions.IndexOf(comparison);
-        var allocatedAt = checkedBlock.Instructions.IndexOf(allocation);
-        if (allocatedAt < 0 || allocatedAt >= comparedAt
-            || checkedBlock.Instructions.Skip(allocatedAt + 1).Take(comparedAt - allocatedAt - 1)
-                .Any(instruction => instruction.OpCode != OpCode.Nop))
+        // The allocation helper ends its native basic block. The null test can be the
+        // first operation of the next block, provided that edge has no alternate entry.
+        if (!ReferenceEquals(InstructionsBefore(checkedBlock, comparison)
+                .FirstOrDefault(instruction => instruction.OpCode is not (OpCode.Nop or OpCode.Jump)), allocation))
             return false;
 
         if (FirstManagedOperation(continuation, defOf, out var singleEntryPath) is not { } constructorCall
@@ -174,15 +173,38 @@ public static class InjectedCheckRemover
     private static LocalVariable? GetCheckedReceiverOwner(Block block, Instruction comparison, IOperand receiver,
         Dictionary<LocalVariable, Instruction> defOf)
     {
-        if (receiver is not LocalVariable local
-            || !defOf.TryGetValue(local, out var load)
-            || load is not { OpCode: OpCode.Move, Operands: [_, FieldReference
-                { Parent: null, Local: { IsThis: true, Type.IsValueType: false } owner, Field.IsStatic: false }] })
+        if (receiver is not LocalVariable local || !defOf.ContainsKey(local))
             return null;
 
-        // The branch can only be reached after the load has successfully dereferenced this.
-        var loadIndex = block.Instructions.IndexOf(load);
-        return loadIndex >= 0 && loadIndex < block.Instructions.IndexOf(comparison) ? owner : null;
+        // A previous field read on the same path proves the reference in the this slot
+        // nonnull even when the tested local came from a call, rather than from that read.
+        foreach (var instruction in InstructionsBefore(block, comparison))
+            if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, FieldReference
+                { Parent: null, Local: { IsThis: true, Type.IsValueType: false } owner, Field.IsStatic: false }] })
+                return owner;
+
+        return null;
+    }
+
+    private static IEnumerable<Instruction> InstructionsBefore(Block block, Instruction instruction)
+    {
+        var index = block.Instructions.IndexOf(instruction);
+        if (index < 0)
+            yield break;
+
+        var visited = new HashSet<Block>();
+        // Looking further is optional. Bound the work per guard in very large methods.
+        for (var remaining = 12; remaining > 0 && visited.Add(block); remaining--)
+        {
+            for (var i = index - 1; i >= 0; i--)
+                yield return block.Instructions[i];
+
+            if (block.Predecessors is not [var predecessor] || predecessor.BlockType == BlockType.Entry)
+                yield break;
+
+            block = predecessor;
+            index = block.Instructions.Count;
+        }
     }
 
     private static bool HasImplicitNullCheck(Block continuation, IOperand receiver,
