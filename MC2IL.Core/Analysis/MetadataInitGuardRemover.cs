@@ -329,11 +329,14 @@ public static class MetadataInitGuardRemover
     private sealed record CctorGuard(TypeAnalysisContext Type, Instruction FlagLoad,
         Block Fast, Block Slow, Instruction Branch);
 
-    private static CctorGuard? MatchCctorGuard(Block guard, Dictionary<LocalVariable, Instruction> definitions)
+    private readonly record struct CctorFlag(TypeAnalysisContext Type, Instruction Load, LocalVariable ClassPointer,
+        Block Ready, Block Slow, Instruction Branch);
+
+    private static CctorFlag? MatchCctorFlag(Block guard, Dictionary<LocalVariable, Instruction> definitions)
     {
-        if (guard.Successors.Count != 2 || guard.Instructions.LastOrDefault() is not
+        if (guard.Successors is not [var first, var second] || guard.Instructions.LastOrDefault() is not
                 { OpCode: OpCode.ConditionalJump, Operands: [Block taken, LocalVariable condition] } branch
-            || !guard.Successors.Contains(taken)
+            || (taken != first && taken != second)
             || !definitions.TryGetValue(condition, out var nonzero)
             || nonzero is not { OpCode: OpCode.Not, Operands: [_, LocalVariable isZero] }
             || !definitions.TryGetValue(isZero, out var comparison)
@@ -343,14 +346,21 @@ public static class MetadataInitGuardRemover
                 { Base: LocalVariable klass, Index: null, Scale: 0, Addend: CctorFinishedOffset64 }] }
             || FollowCopies(klass, definitions) is not LocalVariable originalClass
             || !definitions.TryGetValue(originalClass, out var classLoad)
-            || classLoad is not { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext classType] }
-            || guard.Successors.FirstOrDefault(successor => successor != taken) is not { } slow
-            || slow.Predecessors is not [var predecessor] || predecessor != guard
-            || slow.Instructions.FirstOrDefault(instruction => instruction.OpCode != OpCode.Nop) is not { } init
-            || !InitializesClass(init, klass, definitions))
+            || classLoad is not { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext classType] })
             return null;
 
-        return new CctorGuard(classType, flagLoad, taken, slow, branch);
+        return new CctorFlag(classType, flagLoad, klass, taken, taken == first ? second : first, branch);
+    }
+
+    private static CctorGuard? MatchCctorGuard(Block guard, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        if (MatchCctorFlag(guard, definitions) is not { } flag
+            || flag.Slow.Predecessors is not [var predecessor] || predecessor != guard
+            || flag.Slow.Instructions.FirstOrDefault(instruction => instruction.OpCode != OpCode.Nop) is not { } init
+            || !InitializesClass(init, flag.ClassPointer, definitions))
+            return null;
+
+        return new CctorGuard(flag.Type, flag.Load, flag.Ready, flag.Slow, flag.Branch);
     }
 
     private static void RemoveRepeatedCctorReloads(ISILControlFlowGraph cfg,
@@ -407,6 +417,7 @@ public static class MetadataInitGuardRemover
                 definitions[local] = instruction;
 
         var discardedLoads = new HashSet<Instruction>();
+        RemoveSharedCctorGuards(cfg, definitions, discardedLoads);
         foreach (var guard in cfg.Blocks)
             TryKeepManagedReload(guard, definitions, discardedLoads);
 
@@ -416,6 +427,117 @@ public static class MetadataInitGuardRemover
 
     private static bool SupportsClassReloads(MethodAnalysisContext method) =>
         method.AppContext.InstructionSet is NewArmV8InstructionSet && method.AppContext.MetadataVersion == 29;
+
+    // Multiple checks can share a single initializer, passing X0 through a phi. Match every
+    // incoming edge before deleting the shared slow path and its inputs to the join.
+    private static void RemoveSharedCctorGuards(ISILControlFlowGraph cfg,
+        Dictionary<LocalVariable, Instruction> definitions, HashSet<Instruction> discardedLoads)
+    {
+        var changed = false;
+        foreach (var initBlock in cfg.Blocks)
+        {
+            if (initBlock.Predecessors.Count < 2 || initBlock.Successors is not [var merge])
+                continue;
+
+            var init = initBlock.Instructions.FirstOrDefault(IsClassInitCall);
+            if (init == null || initBlock.Instructions.Any(instruction => instruction != init
+                    && instruction.OpCode is not (OpCode.Phi or OpCode.Nop or OpCode.Jump)))
+                continue;
+
+            var argIndex = init.OpCode == OpCode.Call ? 2 : 1;
+            if (init.Operands.Count <= argIndex || init.Operands[argIndex] is not LocalVariable argument
+                || !definitions.TryGetValue(argument, out var classPhi) || classPhi.OpCode != OpCode.Phi
+                || classPhi.Operands.Count != initBlock.Predecessors.Count + 1
+                || !initBlock.Instructions.Contains(classPhi))
+                continue;
+
+            // The join must immediately use a managed operation on that class. Otherwise removing
+            // the guard could move an observable class initialization past unrelated code.
+            var next = merge.Instructions.FirstOrDefault(instruction => instruction.OpCode is not (OpCode.Phi or OpCode.Nop)
+                && instruction is not { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable or Immediate or StringLiteral] });
+            var declaringType = next switch
+            {
+                { IsCall: true, Operands: [MethodAnalysisContext { IsStatic: true } target, ..] } => target.DeclaringType,
+                { OpCode: OpCode.Move, Operands: [LocalVariable, FieldReference { Field.IsStatic: true, Parent: null } field] }
+                    => field.Field.DeclaringType,
+                _ => null,
+            };
+            if (declaringType == null)
+                continue;
+
+            var initIndex = merge.Predecessors.IndexOf(initBlock);
+            if (initIndex < 0)
+                continue;
+
+            var mergePhis = merge.Instructions.Where(instruction => instruction.OpCode == OpCode.Phi).ToArray();
+            if (mergePhis.Any(phi => phi.Operands.Count != merge.Predecessors.Count + 1))
+                continue;
+
+            List<(Block Guard, CctorFlag Flag)> guards = [];
+            HashSet<Block> region = [initBlock];
+            for (var i = 0; i < initBlock.Predecessors.Count; i++)
+            {
+                var join = initBlock;
+                var guard = initBlock.Predecessors[i];
+                while (guard.Successors is [var successor] && successor == join
+                       && guard.Predecessors is [var predecessor]
+                       && guard.Instructions.All(instruction => instruction.OpCode is OpCode.Nop or OpCode.Jump)
+                       && region.Add(guard))
+                {
+                    join = guard;
+                    guard = predecessor;
+                }
+
+                if (MatchCctorFlag(guard, definitions) is not { } flag || flag.Ready != merge || flag.Slow != join
+                    || !MetadataResolver.IsSameType(declaringType, flag.Type is RuntimeClassTypeAnalysisContext runtimeClass
+                        ? runtimeClass.RepresentedType : flag.Type)
+                    || !SameClassMetadataValue(classPhi.Operands[i + 1], flag.ClassPointer, definitions))
+                    break;
+
+                var readyIndex = merge.Predecessors.IndexOf(guard);
+                if (readyIndex < 0 || mergePhis.Any(phi => !HasSameInput(phi, readyIndex, i)))
+                    break;
+
+                guards.Add((guard, flag));
+            }
+
+            if (guards.Count != initBlock.Predecessors.Count || HasEscapingValues(cfg, region, merge))
+                continue;
+
+            foreach (var phi in mergePhis)
+                phi.RemoveOperandAt(initIndex + 1);
+            merge.Predecessors.RemoveAt(initIndex);
+            initBlock.Successors.Remove(merge);
+
+            foreach (var (guard, flag) in guards)
+            {
+                guard.Successors.Remove(flag.Slow);
+                flag.Slow.Predecessors.Remove(guard);
+                flag.Branch.OpCode = OpCode.Jump;
+                flag.Branch.SetOperands(merge);
+                guard.CalculateBlockType();
+                discardedLoads.Add(flag.Load);
+            }
+            changed = true;
+
+            bool HasSameInput(Instruction phi, int readyIndex, int incomingIndex)
+            {
+                var slowValue = phi.Operands[initIndex + 1];
+                if (slowValue is LocalVariable local && definitions.TryGetValue(local, out var definition)
+                    && definition.OpCode == OpCode.Phi && initBlock.Instructions.Contains(definition))
+                {
+                    if (definition.Operands.Count != initBlock.Predecessors.Count + 1)
+                        return false;
+                    slowValue = definition.Operands[incomingIndex + 1];
+                }
+
+                return Equals(FollowCopies(slowValue, definitions), FollowCopies(phi.Operands[readyIndex + 1], definitions));
+            }
+        }
+
+        if (changed)
+            cfg.RemoveUnreachableBlocks();
+    }
 
     // IL2CPP may reuse an earlier static field read when the class is ready and reload
     // it after the class initializer otherwise. In managed IL the reload itself handles
