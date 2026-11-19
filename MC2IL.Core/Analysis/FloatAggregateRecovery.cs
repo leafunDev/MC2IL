@@ -10,6 +10,29 @@ namespace MC2IL.Core.Analysis;
 
 internal static class FloatAggregateRecovery
 {
+    // The CIL emitter builds this value in scratch storage from typed constants only.
+    // There is no external read, allocation or call between the receiver and the setter.
+    internal static bool IsLiteralPack(Instruction instruction)
+    {
+        if (instruction is not { OpCode: OpCode.PackFloatAggregate,
+                Operands: [LocalVariable { Type: var resultType }, TypeAnalysisContext type, ..] }
+            || resultType != type || Arm64CallingConventionResolver.GetFloatAggregateFields(type) is not { } fields
+            || fields.Length + 2 != instruction.Operands.Count)
+            return false;
+
+        for (var i = 0; i < fields.Length; i++)
+        {
+            var field = fields[i];
+            if ((field.Attributes & (FieldAttributes.FieldAccessMask | FieldAttributes.InitOnly)) != FieldAttributes.Public
+                || !(field.FieldType.FullName == "System.Single"
+                    ? instruction.Operands[i + 2] is FloatLiteral
+                    : instruction.Operands[i + 2] is DoubleLiteral))
+                return false;
+        }
+
+        return true;
+    }
+
     internal static void Run(MethodAnalysisContext method)
     {
         if (method.AppContext.InstructionSet.CallingConventionResolver is not Arm64CallingConventionResolver)

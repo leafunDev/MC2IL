@@ -496,22 +496,30 @@ public static class IlGenerator
                 && consumer.Operands.Count > ConstructorReceiverIndex(consumer)
                 && ReferenceEquals(consumer.Operands[ConstructorReceiverIndex(consumer)], localEntry.Key);
             InlineSingleUseTemporary(block, consumerIndex, consumer, localEntry.Key, graph, instructionMap, locals,
-                isReceiver ? candidate => IsStackNeutralArgumentFieldLoad(candidate, consumer, instructionMap, locals) : null);
+                isReceiver ? candidate => IsStackNeutralArgumentProducer(candidate, consumer, instructionMap, locals) : null);
             return;
         }
     }
 
-    private static bool IsStackNeutralArgumentFieldLoad(Instruction candidate, Instruction consumer,
+    private static bool IsStackNeutralArgumentProducer(Instruction candidate, Instruction consumer,
         Dictionary<Instruction, List<CilInstruction>> instructionMap, Dictionary<LocalVariable, CilLocalVariable> locals)
     {
-        return candidate is { OpCode: OpCode.Move, Operands: [LocalVariable argument, FieldReference
+        if (candidate.Destination is not LocalVariable argument
+            || !consumer.Operands.Skip(ConstructorReceiverIndex(consumer) + 1).Any(value => ReferenceEquals(value, argument))
+            || !locals.TryGetValue(argument, out var slot)
+            || !instructionMap.TryGetValue(candidate, out var emitted)
+            || emitted.Count == 0 || emitted[^1].OpCode != CilOpCodes.Stloc
+            || !ReferenceEquals(emitted[^1].Operand, slot))
+            return false;
+
+        // It is safe to leave another value beneath the scratch value on the evaluation stack.
+        if (FloatAggregateRecovery.IsLiteralPack(candidate))
+            return emitted.Count >= 3 && emitted[0].OpCode == CilOpCodes.Ldloca && emitted[^2].OpCode == CilOpCodes.Ldloc;
+
+        return candidate is { OpCode: OpCode.Move, Operands: [_, FieldReference
                 { Parent: null, Local.IsThis: true, Field.IsStatic: false }] }
-            && consumer.Operands.Skip(ConstructorReceiverIndex(consumer) + 1).Any(value => ReferenceEquals(value, argument))
-            && locals.TryGetValue(argument, out var slot)
-            && instructionMap.TryGetValue(candidate, out var emitted)
-            && emitted is [var load, var field, var store]
-            && load.OpCode == CilOpCodes.Ldarg_0 && field.OpCode == CilOpCodes.Ldfld && store.OpCode == CilOpCodes.Stloc
-            && ReferenceEquals(store.Operand, slot);
+            && emitted is [var load, var field, _]
+            && load.OpCode == CilOpCodes.Ldarg_0 && field.OpCode == CilOpCodes.Ldfld;
     }
 
     private static void InlineSingleUseCallArguments(Block block, int consumerIndex, ISILControlFlowGraph graph,
@@ -567,9 +575,9 @@ public static class IlGenerator
                 || !ReferenceEquals(storedLocal, ilLocal))
                 continue;
 
-            // The receiver may already be on the stack. In that case a field argument
-            // produced immediately before this call can also stay on the stack.
-            if (IsStackNeutralArgumentFieldLoad(producer, consumer, instructionMap, locals)
+            // An argument produced immediately before the call can stay on the stack
+            // above a receiver whose load was already inlined.
+            if (IsStackNeutralArgumentProducer(producer, consumer, instructionMap, locals)
                 && TryInlineStackValue(producer, consumer, argument, instructionMap, locals))
                 continue;
 

@@ -296,6 +296,8 @@ public static class InjectedCheckRemover
             { OpCode: OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide,
                 Operands: [LocalVariable destination, var left, var right, FloatingPointPrecision] } =>
                 defOf.ContainsKey(destination) && IsFloatValue(left) && IsFloatValue(right),
+            { OpCode: OpCode.PackFloatAggregate, Destination: LocalVariable destination } =>
+                defOf.ContainsKey(destination) && FloatAggregateRecovery.IsLiteralPack(instruction),
             _ => false,
         };
     }
