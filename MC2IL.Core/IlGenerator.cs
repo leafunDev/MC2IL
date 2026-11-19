@@ -309,6 +309,7 @@ public static class IlGenerator
         IReadOnlyCollection<AssemblyDefinition> assemblies)
     {
         var removedCalls = 0;
+        var removedStores = 0;
 
         foreach (var module in assemblies.SelectMany(assembly => assembly.Modules))
         foreach (var type in EnumerateTypes(module))
@@ -318,6 +319,7 @@ public static class IlGenerator
                 continue;
 
             var instructions = body.Instructions;
+            var removedCallsBeforeBody = removedCalls;
             for (var i = 0; i < instructions.Count; i++)
             {
                 var instruction = instructions[i];
@@ -334,6 +336,11 @@ public static class IlGenerator
                 instruction.Operand = null;
                 removedCalls++;
             }
+
+            // Unresolved operations can keep input locals alive until the diagnostic is lowered.
+            // With the marker gone, those stores can still interrupt an expression in ILSpy.
+            if (removedCalls != removedCallsBeforeBody)
+                removedStores += RemoveUnreadSimpleLocalStores(body);
         }
 
         var removedHelperTypes = 0;
@@ -359,10 +366,72 @@ public static class IlGenerator
 
         if (removedCalls > 0 || removedHelperTypes > 0)
             Logger.InfoNewline(
-                $"Removed {removedCalls} injected decompiler diagnostic calls and {removedHelperTypes} unused helper types from recovered output.",
+                $"Removed {removedCalls} injected decompiler diagnostic calls, {removedStores} unread simple local stores, "
+                + $"and {removedHelperTypes} unused helper types from recovered output.",
                 "IlGenerator");
 
         return removedCalls;
+    }
+
+    internal static int RemoveUnreadSimpleLocalStores(CilMethodBody body)
+    {
+        if (body.LocalVariables.Count == 0 || body.ExceptionHandlers.Count != 0)
+            return 0;
+
+        var reads = new HashSet<CilLocalVariable>();
+        var targets = new HashSet<CilInstruction>();
+        foreach (var instruction in body.Instructions)
+        {
+            if (instruction.IsLdloc())
+                reads.Add(instruction.GetLocalVariable(body.LocalVariables));
+            else if (instruction.OpCode.Code is CilCode.Ldloca or CilCode.Ldloca_S)
+            {
+                if (instruction.Operand is not CilLocalVariable addressed)
+                    return 0;
+
+                reads.Add(addressed);
+            }
+
+            if (instruction.Operand is ICilLabel label)
+            {
+                if (label is not CilInstructionLabel { Instruction: { } target })
+                    return 0;
+
+                targets.Add(target);
+            }
+            else if (instruction.OpCode.OperandType == CilOperandType.InlineSwitch)
+            {
+                if (instruction.Operand is not IEnumerable<ICilLabel> labels)
+                    return 0;
+
+                foreach (var entry in labels)
+                {
+                    if (entry is not CilInstructionLabel { Instruction: { } target })
+                        return 0;
+
+                    targets.Add(target);
+                }
+            }
+        }
+
+        var removed = 0;
+        var instructions = body.Instructions;
+        for (var i = 1; i < instructions.Count; i++)
+        {
+            var store = instructions[i];
+            var load = instructions[i - 1];
+            if (!store.IsStloc() || reads.Contains(store.GetLocalVariable(body.LocalVariables)) || targets.Contains(store)
+                || i >= 2 && instructions[i - 2].OpCode.OpCodeType == CilOpCodeType.Prefix
+                || !(load.IsLdloc() || load.IsLdarg() || load.IsLdcI4()
+                    || load.OpCode.Code is CilCode.Ldc_I8 or CilCode.Ldc_R4 or CilCode.Ldc_R8 or CilCode.Ldnull))
+                continue;
+
+            load.ReplaceWithNop();
+            store.ReplaceWithNop();
+            removed++;
+        }
+
+        return removed;
     }
 
     private static bool IsInjectedDiagnosticCall(CilInstruction instruction) =>

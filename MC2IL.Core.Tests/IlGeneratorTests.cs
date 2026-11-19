@@ -90,6 +90,62 @@ public class IlGeneratorTests
         // are the stable contract for this test.
     }
 
+    [Test]
+    public void UnreadLocalCleanupKeepsAddressedAndBranchTargetStores()
+    {
+        var module = new ModuleDefinition("Test.dll");
+        var type = new TypeDefinition("Tests", "Locals", TypeAttributes.Public);
+        module.TopLevelTypes.Add(type);
+        var factory = module.CorLibTypeFactory;
+        var method = new MethodDefinition("Cleanup", MethodAttributes.Static,
+            MethodSignature.CreateStatic(factory.Void, [factory.Boolean]));
+        type.Methods.Add(method);
+        var body = new CilMethodBody();
+        method.CilMethodBody = body;
+
+        var addressed = new CilLocalVariable(factory.Int32);
+        var readUsingMacro = new CilLocalVariable(factory.Int32);
+        var unused = new CilLocalVariable(factory.Int64);
+        var writeAtJoin = new CilLocalVariable(factory.Int32);
+        var neededCall = new CilLocalVariable(factory.String);
+        foreach (var local in new[] { addressed, readUsingMacro, unused, writeAtJoin, neededCall })
+            body.LocalVariables.Add(local);
+
+        var deadLoad = new CilInstruction(CilOpCodes.Ldc_I8, 0L);
+        var deadStore = new CilInstruction(CilOpCodes.Stloc, unused);
+        var joinStore = new CilInstruction(CilOpCodes.Stloc_3);
+        var sideEffect = new MethodDefinition("Prepare", MethodAttributes.Static,
+            MethodSignature.CreateStatic(factory.String));
+        type.Methods.Add(sideEffect);
+        var il = body.Instructions;
+        il.Add(CilOpCodes.Ldc_I4_1);
+        il.Add(CilOpCodes.Stloc_0);
+        il.Add(CilOpCodes.Ldc_I4_2);
+        il.Add(CilOpCodes.Stloc_S, readUsingMacro);
+        il.Add(deadLoad);
+        il.Add(deadStore);
+        il.Add(CilOpCodes.Ldc_I4_3);
+        il.Add(CilOpCodes.Ldarg_0);
+        il.Add(CilOpCodes.Brtrue, new CilInstructionLabel(joinStore));
+        il.Add(CilOpCodes.Pop);
+        il.Add(CilOpCodes.Ldc_I4_4);
+        il.Add(joinStore);
+        il.Add(CilOpCodes.Ldloca_S, addressed);
+        il.Add(CilOpCodes.Pop);
+        il.Add(CilOpCodes.Ldloc_1);
+        il.Add(CilOpCodes.Pop);
+        il.Add(CilOpCodes.Call, sideEffect);
+        il.Add(CilOpCodes.Stloc, neededCall);
+        il.Add(CilOpCodes.Ret);
+
+        Assert.That(IlGenerator.RemoveUnreadSimpleLocalStores(body), Is.EqualTo(1));
+        Assert.That(deadLoad.OpCode, Is.EqualTo(CilOpCodes.Nop));
+        Assert.That(deadStore.OpCode, Is.EqualTo(CilOpCodes.Nop));
+        Assert.That(il.Where(i => i.IsStloc()).Select(i => i.GetLocalVariable(body.LocalVariables)),
+            Is.EqualTo(new[] { addressed, readUsingMacro, writeAtJoin, neededCall }));
+        Assert.That(body.ComputeMaxStack(), Is.EqualTo(2));
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public void FieldReceiverKeepsOriginalReadOrderAcrossArgumentCall(bool hasSecondUse)
