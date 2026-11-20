@@ -47,6 +47,7 @@
 
     <ItemGroup>
         <ProjectReference Include="..\MC2IL.Core\MC2IL.Core.csproj" />
+        <ProjectReference Include="..\MC2IL.ILanguageDecompiler\MC2IL.ILanguageDecompiler.csproj" />
     </ItemGroup>
 
     <ItemGroup Condition="'$(TargetFramework)' == 'net472'">

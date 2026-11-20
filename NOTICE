@@ -3,4 +3,6 @@ https://github.com/SamboyCoding/Cpp2IL
 
 The original MIT license and copyright notice are preserved in LICENSE. Project and namespace renames do not remove or replace those notices.
 
+The C# export uses ICSharpCode.Decompiler from ILSpy (https://github.com/icsharpcode/ILSpy), licensed under the MIT license. Its copyright and license are provided in LICENSES/ILSpy-MIT.txt.
+
 The OrbisPkg plugin includes LibOrbisPkg.Core.dll and its debug symbols in Plugins/OrbisPkg/Deps. LibOrbisPkg is developed at https://github.com/maxton/LibOrbisPkg and is licensed under the GNU Lesser General Public License, version 3. A copy of that license is provided in LICENSES/LGPL-3.0.txt. The library's source repository is available at the link above.

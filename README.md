@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/.NET-10-512BD4?style=flat-square" alt=".NET 10">
 </p>
 
-**MC2IL (Machine Code to IL)** analyzes Unity IL2CPP builds and reconstructs managed assemblies with recovered method bodies. It can take a Unity game folder or an Android APK and write DLLs, C#-oriented output, or an instruction-level dump.
+**MC2IL (Machine Code to IL)** analyzes Unity IL2CPP builds and reconstructs managed assemblies with recovered method bodies. It can take a Unity game folder or an Android APK and write DLLs, decompiled C# files, or an instruction-level dump.
 
 MC2IL is an early-stage tool. IL recovery is experimental: generated methods may still contain unresolved native values or incomplete control flow.
 
@@ -50,7 +50,13 @@ List all output formats:
 
     dotnet run --no-build --configuration Release --project MC2IL/MC2IL.csproj --framework net10.0 -- --list-output-formats
 
-The generated files are written to mc2il_out. Choose dll_il_recovery for recovered method bodies; results depend on the game, Unity version, and native code.
+Choose **Decompile to C# source files** in the wizard, or select `csharp` on the command line:
+
+    dotnet run --configuration Release --project MC2IL/MC2IL.csproj --framework net10.0 -- --game-path "C:\Games\Example.apk" --output-as csharp --output-to mc2il_out
+
+This writes `.cs` files under `mc2il_out/CSharp/<assembly>/`. MC2IL recovers method bodies and uses the bundled ILSpy engine to generate C#. The intermediate DLLs are temporary. Use a fresh output directory when comparing different game versions, so files from removed types do not carry over. The generated source may need edits before it can compile.
+
+Choose **Export both DLL and C# files** in the wizard or pass `--output-as dll_il_recovery csharp` to keep the DLLs in the output directory as well.
 
 For source reading, add `--reuse-singleton-instances` to reuse an earlier `MonoSingleton<T>.Instance` result for later reads of the same closed type. This can change behavior if the singleton changes between calls, so the default output preserves both calls.
 
@@ -59,6 +65,7 @@ For source reading, add `--reuse-singleton-instances` to reuse an earlier `MonoS
 | Format | Output |
 | --- | --- |
 | dll_il_recovery | Managed DLLs with recovered method bodies |
+| csharp | Decompiled C# source files with recovered method bodies |
 | dll_default | Managed DLLs with default method bodies |
 | dll_empty | Managed DLLs with empty method bodies |
 | dll_throw_null | Managed DLLs with throw-null method bodies |
@@ -74,6 +81,7 @@ For source reading, add `--reuse-singleton-instances` to reuse an earlier `MonoS
 | --- | --- |
 | MC2IL | Command-line application |
 | MC2IL.Core | Analysis pipeline, method recovery, and output formats |
+| MC2IL.ILanguageDecompiler | C# source export from recovered IL using ILSpy |
 | LibMC2IL | IL2CPP metadata and native-binary parsing |
 | Plugins/* | Optional processors, loaders, and output plugins |
 | WasmDisassembler | WebAssembly instruction decoding |

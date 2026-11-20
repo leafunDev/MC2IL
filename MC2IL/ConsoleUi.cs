@@ -18,6 +18,8 @@ internal static class ConsoleUi
     private static readonly OutputAction[] Actions =
     [
         new("Recover managed DLLs with method bodies", "dll_il_recovery", "Full IL recovery · recommended"),
+        new("Decompile to C# source files", ILanguageDecompiler.CSharpOutputFormat.FormatId, "C# with recovered method bodies"),
+        new("Export both DLL and C# files", "dll_il_recovery", "Both formats from a single recovery pass", ILanguageDecompiler.CSharpOutputFormat.FormatId),
         new("Export managed DLL metadata", "dll_default", "DLLs with default method bodies"),
         new("Export DLLs with empty method bodies", "dll_empty", "Metadata and signatures only"),
         new("Export DLLs with throw-null method bodies", "dll_throw_null", "Stub methods that throw on invocation"),
@@ -138,9 +140,11 @@ internal static class ConsoleUi
         var args = new System.Collections.Generic.List<string>
         {
             "--game-path", gamePath,
-            "--output-as", Actions[actionIndex].FormatId,
-            "--output-to", outputPath
+            "--output-as", Actions[actionIndex].FormatId
         };
+        if (Actions[actionIndex].AdditionalFormatId is { } additionalFormat) args.Add(additionalFormat);
+        args.Add("--output-to");
+        args.Add(outputPath);
         if (lowMemory) args.Add("--low-memory-mode");
         if (verbose) args.Add("--verbose");
         if (reuseSingletons) args.Add("--reuse-singleton-instances");
@@ -487,5 +491,5 @@ internal static class ConsoleUi
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GetConsoleMode(IntPtr handle, out uint mode);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool SetConsoleMode(IntPtr handle, uint mode);
 
-    private sealed record OutputAction(string Title, string FormatId, string Description);
+    private sealed record OutputAction(string Title, string FormatId, string Description, string? AdditionalFormatId = null);
 }

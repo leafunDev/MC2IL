@@ -27,6 +27,7 @@
   </Folder>
   <Project Path="MC2IL.Core.Tests/MC2IL.Core.Tests.csproj" />
   <Project Path="MC2IL.Core/MC2IL.Core.csproj" />
+  <Project Path="MC2IL.ILanguageDecompiler/MC2IL.ILanguageDecompiler.csproj" />
   <Project Path="Plugins/BuildReport/MC2IL.Plugin.BuildReport.csproj" />
   <Project Path="Plugins/ControlFlowGraph/MC2IL.Plugin.ControlFlowGraph.csproj" />
   <Project Path="Plugins/Mfuscator/MC2IL.Plugin.Mfuscator.csproj" />

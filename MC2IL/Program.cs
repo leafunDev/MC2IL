@@ -16,6 +16,8 @@ using LibMC2IL;
 using LibMC2IL.Metadata;
 using AssetRipper.Primitives;
 using MC2IL.Core.Extensions;
+using MC2IL.Core.OutputFormats;
+using MC2IL.ILanguageDecompiler;
 
 namespace MC2IL;
 
@@ -503,6 +505,7 @@ internal static class Program
 #pragma warning disable IL2026 // RequiresUnreferencedCode
         MC2ILApi.Init();
 #pragma warning restore IL2026
+        OutputFormatRegistry.Register<CSharpOutputFormat>();
 
         if (options.ListProcessors)
         {
@@ -566,7 +569,16 @@ internal static class Program
         {
             try
             {
-                result.OutputFormats = options.OutputFormatIds.Select(OutputFormatRegistry.GetFormat).ToList();
+                var formats = options.OutputFormatIds.Distinct().Select(OutputFormatRegistry.GetFormat).ToList();
+                var sourceIndex = formats.FindIndex(format => format is CSharpOutputFormat);
+                var dllIndex = formats.FindIndex(format => format.GetType() == typeof(AsmResolverDllOutputFormatIlRecovery));
+                if (sourceIndex >= 0 && dllIndex >= 0)
+                {
+                    // Both formats use the same recovered IL and must not mutate the analysis context twice.
+                    formats[Math.Min(sourceIndex, dllIndex)] = new CSharpOutputFormat(keepDlls: true);
+                    formats.RemoveAt(Math.Max(sourceIndex, dllIndex));
+                }
+                result.OutputFormats = formats;
                 Logger.VerboseNewline($"Selected output formats: [{string.Join(", ", options.OutputFormatIds)}]");
             }
             catch (Exception e)
