@@ -113,9 +113,105 @@ internal static class FloatAggregateRecovery
                     Remove(store);
             }
             else if (instruction is { OpCode: OpCode.Move,
-                         Operands: [FieldReference { Parent: null, Field.IsStatic: false, Local.IsThis: true } field, _] })
+                         Operands: [FieldReference { Field.IsStatic: false } field, _] })
             {
                 RecoverInstanceStore(block, i, field, definitions);
+            }
+        }
+    }
+
+    internal static void RecoverByRefArgumentLanes(MethodAnalysisContext method)
+    {
+        if (method.AppContext.InstructionSet.CallingConventionResolver is not Arm64CallingConventionResolver)
+            return;
+
+        var graph = method.ControlFlowGraph!;
+        var instructions = graph.Instructions;
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        foreach (var instruction in instructions)
+            if (instruction.Destination is LocalVariable local)
+                definitions[local] = instruction;
+        DominatorInfo? dominance = null;
+        foreach (var callBlock in graph.Blocks)
+        for (var callIndex = 0; callIndex < callBlock.Instructions.Count; callIndex++)
+        {
+            var call = callBlock.Instructions[callIndex];
+            if (!call.IsCall || call.Operands[0] is not MethodAnalysisContext callee)
+                continue;
+
+            var firstArgument = (call.OpCode == OpCode.CallVoid ? 1 : 2) + (callee.IsStatic ? 0 : 1);
+            for (var i = 0; i < callee.Parameters.Count && firstArgument + i < call.Operands.Count; i++)
+            {
+                var parameter = callee.Parameters[i];
+                if (parameter.ParameterType is not ByRefTypeAnalysisContext { ElementType: { } type }
+                    || !parameter.Attributes.HasFlag(ParameterAttributes.Out)
+                    || !TryGetStackReceiver(call.Operands[firstArgument + i], definitions, out var storage, out var setup)
+                    || (setup.Count == 0 && call.Operands[firstArgument + i] is not AddressOf)
+                    || (setup.Count > 0 && !setup.Any(instruction => instruction.Operands[1] is AddressOf { Target: LocalVariable }))
+                    || storage.Type != type || !TryGetStackOffset(storage, out var offset)
+                    || Arm64CallingConventionResolver.GetFloatAggregateFields(type) is not { Length: >= 2 } fields)
+                    continue;
+
+                var width = fields[0].FieldType.FullName == "System.Double" ? sizeof(double) : sizeof(float);
+                if (fields.Where((field, lane) => field.Offset != lane * width
+                        || (field.Attributes & FieldAttributes.FieldAccessMask) != FieldAttributes.Public).Any())
+                    continue;
+
+                bool Overlaps(IOperand operand, int size) =>
+                    TryGetStackSlot(operand, out _, out var slot) && slot < offset + fields.Length * width
+                    && slot + size > offset;
+
+                // The native slots overlap the byref argument. Don't attach them to the
+                // managed local if any other store or address escape can reuse the storage.
+                if (instructions.Any(instruction =>
+                        instruction.Destination is { } destination
+                        && Overlaps(destination, instruction.MemoryAccessSize ?? width)
+                        || instruction.Operands.Select((operand, index) => (operand, index)).Any(pair =>
+                            pair.operand is AddressOf address
+                            && !setup.Contains(instruction)
+                            && (instruction != call || pair.index != firstArgument + i)
+                            && Overlaps(address.Target, width))))
+                {
+                    continue;
+                }
+
+                foreach (var block in graph.Blocks)
+                for (var j = 0; j < block.Instructions.Count; j++)
+                {
+                    var read = block.Instructions[j];
+                    if (block == callBlock ? j <= callIndex
+                        : !(dominance ??= new DominatorInfo(graph)).Dominates(callBlock, block))
+                        continue;
+
+                    if (read is { OpCode: OpCode.Move, MemoryAccessSize: var size,
+                            Operands: [LocalVariable result, LocalVariable laneSlot] }
+                        && size == width && LaneField(laneSlot) is { } movedField)
+                    {
+                        read.SetOperand(1, new FieldReference(movedField, storage, movedField.Offset));
+                        if (result.Type == null || result.Type == type)
+                            result.Type = movedField.FieldType;
+                    }
+                    else if (read.Operands.Count == 4 && read.Operands[3] is FloatingPointPrecision precision
+                        && (precision.IsDouble ? sizeof(double) : sizeof(float)) == width
+                        && (read.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                            or OpCode.Modulo or >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned))
+                    {
+                        // Copy propagation can already have substituted the native spill
+                        // into an arithmetic operand. Its precision still proves the size.
+                        for (var operand = 1; operand <= 2; operand++)
+                            if (read.Operands[operand] is LocalVariable lane && LaneField(lane) is { } field)
+                                read.SetOperand(operand, new FieldReference(field, storage, field.Offset));
+                    }
+                }
+
+                FieldAnalysisContext? LaneField(LocalVariable lane)
+                {
+                    if (!TryGetStackOffset(lane, out var laneOffset) || laneOffset < offset
+                        || laneOffset >= offset + fields.Length * width || (laneOffset - offset) % width != 0
+                        || (laneOffset == offset ? lane != storage : lane.Type != null && lane.Type != fields[0].FieldType))
+                        return null;
+                    return fields[(int)((laneOffset - offset) / width)];
+                }
             }
         }
     }
@@ -413,14 +509,19 @@ internal static class FloatAggregateRecovery
         Dictionary<LocalVariable, Instruction> definitions)
     {
         var first = block.Instructions[index];
-        if (first.MemoryAccessSize is not (4 or 8)
-            || Arm64CallingConventionResolver.GetFloatAggregateFields(target.Field.FieldType) is not { } fields)
+        if (target.Parent != null && target.Parent.Parent != null)
+            return;
+
+        var start = target.Parent ?? target;
+        if (start.Field.IsStatic || !IsThisCopy(start.Local, definitions) || first.MemoryAccessSize is not (4 or 8)
+            || Arm64CallingConventionResolver.GetFloatAggregateFields(start.Field.FieldType) is not { } fields
+            || (target.Parent != null && (target.Field != fields[0] || target.Offset != start.Offset)))
             return;
 
         var size = fields[0].FieldType.FullName == "System.Double" ? 8 : 4;
         var argument = GetProjection(first.Operands[1], fields[0], definitions);
         if (first.MemoryAccessSize != size || argument == null || !IsAggregateParameter(argument.Register)
-            || argument.Type != target.Field.FieldType)
+            || argument.Type != start.Field.FieldType)
             return;
 
         var lane = 1;
@@ -434,8 +535,8 @@ internal static class FloatAggregateRecovery
             var field = fields[lane];
             if (store is not { OpCode: OpCode.Move, MemoryAccessSize: var width,
                     Operands: [FieldReference { Parent: { Parent: null } parent } destination, var value] }
-                || width != size || parent.Field != target.Field || !ReferenceEquals(destination.Local, target.Local)
-                || destination.Field != field || destination.Offset != target.Offset + field.Offset
+                || width != size || parent.Field != start.Field || parent.Offset != start.Offset || !ReferenceEquals(destination.Local, start.Local)
+                || destination.Field != field || destination.Offset != start.Offset + field.Offset
                 || GetProjection(value, field, definitions) != argument)
                 break;
             lane++;
@@ -443,17 +544,31 @@ internal static class FloatAggregateRecovery
 
         if (lane == fields.Length)
         {
-            first.SetOperand(1, argument);
+            first.SetOperands(start, argument);
             first.MemoryAccessSize = null;
             for (var j = index + 1; j < end; j++)
                 Remove(block.Instructions[j]);
         }
-        else
+        else if (target.Parent == null)
         {
             // An exact offset match resolved the first scalar store to its enclosing struct.
             // If the other lanes do not form a copy, keep the write to the first lane only.
             first.SetOperand(0, new FieldReference(fields[0], target.Local, target.Offset, target));
         }
+    }
+
+    private static bool IsThisCopy(LocalVariable local, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        for (var depth = 0; depth < 16; depth++)
+        {
+            if (local.IsThis)
+                return true;
+            if (!definitions.TryGetValue(local, out var definition)
+                || definition is not { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+                break;
+            local = source;
+        }
+        return false;
     }
 
     private static LocalVariable? GetProjection(IOperand operand, FieldAnalysisContext field,
