@@ -526,9 +526,18 @@ internal static class Program
         if (!options.AreForceOptionsValid)
             throw new SoftException("Invalid force option configuration");
 
+        if (options.ListAssemblies && (options.OutputFormatIds.Any() || options.CSharpAssemblies != null || options.RecoverySelectors.Any()))
+            throw new SoftException("--list-assemblies lists assemblies without exporting. Run it without --output-as, --csharp-assemblies or --recover-only.");
+
+        var assemblyNames = options.CSharpAssemblies?.Split(',').Select(name => name.Trim()).ToArray();
+        if (assemblyNames != null && !options.OutputFormatIds.Contains(CSharpOutputFormat.FormatId))
+            throw new SoftException("--csharp-assemblies requires --output-as csharp.");
+        if (assemblyNames?.Any(string.IsNullOrEmpty) == true)
+            throw new SoftException("--csharp-assemblies requires a comma-separated list of nonempty assembly names.");
+
         MC2ILApi.ConfigureLib(false);
 
-        var result = new MC2ILRuntimeArgs();
+        var result = new MC2ILRuntimeArgs { ListAssemblies = options.ListAssemblies };
 
         if (options.ForcedBinaryPath == null)
         {
@@ -576,9 +585,11 @@ internal static class Program
                 if (sourceIndex >= 0 && dllIndex >= 0)
                 {
                     // Both formats use the same recovered IL and must not mutate the analysis context twice.
-                    formats[Math.Min(sourceIndex, dllIndex)] = new CSharpOutputFormat(keepDlls: true);
+                    formats[Math.Min(sourceIndex, dllIndex)] = new CSharpOutputFormat(keepDlls: true, assemblyNames);
                     formats.RemoveAt(Math.Max(sourceIndex, dllIndex));
                 }
+                else if (sourceIndex >= 0 && assemblyNames != null)
+                    formats[sourceIndex] = new CSharpOutputFormat(keepDlls: false, assemblyNames);
                 result.OutputFormats = formats;
                 Logger.VerboseNewline($"Selected output formats: [{string.Join(", ", options.OutputFormatIds)}]");
             }
@@ -665,12 +676,16 @@ internal static class Program
                 GC.Collect();
 
             var exitCode = MainWithArgs(runtimeArgs);
-            ConsoleUi.FinishProgress(exitCode == 0, runtimeArgs.OutputRootDirectory);
+            if (runtimeArgs.ListAssemblies)
+                ConsoleUi.FinishProgress(exitCode == 0, outputPath: null, completionMessage: "Assemblies listed");
+            else
+                ConsoleUi.FinishProgress(exitCode == 0, runtimeArgs.OutputRootDirectory);
             return exitCode;
         }
-        catch (SoftException e)
+        catch (Exception e) when (e is SoftException or CSharpOutputFormat.AssemblySelectionException)
         {
             Logger.ErrorNewline($"Execution Failed: {e.Message}");
+            CleanupExtractedFiles();
             ConsoleUi.FinishProgress(success: false, outputPath: null);
             return -1;
         }
@@ -753,6 +768,17 @@ internal static class Program
             return ReportInvalidMetadataHeader(runtimeArgs, invalidHeader);
         }
         MC2ILApi.CurrentAppContext.ReuseSingletonInstances = runtimeArgs.ReuseSingletonInstances;
+
+        if (runtimeArgs.ListAssemblies)
+        {
+            Logger.InfoNewline("Assemblies in the game:");
+            foreach (var assembly in MC2ILApi.CurrentAppContext.Assemblies.OrderBy(assembly => assembly.Name, StringComparer.OrdinalIgnoreCase))
+                Console.WriteLine($"  {assembly.Name}");
+
+            CleanupExtractedFiles();
+            MC2ILPluginManager.CallOnFinish();
+            return 0;
+        }
 
         if (runtimeArgs.LowMemoryMode)
             GC.Collect();

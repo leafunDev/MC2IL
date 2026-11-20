@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection.PortableExecutable;
+using AsmResolver.DotNet;
+using AssetRipper.CIL;
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.CSharp.ProjectDecompiler;
@@ -17,10 +19,20 @@ namespace MC2IL.ILanguageDecompiler;
 public sealed class CSharpOutputFormat : MC2ILOutputFormat
 {
     private readonly bool _keepDlls;
+    private readonly string[] _assemblyNames;
 
     public CSharpOutputFormat() : this(keepDlls: false) { }
 
-    public CSharpOutputFormat(bool keepDlls) => _keepDlls = keepDlls;
+    public CSharpOutputFormat(bool keepDlls) : this(keepDlls, assemblyNames: null) { }
+
+    public CSharpOutputFormat(bool keepDlls, IEnumerable<string>? assemblyNames)
+    {
+        _keepDlls = keepDlls;
+        _assemblyNames = assemblyNames?.Select(name => name.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
+            ?? Array.Empty<string>();
+        if (_assemblyNames.Any(string.IsNullOrEmpty))
+            throw new AssemblySelectionException("Assembly names must not be empty.");
+    }
 
     public const string FormatId = "csharp";
     public override string OutputFormatId => FormatId;
@@ -30,6 +42,15 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
 
     public override void DoOutput(ApplicationAnalysisContext context, string outputRoot)
     {
+        // Resolve before creating output or recovering methods, so typos never trigger an unfiltered export.
+        var selectedAssemblies = ResolveSelectedAssemblies(context);
+        var selectedFiles = selectedAssemblies == null
+            ? null
+            : new HashSet<string>(selectedAssemblies.Select(assembly => assembly.CleanAssemblyName + ".dll"), StringComparer.Ordinal);
+        var scope = context.RecoveryScope;
+        if (selectedFiles != null && scope != null && !selectedFiles.Any(file => scope.TopLevelTypesIn(file).Any()))
+            throw new AssemblySelectionException("None of the --recover-only targets belong to the selected C# assemblies.");
+
         var sourceRoot = Path.Combine(outputRoot, "CSharp");
         Directory.CreateDirectory(sourceRoot);
 
@@ -40,7 +61,10 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
 
         try
         {
-            new AsmResolverDllOutputFormatIlRecovery().DoOutput(context, recoveryDirectory);
+            var recovery = selectedAssemblies != null && !_keepDlls
+                ? new ScopedIlRecovery(selectedAssemblies)
+                : new AsmResolverDllOutputFormatIlRecovery();
+            recovery.DoOutput(context, recoveryDirectory);
             var assemblies = Directory.GetFiles(recoveryDirectory, "*.dll");
             Array.Sort(assemblies, StringComparer.Ordinal);
             if (_keepDlls)
@@ -48,7 +72,8 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
                     File.Copy(path, Path.Combine(outputRoot, Path.GetFileName(path)), overwrite: true);
 
             var sourceAssemblies = assemblies
-                .Select(path => (Path: path, Types: context.RecoveryScope?.TopLevelTypesIn(Path.GetFileName(path)).ToArray()))
+                .Where(path => selectedFiles == null || selectedFiles.Contains(Path.GetFileName(path)))
+                .Select(path => (Path: path, Types: scope?.TopLevelTypesIn(Path.GetFileName(path)).ToArray()))
                 .Where(assembly => assembly.Types is not { Length: 0 })
                 .ToArray();
 
@@ -77,6 +102,29 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
                 Logger.WarnNewline($"Could not remove temporary DLLs from {recoveryDirectory}: {ex.Message}", "CSharpOutput");
             }
         }
+    }
+
+    private HashSet<AssemblyAnalysisContext>? ResolveSelectedAssemblies(ApplicationAnalysisContext context)
+    {
+        if (_assemblyNames.Length == 0)
+            return null;
+
+        var selected = new HashSet<AssemblyAnalysisContext>();
+        foreach (var name in _assemblyNames)
+        {
+            var matches = context.Assemblies.Where(assembly => string.Equals(assembly.Name, name, StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (matches.Length == 0 && name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+                matches = context.Assemblies.Where(assembly =>
+                    string.Equals(assembly.Name, name.Substring(0, name.Length - 4), StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (matches.Length != 1)
+            {
+                var problem = matches.Length == 0 ? "was not found" : "is ambiguous";
+                throw new AssemblySelectionException($"Assembly '{name}' {problem}. Run --list-assemblies with the same game input to see its assembly names.");
+            }
+
+            selected.Add(matches[0]);
+        }
+        return selected;
     }
 
     private static void WriteAssembly(string path, string outputDirectory, string[]? selectedTypes)
@@ -138,4 +186,17 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
 
         protected override IEnumerable<ProjectItemInfo> WriteMiscellaneousFilesInProject(PEFile module) => Enumerable.Empty<ProjectItemInfo>();
     }
+
+    private sealed class ScopedIlRecovery(HashSet<AssemblyAnalysisContext> selectedAssemblies) : AsmResolverDllOutputFormatIlRecovery
+    {
+        protected override void FillMethodBody(MethodDefinition definition, MethodAnalysisContext method)
+        {
+            if (method.DeclaringType is { } type && selectedAssemblies.Contains(type.DeclaringAssembly))
+                base.FillMethodBody(definition, method);
+            else if (definition.IsManagedMethodWithBody())
+                FillMethodBodyWithStub(definition);
+        }
+    }
+
+    public sealed class AssemblySelectionException(string message) : Exception(message);
 }

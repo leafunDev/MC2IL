@@ -86,6 +86,31 @@ internal static class ConsoleUi
         if (gamePath == null)
             return null;
 
+        var action = Actions[actionIndex];
+        var exportsCSharp = action.FormatId == ILanguageDecompiler.CSharpOutputFormat.FormatId
+            || action.AdditionalFormatId == ILanguageDecompiler.CSharpOutputFormat.FormatId;
+        string? sourceAssemblies = null;
+        if (exportsCSharp)
+        {
+            var assemblyMode = Select("Choose assemblies for C# export", new[]
+            {
+                "All assemblies",
+                "Assembly-CSharp only    Typical Unity game scripts",
+                "Enter assembly names"
+            }, 0);
+            if (assemblyMode < 0)
+                return null;
+
+            if (assemblyMode == 1)
+                sourceAssemblies = "Assembly-CSharp";
+            else if (assemblyMode == 2)
+            {
+                sourceAssemblies = Prompt("C# ASSEMBLIES", "Comma-separated assembly names (e.g. Assembly-CSharp,MyGame.UI)");
+                if (string.IsNullOrWhiteSpace(sourceAssemblies))
+                    return null;
+            }
+        }
+
         var defaultOutput = Path.Combine(Environment.CurrentDirectory, "mc2il_out");
         var outputKind = Select("Select output folder", new[]
         {
@@ -129,9 +154,11 @@ internal static class ConsoleUi
 
         Console.WriteLine();
         WriteAccent("READY TO START");
-        WriteLabel("Action", Actions[actionIndex].Title);
+        WriteLabel("Action", action.Title);
         WriteLabel("Input", gamePath);
         WriteLabel("Output", outputPath);
+        if (exportsCSharp)
+            WriteLabel("C# assemblies", sourceAssemblies ?? "All");
         WriteLabel("Low memory", lowMemory ? "On" : "Off");
         WriteLabel("Verbose log", verbose ? "On" : "Off");
         WriteLabel("Reuse singletons", reuseSingletons ? "On" : "Off");
@@ -145,11 +172,16 @@ internal static class ConsoleUi
         var args = new System.Collections.Generic.List<string>
         {
             "--game-path", gamePath,
-            "--output-as", Actions[actionIndex].FormatId
+            "--output-as", action.FormatId
         };
-        if (Actions[actionIndex].AdditionalFormatId is { } additionalFormat) args.Add(additionalFormat);
+        if (action.AdditionalFormatId is { } additionalFormat) args.Add(additionalFormat);
         args.Add("--output-to");
         args.Add(outputPath);
+        if (sourceAssemblies != null)
+        {
+            args.Add("--csharp-assemblies");
+            args.Add(sourceAssemblies);
+        }
         if (lowMemory) args.Add("--low-memory-mode");
         if (verbose) args.Add("--verbose");
         if (reuseSingletons) args.Add("--reuse-singleton-instances");
@@ -365,7 +397,7 @@ internal static class ConsoleUi
         }
     }
 
-    public static void FinishProgress(bool success, string? outputPath)
+    public static void FinishProgress(bool success, string? outputPath, string completionMessage = "Recovery finished")
     {
         lock (ConsoleLock)
         {
@@ -384,7 +416,7 @@ internal static class ConsoleUi
             Console.WriteLine();
             if (success)
             {
-                WriteColoredLine("  ✓  Recovery finished", ConsoleColor.Green, _ansi ? "1;38;2;71;232;143" : null);
+                WriteColoredLine("  ✓  " + completionMessage, ConsoleColor.Green, _ansi ? "1;38;2;71;232;143" : null);
                 if (!string.IsNullOrWhiteSpace(outputPath))
                     Console.WriteLine("     Output: " + outputPath);
             }

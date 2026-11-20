@@ -20,6 +20,7 @@ public class MC2ILRuntimeArgs
     public readonly Dictionary<string, string> ProcessingLayerConfigurationOptions = new();
 
     public IEnumerable<MC2ILOutputFormat>? OutputFormats;
+    public bool ListAssemblies;
     public string OutputRootDirectory = null!;
 
     public bool LowMemoryMode;

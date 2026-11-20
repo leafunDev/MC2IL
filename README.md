@@ -64,6 +64,12 @@ When working on one part of a game, use `--recover-only` with the DLL or C# reco
 
 Scoped C# output includes only the containing types. Scoped DLLs keep all type and member declarations for reference resolution. Other game method bodies are marked as excluded; select the whole type when examining its constructors, accessors, or generated nested types.
 
+To export only the game scripts, choose **Assembly-CSharp only** in the wizard or add `--csharp-assemblies Assembly-CSharp`. Use a comma-separated list for multiple assemblies, such as `--csharp-assemblies "Assembly-CSharp,MyGame.UI"`. Other assemblies are still available for resolving references. When exporting both formats, the assembly filter limits only the C# files. With `--recover-only`, the C# output contains the requested types within the selected assemblies.
+
+To discover the assembly names in a game without exporting files:
+
+    dotnet run --configuration Release --project MC2IL/MC2IL.csproj --framework net10.0 -- --game-path "C:\Games\Example.apk" --list-assemblies
+
 For source reading, add `--reuse-singleton-instances` to reuse an earlier `MonoSingleton<T>.Instance` result for later reads of the same closed type. This can change behavior if the singleton changes between calls, so the default output preserves both calls.
 
 ## Output formats
