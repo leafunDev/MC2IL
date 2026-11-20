@@ -19,7 +19,7 @@ public static class InjectedCheckRemover
     private static void Run(ISILControlFlowGraph cfg, bool removeNullChecks, bool removeBoundsChecks,
         IEnumerable<LocalVariable>? parameters = null)
     {
-        var defOf = BuildDefMap(cfg, parameters, out var stableParameters);
+        var defOf = BuildDefMap(cfg, parameters, out var stableParameters, out var addressed);
         var ignoredExceptionConstructions = FindUnusedExceptionConstructions(cfg);
         var removedAny = false;
 
@@ -55,7 +55,7 @@ public static class InjectedCheckRemover
 
             if (terminator.Operands[1] is not LocalVariable condition
                 || !TryGetDefinitionBefore(block, terminator, condition, defOf, out var definition)
-                || !IsInjectedCheck(block, definition, thrown, throwOnTrue, defOf, stableParameters, throwOnTrue ? falseTarget : trueTarget,
+                || !IsInjectedCheck(block, definition, thrown, throwOnTrue, defOf, stableParameters, addressed, throwOnTrue ? falseTarget : trueTarget,
                     removeNullChecks, removeBoundsChecks))
                 continue;
 
@@ -82,7 +82,7 @@ public static class InjectedCheckRemover
     }
 
     private static bool IsInjectedCheck(Block checkedBlock, Instruction definition, InjectedThrow thrown, bool throwOnTrue,
-        Dictionary<LocalVariable, Instruction> defOf, HashSet<LocalVariable> stableParameters, Block continuation,
+        Dictionary<LocalVariable, Instruction> defOf, HashSet<LocalVariable> stableParameters, HashSet<LocalVariable> addressed, Block continuation,
         bool removeNullChecks, bool removeBoundsChecks)
     {
         if (TryGetNullComparison(checkedBlock, definition, throwOnTrue, defOf,
@@ -104,11 +104,96 @@ public static class InjectedCheckRemover
                         knownNonNullThis: knownNonNullThis)
                     || thrown.ExceptionType == "System.NullReferenceException"
                     && (IsObjectAllocationCheck(checkedBlock, definition, continuation, receiver, defOf)
+                        || HasImplicitNullCheckAfterGuardCopies(checkedBlock, nullComparison, continuation, receiver, addressed)
                         || HasEarlierNonNullCheck(checkedBlock, definition, receiver, defOf, stableParameters)));
         }
 
         return removeBoundsChecks && thrown.ExceptionType == "System.IndexOutOfRangeException"
             && IsArrayBoundsCheck(definition, throwOnTrue, continuation, defOf, removeNullChecks);
+    }
+
+    private static bool HasImplicitNullCheckAfterGuardCopies(Block guard, Instruction comparison,
+        Block continuation, IOperand receiver, HashSet<LocalVariable> addressed)
+    {
+        if (comparison.Operands.Count != 3 || receiver is not LocalVariable { Type: { } type } local
+            || !IlGenerator.IsManagedReference(type))
+            return false;
+
+        if (addressed.Contains(local))
+            return false;
+
+        var comparisonIndex = guard.Instructions.IndexOf(comparison);
+        if (comparisonIndex < 0)
+            return false;
+
+        // Phi lowering can place a copy between the null comparison and its branch.
+        // Resolve the dereference against those copies, as well as copies in the next block.
+        // Only non-throwing local operations may move before the implicit null check.
+        var aliases = new HashSet<LocalVariable> { local };
+        var sawCopy = false;
+        for (var i = comparisonIndex + 1; i < guard.Instructions.Count - 1; i++)
+        {
+            var instruction = guard.Instructions[i];
+            if (ReferenceEquals(instruction.Destination, local))
+                return false;
+
+            if (instruction.OpCode == OpCode.Nop)
+                continue;
+
+            if (instruction is not { OpCode: OpCode.Move or OpCode.Not,
+                    Operands: [LocalVariable destination, LocalVariable or Immediate] }
+                || addressed.Contains(destination))
+                return false;
+
+            if (instruction.OpCode == OpCode.Move)
+            {
+                TrackCopy(destination, instruction.Operands[1]);
+                sawCopy = true;
+            }
+            else
+            {
+                aliases.Remove(destination);
+            }
+        }
+        if (!sawCopy)
+            return false;
+
+        var blocks = new HashSet<Block> { guard };
+        var current = continuation;
+        while (blocks.Count < 12 && blocks.Add(current))
+        {
+            foreach (var instruction in current.Instructions)
+            {
+                if (instruction.OpCode is OpCode.Nop or OpCode.Jump)
+                    continue;
+                if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable destination, var source] }
+                    && IsSimpleValue(source) && !addressed.Contains(destination))
+                {
+                    TrackCopy(destination, source);
+                    continue;
+                }
+
+                if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, var loaded] })
+                    return loaded is FieldReference { Parent: null, Field.IsStatic: false } field && aliases.Contains(field.Local)
+                        || loaded is ArrayLength length && aliases.Contains(length.Array);
+
+                return false;
+            }
+
+            if (current.Successors is not [var next])
+                return false;
+            current = next;
+        }
+        return false;
+
+        void TrackCopy(LocalVariable destination, IOperand source)
+        {
+            if (source is LocalVariable from && aliases.Contains(from)
+                && destination.Type is { } destinationType && IlGenerator.IsManagedReference(destinationType))
+                aliases.Add(destination);
+            else
+                aliases.Remove(destination);
+        }
     }
 
     private static bool TryGetNullComparison(Block checkedBlock, Instruction definition, bool branchOnTrue,
@@ -876,11 +961,12 @@ public static class InjectedCheckRemover
     }
 
     private static Dictionary<LocalVariable, Instruction> BuildDefMap(ISILControlFlowGraph cfg,
-        IEnumerable<LocalVariable>? parameters, out HashSet<LocalVariable> stableParameters)
+        IEnumerable<LocalVariable>? parameters, out HashSet<LocalVariable> stableParameters, out HashSet<LocalVariable> addressedLocals)
     {
         var defs = new Dictionary<LocalVariable, Instruction>();
         stableParameters = parameters != null ? new HashSet<LocalVariable>(parameters) : [];
         var unstable = new HashSet<LocalVariable>(stableParameters);
+        addressedLocals = [];
 
         foreach (var instruction in cfg.Instructions)
         {
@@ -897,6 +983,7 @@ public static class InjectedCheckRemover
                 if (operand is AddressOf { Target: LocalVariable addressed })
                 {
                     unstable.Add(addressed);
+                    addressedLocals.Add(addressed);
                     stableParameters.Remove(addressed);
                 }
             }
