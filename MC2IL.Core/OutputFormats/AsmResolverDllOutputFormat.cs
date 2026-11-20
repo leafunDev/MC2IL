@@ -156,6 +156,9 @@ public abstract class AsmResolverDllOutputFormat : MC2ILOutputFormat
             }
         }
 
+        var completedMethodCount = 0;
+        var progressInterval = Math.Max(1, work.Count / 100);
+
         void FillOne((TypeAnalysisContext Type, MethodAnalysisContext Method) pair)
         {
             var (typeContext, methodCtx) = pair;
@@ -167,6 +170,9 @@ public abstract class AsmResolverDllOutputFormat : MC2ILOutputFormat
                 var managedMethod = methodCtx.GetExtraData<MethodDefinition>("AsmResolverMethod") ?? throw new($"AsmResolver method not found in method analysis context for {typeContext.FullName}.{methodCtx.Name}");
 
                 FillMethodBody(managedMethod, methodCtx);
+                var completed = System.Threading.Interlocked.Increment(ref completedMethodCount);
+                if (completed % progressInterval == 0 || completed == work.Count)
+                    Logger.InfoNewline($"Decompiling methods: {completed}/{work.Count}", "Progress");
             }
 #if !DEBUG
             catch (System.Exception e)

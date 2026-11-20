@@ -602,21 +602,38 @@ internal static class Program
 
     public static int Main(string[] args)
     {
-        Console.WriteLine("=== MC2IL | Machine Code to IL ===");
-        Console.WriteLine("Unity IL2CPP analysis and managed-code recovery.");
-        Console.WriteLine($"Version {MC2ILVersionString}\n");
-
         if (args.Length == 0)
         {
-            Console.WriteLine("Specify a Unity game folder or package on the command line. Example:");
-            Console.WriteLine("  MC2IL.exe --game-path \"C:\\Games\\My Game\" --output-as dll_il_recovery --output-to mc2il_out");
-            Console.WriteLine("Run with --help for all options.");
-            return 0;
+            if (Console.IsInputRedirected || Console.IsOutputRedirected)
+            {
+                ConsoleUi.Initialize();
+                ConsoleUi.PrintBanner();
+                Console.WriteLine("No arguments were provided and no interactive terminal is available.");
+                Console.WriteLine("Run with --help for command-line options.");
+                return 0;
+            }
+
+            ConsoleUi.Initialize();
+            ConsoleUi.PrintBanner();
+            var interactiveArgs = ConsoleUi.CollectArguments();
+            return interactiveArgs == null ? 0 : RunWithArguments(interactiveArgs, showBanner: false);
+        }
+
+        return RunWithArguments(args);
+    }
+
+    private static int RunWithArguments(string[] args, bool showBanner = true)
+    {
+        if (showBanner)
+        {
+            ConsoleUi.Initialize();
+            ConsoleUi.PrintBanner();
         }
 
         ConsoleLogger.Initialize();
 
         Logger.InfoNewline("Running on " + Environment.OSVersion.Platform);
+        ConsoleUi.BeginProgress();
 
         try
         {
@@ -626,31 +643,36 @@ internal static class Program
                 //Force an early collection for all the zip shenanigans we may have just done
                 GC.Collect();
 
-            return MainWithArgs(runtimeArgs);
+            var exitCode = MainWithArgs(runtimeArgs);
+            ConsoleUi.FinishProgress(exitCode == 0, runtimeArgs.OutputRootDirectory);
+            return exitCode;
         }
         catch (SoftException e)
         {
             Logger.ErrorNewline($"Execution Failed: {e.Message}");
+            ConsoleUi.FinishProgress(success: false, outputPath: null);
             return -1;
         }
 #if !DEBUG
-            catch (DllSaveException e)
-            {
-                Logger.ErrorNewline(e.ToString());
-                Console.WriteLine();
-                Console.WriteLine();
-                Logger.ErrorNewline("Waiting for you to press enter - feel free to copy the error...");
-                Console.ReadLine();
-
-                return -1;
-            }
-            catch (LibMC2ILInitializationException e)
-            {
-                Logger.ErrorNewline($"\n\n{e}\n\nWaiting for you to press enter - feel free to copy the error...");
-                Console.ReadLine();
-                return -1;
-            }
+        catch (DllSaveException e)
+        {
+            Logger.ErrorNewline(e.ToString());
+            ConsoleUi.FinishProgress(success: false, outputPath: null);
+            return -1;
+        }
+        catch (LibMC2ILInitializationException e)
+        {
+            Logger.ErrorNewline(e.ToString());
+            ConsoleUi.FinishProgress(success: false, outputPath: null);
+            return -1;
+        }
 #endif
+        catch (Exception e)
+        {
+            Logger.ErrorNewline($"Unexpected failure: {e}");
+            ConsoleUi.FinishProgress(success: false, outputPath: null);
+            return -1;
+        }
     }
 
     public static int MainWithArgs(MC2ILRuntimeArgs runtimeArgs)
@@ -772,7 +794,7 @@ internal static class Program
                 catch (Exception e)
                 {
                     Logger.ErrorNewline($"Processing layer {processingLayer.Id} threw an exception: {e}");
-                    Environment.Exit(1);
+                    throw new SoftException($"Processing layer {processingLayer.Id} failed: {e.Message}");
                 }
 #endif
 
