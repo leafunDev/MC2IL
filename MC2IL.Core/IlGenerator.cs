@@ -185,6 +185,7 @@ public static class IlGenerator
 
         // Keep simple temporaries out of logging calls, conditions, and returns. Run this after
         // generating every block so a single-use value can also be traced across a call's fallthrough.
+        var inlineLocals = FindSingleUseCilLocals(body, locals);
         foreach (var block in graph.Blocks)
         {
             if (block == graph.EntryBlock || block == graph.ExitBlock)
@@ -192,15 +193,15 @@ public static class IlGenerator
 
             for (var i = 0; i < block.Instructions.Count; i++)
             {
-                InlineSingleUseFirstInput(block, i, graph, instructionMap, locals);
-                InlineSingleUseComparisonInput(block, i, graph, instructionMap, locals, body);
-                InlineSingleUseArrayLengthReceiver(block, i, graph, instructionMap, locals, body);
-                InlineSingleUseCallArguments(block, i, graph, instructionMap, locals, body);
+                InlineSingleUseFirstInput(block, i, graph, instructionMap, inlineLocals);
+                InlineSingleUseComparisonInput(block, i, graph, instructionMap, inlineLocals, body);
+                InlineSingleUseArrayLengthReceiver(block, i, graph, instructionMap, inlineLocals, body);
+                InlineSingleUseCallArguments(block, i, graph, instructionMap, inlineLocals, body);
                 if (fieldReadLocals != null)
-                    InlineSingleUseFieldReceiver(block, i, graph, fieldReadLocals, instructionMap, locals, body);
-                InlineSingleUseLogArgument(block, i, graph, instructionMap, locals);
-                InlineSingleUseBranchCondition(block, i, graph, instructionMap, locals);
-                InlineSingleUseReturnValue(block, i, graph, instructionMap, locals);
+                    InlineSingleUseFieldReceiver(block, i, graph, fieldReadLocals, instructionMap, inlineLocals, body);
+                InlineSingleUseLogArgument(block, i, graph, instructionMap, inlineLocals);
+                InlineSingleUseBranchCondition(block, i, graph, instructionMap, inlineLocals);
+                InlineSingleUseReturnValue(block, i, graph, instructionMap, inlineLocals);
             }
         }
 
@@ -278,6 +279,28 @@ public static class IlGenerator
         CilSingleUseMathInliner.Run(body, locals);
         CilBranchCleanup.Run(body);
         SetRecoveredMaxStack(body);
+    }
+
+    private static Dictionary<LocalVariable, CilLocalVariable> FindSingleUseCilLocals(CilMethodBody body,
+        Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        // Constructor fusion moves arguments into newobj and suppresses their original ISIL call.
+        // Count the emitted reads as well, so a captured receiver's initialization survives.
+        var readOnce = new HashSet<CilLocalVariable>();
+        var ineligible = new HashSet<CilLocalVariable>();
+        foreach (var instruction in body.Instructions)
+        {
+            if (instruction.Operand is not CilLocalVariable local)
+                continue;
+            if (instruction.OpCode.Code is CilCode.Ldloca or CilCode.Ldloca_S
+                || instruction.OpCode.Code is CilCode.Ldloc or CilCode.Ldloc_S && !readOnce.Add(local))
+                ineligible.Add(local);
+        }
+
+        // Each rewrite transfers the existing loads of other locals, so the initial counts
+        // are a safe upper bound throughout this pass.
+        return locals.Where(pair => readOnce.Contains(pair.Value) && !ineligible.Contains(pair.Value))
+            .ToDictionary(pair => pair.Key, pair => pair.Value);
     }
 
     private static void SetRecoveredMaxStack(CilMethodBody body)
