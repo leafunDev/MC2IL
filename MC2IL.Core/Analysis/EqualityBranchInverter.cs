@@ -48,8 +48,10 @@ public static class EqualityBranchInverter
         var definitions = new Dictionary<LocalVariable, (Block Block, int Index, Instruction Instruction)>();
         var appearances = new Dictionary<LocalVariable, int>();
 
+        var blockOrder = new Dictionary<Block, int>();
         foreach (var block in cfg.Blocks)
         {
+            blockOrder.Add(block, blockOrder.Count);
             for (var i = 0; i < block.Instructions.Count; i++)
             {
                 var instruction = block.Instructions[i];
@@ -96,7 +98,9 @@ public static class EqualityBranchInverter
                     || InverseOperator(called) is not { } inverse)
                     break;
 
-                var flipBranches = ShouldFlip(taken, fallenThrough, block);
+                var flipBranches = ShouldFlip(taken, fallenThrough, block, cfg.ExitBlock, blockOrder,
+                    definition.Instruction is { Operands: [_, _, var left, var right] }
+                    && (left is Immediate { Value: 0 } || right is Immediate { Value: 0 }));
                 if (negate != flipBranches)
                     definition.Instruction.SetOperand(0, inverse);
                 jump.SetOperands(flipBranches ? fallenThrough : taken, condition);
@@ -111,6 +115,13 @@ public static class EqualityBranchInverter
         {
             input = operand;
             invert = true;
+            return true;
+        }
+
+        if (instruction is { OpCode: OpCode.Move, Operands: [_, LocalVariable { Type.FullName: "System.Boolean" } copy] })
+        {
+            input = copy;
+            invert = false;
             return true;
         }
 
@@ -147,35 +158,70 @@ public static class EqualityBranchInverter
         return false;
     }
 
-    private static bool ShouldFlip(Block taken, Block fallenThrough, Block branch)
+    private static bool ShouldFlip(Block taken, Block fallenThrough, Block branch, Block exit,
+        Dictionary<Block, int> blockOrder, bool comparesWithNull)
     {
-        // A return reached after the main body can also be the target of a guard clause.
-        // When several conditions alone target an exit, prefer the continuing arm so
-        // short-circuit tests can be printed together without negating their operators.
         var takenExits = IsGuardExit(taken);
         var fallthroughExits = IsGuardExit(fallenThrough);
+        if (!comparesWithNull && takenExits != fallthroughExits)
+            return fallthroughExits;
+
+        var takenRegion = Reachable(taken, branch);
+        var fallthroughRegion = Reachable(fallenThrough, branch);
+
+        if (comparesWithNull)
+        {
+            var takenJoins = fallthroughRegion.Contains(taken);
+            var fallthroughJoins = takenRegion.Contains(fallenThrough);
+            if (takenJoins != fallthroughJoins)
+            {
+                // A shared return closes the if only if the body cannot also exit
+                // through another return or throw. Otherwise keep the guard shape.
+                var join = takenJoins ? taken : fallenThrough;
+                var body = takenJoins ? fallenThrough : taken;
+                if (!(takenJoins ? takenExits : fallthroughExits) || !Reachable(body, join).Contains(exit))
+                    return takenJoins;
+            }
+
+            // An if/else is normally printed in the order of its bodies. A void
+            // return at the end of a straight-line arm can disappear at the join too.
+            if (!takenJoins && !fallthroughJoins && ((!takenExits && !fallthroughExits)
+                    || (takenExits && IsVoidReturn(taken) && EndsInStraightVoidReturn(fallenThrough, branch))
+                    || (fallthroughExits && IsVoidReturn(fallenThrough) && EndsInStraightVoidReturn(taken, branch))))
+                return blockOrder[taken] > blockOrder[fallenThrough];
+        }
+
+        // Keep a direct guard exit when it has its own return or throw. When
+        // several conditions share a failure edge, prefer their continuing arm.
         if (takenExits != fallthroughExits)
             return fallthroughExits;
 
-        return Size(UniquelyReachable(taken, fallenThrough, branch)) < Size(UniquelyReachable(fallenThrough, taken, branch));
+        return takenRegion.Where(candidate => !fallthroughRegion.Contains(candidate)).Sum(candidate => candidate.Instructions.Count)
+            < fallthroughRegion.Where(candidate => !takenRegion.Contains(candidate)).Sum(candidate => candidate.Instructions.Count);
     }
+
+    private static bool EndsInStraightVoidReturn(Block start, Block branch)
+    {
+        var visited = new HashSet<Block> { branch };
+        while (visited.Add(start))
+        {
+            if (IsVoidReturn(start))
+                return true;
+            if (start.Successors is not [var next])
+                return false;
+            start = next;
+        }
+        return false;
+    }
+
+    private static bool IsVoidReturn(Block block) =>
+        block.Instructions.LastOrDefault() is { OpCode: OpCode.Return, Operands.Count: 0 };
 
     private static bool IsGuardExit(Block block) =>
         block.Instructions.Count != 0
         && block.Instructions[^1].OpCode is OpCode.Return or OpCode.Throw
         && block.Instructions.Take(block.Instructions.Count - 1).All(instruction => instruction.OpCode == OpCode.Nop)
         && (block.Predecessors.Count == 1 || block.Predecessors.Any(predecessor => predecessor.Successors.Count == 1));
-
-    private static int Size(HashSet<Block> region) => region.Sum(block => block.Instructions.Count);
-
-    // The blocks only this branch reaches, i.e. everything up to the continuation after the statement
-    private static HashSet<Block> UniquelyReachable(Block from, Block other, Block branch)
-    {
-        var mine = Reachable(from, branch);
-        mine.ExceptWith(Reachable(other, branch));
-
-        return mine;
-    }
 
     private static HashSet<Block> Reachable(Block start, Block branch)
     {
