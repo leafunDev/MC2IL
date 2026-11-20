@@ -449,7 +449,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         InternalCallGuardRemover.Run(this);
         KeyFunctionRecovery.Run(this);
-        ClosureConstructorRecovery.Run(this);
+        TrivialConstructorRecovery.Run(this);
 
         ArrayRecovery.RecoverSplitElementAccesses(this);
         SsaForm.Remove(this);

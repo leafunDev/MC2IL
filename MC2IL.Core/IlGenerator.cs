@@ -2034,7 +2034,7 @@ public static class IlGenerator
             || targetMethod.DeclaringType is not { } targetType
             || context.DeclaringType is not { BaseType: { } baseType } declaringType
             // C# decompilers recognize the trivial closure constructor by its base call.
-            || ClosureConstructorRecovery.IsDisplayClass(declaringType)
+            || TrivialConstructorRecovery.IsDisplayClass(declaringType)
             || !SameType(baseType, targetType))
             return false;
 
