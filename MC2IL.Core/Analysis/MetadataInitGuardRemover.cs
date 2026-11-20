@@ -1,3 +1,4 @@
+using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Linq;
@@ -35,11 +36,17 @@ public static class MetadataInitGuardRemover
 
     public static void Run(MethodAnalysisContext method)
     {
-        var flagOffsets = method.AppContext.Binary.is32Bit
-            ? new[] { InitialisedFlagOffset32, CctorFinishedOffset32 }
-            : new[] { InitialisedFlagOffset64, CctorFinishedOffset64 };
         var cfg = method.ControlFlowGraph!;
         var supportsClassReloads = SupportsClassReloads(method);
+        // These Il2CppClass offsets are only verified for the ARM64 metadata-v29 layout.
+        // Keep class-init guards in unknown layouts instead of treating an unrelated byte as
+        // the initialized flag. Metadata-init guards are independently recognized by their
+        // matching absolute flag store.
+        var flagOffsets = supportsClassReloads
+            ? method.AppContext.Binary.is32Bit
+                ? new[] { InitialisedFlagOffset32, CctorFinishedOffset32 }
+                : new[] { InitialisedFlagOffset64, CctorFinishedOffset64 }
+            : Array.Empty<long>();
         if (supportsClassReloads)
             RemoveArm64ClassMetadataGuards(method, cfg);
         Run(cfg, flagOffsets, keepBareCalls: supportsClassReloads);
@@ -645,12 +652,25 @@ public static class MetadataInitGuardRemover
         var flagLoad = FindFlagLoad(condition, definitions);
         var metadataFlagAddress = flagLoad?.Operands[1] is
             MemoryOperand { IsConstant: true } metadataFlag ? (long?)metadataFlag.Addend : null;
+        var hasKnownClassInitFlag = flagLoad?.Operands[1] is MemoryOperand
+            { Index: null, Scale: 0, Base: LocalVariable } classFlag
+            && initialisedFlagOffsets.Contains(classFlag.Addend);
         var first = guard.Successors[0];
         var second = guard.Successors[1];
 
-        if (!TryExcise(cfg, guard, first, second, false, out var region, metadataFlagAddress)
-            && !TryExcise(cfg, guard, second, first, false, out region, metadataFlagAddress))
+        Block initEntry;
+        HashSet<Block> region;
+        if (TryCollectRegion(cfg, guard, first, second, false, metadataFlagAddress, out region)
+            && IsRecognizedInitializationRegion(region, hasKnownClassInitFlag, metadataFlagAddress.HasValue))
+            initEntry = first;
+        else if (TryCollectRegion(cfg, guard, second, first, false, metadataFlagAddress, out region)
+            && IsRecognizedInitializationRegion(region, hasKnownClassInitFlag, metadataFlagAddress.HasValue))
+            initEntry = second;
+        else
             return false;
+
+        var merge = initEntry == first ? second : first;
+        Excise(cfg, guard, initEntry, merge, region);
 
         // These reads can be discarded only for the class pointer consumed by the recognized
         // initializer. The same offsets can occur in ordinary managed objects.
@@ -730,6 +750,20 @@ public static class MetadataInitGuardRemover
     private static bool IsClassInitCall(Instruction instruction) =>
         instruction.IsCall
         && instruction.Operands is [StringLiteral { Value: ClassInitExport or ClassInitActual or ClassInitCodegen }, ..];
+
+    private static bool IsMetadataInitCall(Instruction instruction) =>
+        instruction.IsCall
+        && instruction.Operands is [StringLiteral { Value: InitializeRuntimeMetadata or InitializeMethod }, ..];
+
+    private static bool IsRecognizedInitializationRegion(HashSet<Block> region, bool hasKnownClassInitFlag,
+        bool hasMetadataFlagAddress)
+    {
+        var instructions = region.SelectMany(block => block.Instructions);
+        if (instructions.Any(IsClassInitCall))
+            return hasKnownClassInitFlag;
+
+        return hasMetadataFlagAddress && instructions.Any(IsMetadataInitCall);
+    }
 
     private static bool TryExcise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge,
         bool allowMetadataInitWithoutStore, out HashSet<Block> region, long? metadataFlagAddress = null)
