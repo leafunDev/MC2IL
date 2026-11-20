@@ -54,7 +54,7 @@ public static class InjectedCheckRemover
             var thrown = throwOnTrue ? trueThrow! : falseThrow!;
 
             if (terminator.Operands[1] is not LocalVariable condition
-                || !defOf.TryGetValue(condition, out var definition)
+                || !TryGetDefinitionBefore(block, terminator, condition, defOf, out var definition)
                 || !IsInjectedCheck(block, definition, thrown, throwOnTrue, defOf, stableParameters, throwOnTrue ? falseTarget : trueTarget,
                     removeNullChecks, removeBoundsChecks))
                 continue;
@@ -85,7 +85,9 @@ public static class InjectedCheckRemover
         Dictionary<LocalVariable, Instruction> defOf, HashSet<LocalVariable> stableParameters, Block continuation,
         bool removeNullChecks, bool removeBoundsChecks)
     {
-        if (IsNullComparison(definition, out var receiver) && IsNullEdge(definition.OpCode, throwOnTrue)
+        if (TryGetNullComparison(checkedBlock, definition, throwOnTrue, defOf,
+                out var nullComparison, out var comparisonBranchOnTrue, out var receiver)
+            && IsNullEdge(nullComparison.OpCode, comparisonBranchOnTrue)
             && (thrown.ExceptionType == "System.NullReferenceException"
                 || thrown.Operand != null && SameValue(receiver, thrown.Operand, defOf, [])
                 || thrown.ExceptionType == "System.IndexOutOfRangeException" && removeBoundsChecks))
@@ -98,7 +100,7 @@ public static class InjectedCheckRemover
             return (removeNullChecks || thrown.ExceptionType == "System.IndexOutOfRangeException")
                 && (HasImplicitNullCheck(continuation, receiver, defOf,
                         arraysOnly: thrown.ExceptionType == "System.IndexOutOfRangeException",
-                        allowFloatComputations: thrown.ExceptionType == "System.NullReferenceException" && receiver is LocalVariable,
+                        allowNonThrowingComputations: thrown.ExceptionType == "System.NullReferenceException" && receiver is LocalVariable,
                         knownNonNullThis: knownNonNullThis)
                     || thrown.ExceptionType == "System.NullReferenceException"
                     && (IsObjectAllocationCheck(checkedBlock, definition, continuation, receiver, defOf)
@@ -107,6 +109,66 @@ public static class InjectedCheckRemover
 
         return removeBoundsChecks && thrown.ExceptionType == "System.IndexOutOfRangeException"
             && IsArrayBoundsCheck(definition, throwOnTrue, continuation, defOf, removeNullChecks);
+    }
+
+    private static bool TryGetNullComparison(Block checkedBlock, Instruction definition, bool branchOnTrue,
+        Dictionary<LocalVariable, Instruction> defOf, out Instruction comparison,
+        out bool comparisonBranchOnTrue, out IOperand receiver)
+    {
+        var visited = new HashSet<LocalVariable>();
+        while (true)
+        {
+            if (IsNullComparison(definition, out receiver))
+            {
+                comparison = definition;
+                comparisonBranchOnTrue = branchOnTrue;
+                return true;
+            }
+
+            var negates = definition.OpCode == OpCode.Not;
+            if (definition.Operands is not [LocalVariable destination, LocalVariable source]
+                || definition.OpCode is not (OpCode.Not or OpCode.Move)
+                || !ReferenceEquals(definition.Destination, destination)
+                || !visited.Add(source)
+                || !TryGetDefinitionBefore(checkedBlock, definition, source, defOf, out var nextDefinition))
+                break;
+
+            if (negates)
+                branchOnTrue = !branchOnTrue;
+            definition = nextDefinition;
+        }
+
+        comparison = null!;
+        comparisonBranchOnTrue = false;
+        receiver = null!;
+        return false;
+    }
+
+    private static bool TryGetDefinitionBefore(Block block, Instruction before, LocalVariable local,
+        Dictionary<LocalVariable, Instruction> defOf, out Instruction definition)
+    {
+        var current = block;
+        var index = current.Instructions.IndexOf(before);
+        var visited = new HashSet<Block>();
+        for (var remaining = 12; index >= 0 && remaining > 0 && visited.Add(current); remaining--)
+        {
+            for (var i = index - 1; i >= 0; i--)
+            {
+                var candidate = current.Instructions[i];
+                if (!ReferenceEquals(candidate.Destination, local))
+                    continue;
+
+                definition = candidate;
+                return true;
+            }
+
+            if (current.Predecessors is not [var predecessor])
+                break;
+            current = predecessor;
+            index = current.Instructions.Count;
+        }
+
+        return defOf.TryGetValue(local, out definition!);
     }
 
     private static bool IsObjectAllocationCheck(Block checkedBlock, Instruction comparison, Block continuation,
@@ -263,15 +325,99 @@ public static class InjectedCheckRemover
     }
 
     private static bool HasImplicitNullCheck(Block continuation, IOperand receiver,
-        Dictionary<LocalVariable, Instruction> defOf, bool arraysOnly, bool allowFloatComputations,
+        Dictionary<LocalVariable, Instruction> defOf, bool arraysOnly, bool allowNonThrowingComputations,
         LocalVariable? knownNonNullThis)
     {
-        if (FirstManagedOperation(continuation, defOf, out var singleEntryPath, allowFloatComputations, knownNonNullThis) is not { } operation)
+        var callsNeedingNullCheck = new HashSet<Instruction>();
+        if (!HasImplicitNullCheckOnEveryPath(continuation, receiver, defOf, arraysOnly,
+                allowNonThrowingComputations, knownNonNullThis, [], [], callsNeedingNullCheck))
+            return false;
+
+        foreach (var call in callsNeedingNullCheck)
+            call.NullCheckReceiver = true;
+        return true;
+    }
+
+    private static bool HasImplicitNullCheckOnEveryPath(Block start, IOperand receiver,
+        Dictionary<LocalVariable, Instruction> defOf, bool arraysOnly, bool allowNonThrowingComputations,
+        LocalVariable? knownNonNullThis, List<Instruction> pathInstructions, HashSet<Block> visitedPath,
+        HashSet<Instruction> callsNeedingNullCheck)
+    {
+        // A native null guard can precede a conditional whose separate branches both
+        // dereference the same value. Remove it only when every branch proves that use.
+        var current = start;
+        while (visitedPath.Count < 32 && visitedPath.Add(current))
+        {
+            foreach (var instruction in current.Instructions)
+            {
+                if (instruction.OpCode is OpCode.Nop or OpCode.Jump)
+                {
+                    pathInstructions.Add(instruction);
+                    continue;
+                }
+
+                if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, var source] }
+                    && (IsSimpleValue(source) || source is RuntimeMethodInfoAnalysisContext or TypeAnalysisContext))
+                {
+                    pathInstructions.Add(instruction);
+                    continue;
+                }
+
+                if (allowNonThrowingComputations
+                    && (IsNonThrowingFloatComputation(instruction, defOf) || IsNonThrowingComputation(instruction)))
+                {
+                    pathInstructions.Add(instruction);
+                    continue;
+                }
+
+                if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, var fieldSource] }
+                    && IsSafeFieldRead(fieldSource, knownNonNullThis))
+                {
+                    pathInstructions.Add(instruction);
+                    continue;
+                }
+
+                if (instruction.OpCode == OpCode.ConditionalJump)
+                {
+                    if (current.Successors.Count != 2)
+                        return false;
+
+                    foreach (var successor in current.Successors)
+                    {
+                        if (!HasImplicitNullCheckOnEveryPath(successor, receiver, defOf, arraysOnly,
+                                allowNonThrowingComputations, knownNonNullThis, [.. pathInstructions],
+                                [.. visitedPath], callsNeedingNullCheck))
+                            return false;
+                    }
+                    return true;
+                }
+
+                return IsImplicitNullCheckOperation(instruction, receiver, defOf, arraysOnly,
+                    knownNonNullThis, pathInstructions, callsNeedingNullCheck);
+            }
+
+            if (current.Successors is not [var next])
+                return false;
+            current = next;
+        }
+
+        // Cycles and long, unresolved paths are not proof that every route checks this value.
+        return false;
+    }
+
+    private static bool IsImplicitNullCheckOperation(Instruction operation, IOperand receiver,
+        Dictionary<LocalVariable, Instruction> defOf, bool arraysOnly, LocalVariable? knownNonNullThis,
+        List<Instruction> pathInstructions, HashSet<Instruction> callsNeedingNullCheck)
+    {
+        // A check proves the value held at the branch, not a later value written to
+        // the same local while evaluating the surviving path.
+        if (receiver is LocalVariable checkedLocal
+            && pathInstructions.Any(instruction => ReferenceEquals(instruction.Destination, checkedLocal)))
             return false;
 
         var operand = FirstAccess(operation);
-        if (operand is ArrayLength length && SameValue(receiver, length.Array, defOf, [])
-            || AsArrayAccess(operand) is { } access && SameValue(receiver, access.Array, defOf, []))
+        if (operand is ArrayLength length && SameValueOnPath(receiver, length.Array, pathInstructions, defOf)
+            || AsArrayAccess(operand) is { } access && SameValueOnPath(receiver, access.Array, pathInstructions, defOf))
             return true;
 
         if (arraysOnly)
@@ -279,12 +425,12 @@ public static class InjectedCheckRemover
 
         if ((operand is AddressOf { Target: FieldReference addressedField } ? addressedField : operand)
             is FieldReference { Field.IsStatic: false } field
-            && SameValue(receiver, field.Local, defOf, []))
+            && SameValueOnPath(receiver, field.Local, pathInstructions, defOf))
             return true;
 
         // A direct CIL call can enter a nonvirtual instance method on a null receiver. Use
         // callvirt for its null check only when it cannot change the method being invoked.
-        if (!singleEntryPath || !operation.IsCall
+        if (!operation.IsCall
             || operation.Operands[0] is not MethodAnalysisContext { IsStatic: false, DeclaringType: { IsValueType: false } owner } target
             || target.Name == ".ctor"
             || !operation.NullCheckReceiver && target.IsVirtual && !target.IsFinal && !owner.IsSealed)
@@ -292,12 +438,13 @@ public static class InjectedCheckRemover
 
         var receiverIndex = operation.OpCode == OpCode.CallVoid ? 1 : 2;
         if (operation.Operands.Count <= receiverIndex
-            || !SameValue(receiver, operation.Operands[receiverIndex], defOf, [])
+            || !SameValueOnPath(receiver, operation.Operands[receiverIndex], pathInstructions, defOf)
             || operation.Operands.Skip(receiverIndex + 1).Take(target.Parameters.Count)
                 .Any(arg => !IsSimpleValue(arg) && !IsSafeFieldRead(arg, knownNonNullThis)))
             return false;
 
-        operation.NullCheckReceiver = true;
+        if (!operation.NullCheckReceiver)
+            callsNeedingNullCheck.Add(operation);
         return true;
     }
 
@@ -337,6 +484,69 @@ public static class InjectedCheckRemover
         }
 
         return null;
+    }
+
+    private static bool IsNonThrowingComputation(Instruction instruction) => instruction switch
+    {
+        // Packing already-loaded scalar lanes only creates a value type; it cannot throw.
+        { OpCode: OpCode.PackFloatAggregate, Operands: [_, _, ..] } =>
+            instruction.Operands.Skip(2).All(IsSimpleValue),
+        { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual or OpCode.CheckGreater or OpCode.CheckLess
+            or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual or OpCode.CheckGreaterUnsigned
+            or OpCode.CheckLessUnsigned or OpCode.CheckGreaterOrEqualUnsigned or OpCode.CheckLessOrEqualUnsigned,
+            Operands: [LocalVariable, var left, var right] } => IsSimpleValue(left) && IsSimpleValue(right),
+        { OpCode: OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.ShiftLeft or OpCode.ShiftRight
+            or OpCode.ShiftRightUnsigned or OpCode.And or OpCode.Or or OpCode.Xor,
+            Operands: [LocalVariable, var left, var right] } => IsSimpleValue(left) && IsSimpleValue(right),
+        { OpCode: OpCode.Not or OpCode.Negate, Operands: [LocalVariable, var value] } => IsSimpleValue(value),
+        _ => false,
+    };
+
+    private static bool SameValueOnPath(IOperand left, IOperand right, List<Instruction> pathInstructions,
+        Dictionary<LocalVariable, Instruction> defOf) =>
+        SameValueOnPath(left, right, pathInstructions, pathInstructions.Count, defOf, []);
+
+    private static bool SameValueOnPath(IOperand left, IOperand right, List<Instruction> pathInstructions,
+        int instructionLimit, Dictionary<LocalVariable, Instruction> defOf, HashSet<LocalVariable> seen)
+    {
+        if (ReferenceEquals(left, right))
+            return true;
+
+        if (left is LocalVariable leftLocal && seen.Add(leftLocal)
+            && TryGetPathDefinition(leftLocal, pathInstructions, instructionLimit, out var leftDefinition, out var leftIndex))
+        {
+            if (leftDefinition is { OpCode: OpCode.Move, Operands: [_, var leftSource] } && IsSimpleValue(leftSource))
+                return SameValueOnPath(leftSource, right, pathInstructions, leftIndex, defOf, seen);
+            return false;
+        }
+
+        if (right is LocalVariable rightLocal && seen.Add(rightLocal)
+            && TryGetPathDefinition(rightLocal, pathInstructions, instructionLimit, out var rightDefinition, out var rightIndex))
+        {
+            if (rightDefinition is { OpCode: OpCode.Move, Operands: [_, var rightSource] } && IsSimpleValue(rightSource))
+                return SameValueOnPath(left, rightSource, pathInstructions, rightIndex, defOf, seen);
+            return false;
+        }
+
+        return SameValue(left, right, defOf, seen);
+    }
+
+    private static bool TryGetPathDefinition(LocalVariable local, List<Instruction> pathInstructions,
+        int instructionLimit, out Instruction definition, out int index)
+    {
+        for (index = instructionLimit - 1; index >= 0; index--)
+        {
+            var instruction = pathInstructions[index];
+            if (!ReferenceEquals(instruction.Destination, local))
+                continue;
+
+            definition = instruction;
+            return true;
+        }
+
+        definition = null!;
+        index = -1;
+        return false;
     }
 
     private static bool IsNonThrowingFloatComputation(Instruction instruction,
