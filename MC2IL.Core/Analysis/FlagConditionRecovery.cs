@@ -106,6 +106,18 @@ public static class FlagConditionRecovery
                 if (IsZeroFlag(inner, defOf, out op0, out op1)) { relop = OpCode.CheckNotEqual; return true; }          // !ZF        => !=  (jne)
                 if (IsSignOfValue(inner, defOf, out op0, out op1)) { relop = OpCode.CheckGreaterOrEqual; return true; }  // !SF => >= 0 (jns)
                 if (IsSignEqualsOverflow(inner, defOf, out op0, out op1)) { relop = OpCode.CheckLess; return true; }    // !(SF==OF)  => <   (jl/jb)
+                // ARM64 conditional selects jump to the alternative assignment on the
+                // inverse of the flag expression. Recover the relation before pruning flags.
+                if (Def(inner, defOf) is { OpCode: OpCode.And } conjunction)
+                {
+                    if (IsSignGreater(conjunction, defOf, out op0, out op1)) { relop = OpCode.CheckLessOrEqual; return true; }
+                    if (IsUnsignedGreater(conjunction, defOf, out op0, out op1)) { relop = OpCode.CheckLessOrEqualUnsigned; return true; }
+                }
+                if (Def(inner, defOf) is { OpCode: OpCode.Or } disjunction)
+                {
+                    if (IsSignLessOrEqual(disjunction, defOf, out op0, out op1)) { relop = OpCode.CheckGreater; return true; }
+                    if (IsUnsignedLessOrEqual(disjunction, defOf, out op0, out op1)) { relop = OpCode.CheckGreaterUnsigned; return true; }
+                }
                 return false;
 
             case OpCode.CheckEqual:
