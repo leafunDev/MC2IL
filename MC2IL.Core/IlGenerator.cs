@@ -1186,6 +1186,18 @@ public static class IlGenerator
                     break;
                 }
 
+                // stobj needs the pointer below the value. Load the by-ref local first, so
+                // ordinary assignments through ref/out do not need a scratch value local.
+                if (instruction.Operands[0] is MemoryOperand { Index: null, Scale: 0, Addend: 0,
+                    Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: { } referent } } address })
+                {
+                    LoadLocal(address, method, locals);
+                    LoadOperand(instruction.Operands[1], method, locals, writeLine, referent);
+                    EmitMoveWidthConversion(instruction, instructions);
+                    instructions.Add(CilOpCodes.Stobj, referent.ToTypeSignature().ToTypeDefOrRef());
+                    break;
+                }
+
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, OperandType(instruction.Operands[0]));
                 EmitMoveWidthConversion(instruction, instructions);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
