@@ -613,10 +613,18 @@ internal static class Program
                 return 0;
             }
 
-            ConsoleUi.Initialize();
-            ConsoleUi.PrintBanner();
-            var interactiveArgs = ConsoleUi.CollectArguments();
-            return interactiveArgs == null ? 0 : RunWithArguments(interactiveArgs, showBanner: false);
+            try
+            {
+                ConsoleUi.Initialize();
+                ConsoleUi.PrintBanner();
+                var interactiveArgs = ConsoleUi.CollectArguments();
+                return interactiveArgs == null ? 0 : RunWithArguments(interactiveArgs, showBanner: false);
+            }
+            catch (Exception e)
+            {
+                ConsoleUi.ReportStartupError(e);
+                return -1;
+            }
         }
 
         return RunWithArguments(args);

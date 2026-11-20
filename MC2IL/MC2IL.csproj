@@ -22,6 +22,10 @@
         <TrimMode>link</TrimMode>
         <PublishTrimmed>true</PublishTrimmed>
     </PropertyGroup>
+
+    <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0'">
+        <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    </PropertyGroup>
      
      <ItemGroup Condition="$([MSBuild]::IsTargetFrameworkCompatible('$(TargetFramework)', 'net7.0'))">
          <TrimmerRootAssembly Include="System.Runtime" />

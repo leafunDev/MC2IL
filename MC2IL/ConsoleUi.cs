@@ -60,25 +60,61 @@ internal static class ConsoleUi
         Console.WriteLine();
     }
 
+    public static void ReportStartupError(Exception error)
+    {
+        WriteLog("ERROR", "Startup", error.ToString(), ConsoleColor.Red, "1;38;2;255;115;115");
+    }
+
     public static string[]? CollectArguments()
     {
         var actionIndex = Select("Choose an action", Array.ConvertAll(Actions, action => action.Title + "    " + action.Description), 0);
         if (actionIndex < 0)
             return null;
 
-        string gamePath;
-        while (true)
+        var inputKind = Select("Select game input", new[]
         {
-            gamePath = Prompt("GAME PATH", "Path to APK / XAPK / IPA or Unity game folder");
-            if (File.Exists(gamePath) || Directory.Exists(gamePath))
-                break;
-            WriteStatus("That path does not exist. Enter a file or folder path and try again.", ConsoleColor.Yellow);
-        }
+            "Browse for a package file    APK / XAPK / APKM / IPA / TIPA",
+            "Browse for a Unity game folder",
+            "Enter or paste a path manually"
+        }, 0);
+        if (inputKind < 0)
+            return null;
+
+        var gamePath = SelectInputPath(inputKind);
+        if (gamePath == null)
+            return null;
 
         var defaultOutput = Path.Combine(Environment.CurrentDirectory, "mc2il_out");
-        var outputPath = Prompt("OUTPUT FOLDER", "Press Enter to use: " + defaultOutput);
-        if (string.IsNullOrWhiteSpace(outputPath))
+        var outputKind = Select("Select output folder", new[]
+        {
+            "Browse for an output folder",
+            "Use the default folder    " + defaultOutput,
+            "Enter or paste a path manually"
+        }, 1);
+        if (outputKind < 0)
+            return null;
+
+        string outputPath;
+        if (outputKind == 1)
             outputPath = defaultOutput;
+        else if (outputKind == 0)
+        {
+            var folderResult = NativeFilePicker.PickFolder("Select an output folder");
+            if (folderResult.Status == NativePickerStatus.Cancelled)
+                return null;
+            if (folderResult.Status == NativePickerStatus.Unavailable)
+            {
+                WriteStatus("A native folder picker is unavailable. Enter a path below.", ConsoleColor.Yellow);
+                outputPath = Prompt("OUTPUT FOLDER", "Destination folder");
+            }
+            else
+                outputPath = folderResult.Path!;
+        }
+        else
+            outputPath = Prompt("OUTPUT FOLDER", "Destination folder");
+
+        if (string.IsNullOrWhiteSpace(outputPath))
+            return null;
 
         Console.WriteLine();
         WriteAccent("ANALYSIS OPTIONS");
@@ -109,6 +145,35 @@ internal static class ConsoleUi
         if (verbose) args.Add("--verbose");
         if (reuseSingletons) args.Add("--reuse-singleton-instances");
         return args.ToArray();
+    }
+
+    private static string? SelectInputPath(int inputKind)
+    {
+        if (inputKind == 2)
+            return PromptValidInputPath();
+
+        var result = inputKind == 0
+            ? NativeFilePicker.PickGamePackage()
+            : NativeFilePicker.PickFolder("Select a Unity game folder");
+
+        if (result.Status == NativePickerStatus.Cancelled)
+            return null;
+        if (result.Status == NativePickerStatus.Selected && result.Path != null)
+            return result.Path;
+
+        WriteStatus("A native picker is unavailable on this system. Enter a path below.", ConsoleColor.Yellow);
+        return PromptValidInputPath();
+    }
+
+    private static string? PromptValidInputPath()
+    {
+        while (true)
+        {
+            var path = Prompt("GAME PATH", "APK / XAPK / APKM / IPA / TIPA or Unity game folder");
+            if (File.Exists(path) || Directory.Exists(path))
+                return path;
+            WriteStatus("That path does not exist. Choose a file/folder or press Ctrl+C to cancel.", ConsoleColor.Yellow);
+        }
     }
 
     private static string Prompt(string label, string hint)

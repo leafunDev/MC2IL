@@ -38,7 +38,7 @@ Analyze a game APK:
 
     dotnet run --configuration Release --project MC2IL/MC2IL.csproj --framework net10.0 -- --game-path "C:\Games\Example.apk" --output-as dll_il_recovery --output-to mc2il_out
 
-On Windows, Linux, or macOS, launch MC2IL without arguments to open the interactive terminal wizard. It lets you choose the game path, output format, destination, and common analysis options. The terminal progress display reports the actual method-processing count. Existing command-line arguments remain available.
+On Windows, Linux, or macOS, launch MC2IL without arguments to open the interactive terminal wizard. It lets you choose an action, select APK/XAPK/APKM/IPA/TIPA packages with a filtered native file picker, browse game and output folders, and set common analysis options. Linux and macOS use their native picker when available and otherwise accept a typed path. The terminal progress display reports the actual method-processing count. Existing command-line arguments remain available.
 
     dotnet run --configuration Release --project MC2IL/MC2IL.csproj --framework net10.0
 
