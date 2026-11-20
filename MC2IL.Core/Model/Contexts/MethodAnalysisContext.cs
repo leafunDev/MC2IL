@@ -486,6 +486,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);
 
+        StructReturnFieldRecovery.Run(this);
         DeadCodeEliminator.Run(ControlFlowGraph!, MetadataResolver.FindMethodMetadataReads(this),
             discardUnusedCallResults: true);
 
