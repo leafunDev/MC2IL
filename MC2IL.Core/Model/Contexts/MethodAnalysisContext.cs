@@ -479,6 +479,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Only remove guards once the managed operations that replace their checks are known.
         InjectedCheckRemover.Run(this);
+        if (ArrayStoreGuardRecovery.Run(this))
+            InjectedCheckRemover.Run(this, removeNullChecks: true, removeBoundsChecks: false);
 
         LocalVariables.TypeAddressedLocals(this);
 
