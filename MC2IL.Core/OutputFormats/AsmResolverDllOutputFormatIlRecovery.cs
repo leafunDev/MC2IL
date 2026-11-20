@@ -35,6 +35,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
         var assemblies = base.BuildAssemblies(context);
         IlGenerator.StripInjectedDiagnosticScaffolding(context, assemblies);
+        DelegateCombineRecovery.Run(assemblies);
         AutoPropertyRestorer.Run(context, assemblies);
         return assemblies;
     }
