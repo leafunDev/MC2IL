@@ -182,10 +182,20 @@ public static class MetadataResolver
                 if (address == 0)
                     continue;
 
+                // Writing an immediate to Wn constructs a 32-bit value, often the first
+                // fragment of a MOVZ/MOVK sequence. An incidental match in the binary must
+                // not replace that fragment with a metadata handle before constant folding.
+                // Explicit string and delegate pointer uses still have their own resolution.
+                var isArm64WordLiteral = operand is Immediate && isLocalMoveSource
+                    && instruction.OperandWidth == 32
+                    && method.AppContext.InstructionSet is NewArmV8InstructionSet;
+
                 // ARM64 ELF commonly reaches metadata usage slots through a GOT entry. Look
                 // through exactly one pointer, and only accept it when the target independently
                 // decodes as a valid metadata usage.
-                var metadataGlobal = ResolveMetadataGlobalAtAddress(libContext, address, isLocalMoveSource);
+                var metadataGlobal = isArm64WordLiteral
+                    ? null
+                    : ResolveMetadataGlobalAtAddress(libContext, address, isLocalMoveSource);
 
                 // String/type/field globals are handled for the established Move-local pattern.
                 // A direct delegate pointer argument is only meaningful as a method metadata global.
@@ -207,7 +217,7 @@ public static class MetadataResolver
 
                     // A type from a GOT slot requires a second dereference. Resolve that
                     // instruction separately; assigning the class type here loses one level.
-                    if (libContext.GetTypeGlobalByAddress(address) is { } typeGlobal)
+                    if (!isArm64WordLiteral && libContext.GetTypeGlobalByAddress(address) is { } typeGlobal)
                     {
                         instruction.SetOperand(i, method.AppContext.ResolveIl2CppType(typeGlobal));
                         continue;
