@@ -438,6 +438,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // make joins explicit, so forwarding a value is an unconditional global substitution.
         SsaSimplifier.Run(this);
         FloatAggregateRecovery.RecoverByRefArgumentLanes(this);
+        BooleanFlagSimplifier.TypeMaskedReturnMerges(this);
 
         // Folding a constant exposes more to propagate
         for (var i = 0; i < 8 && ConstantFolder.Run(this); i++)
