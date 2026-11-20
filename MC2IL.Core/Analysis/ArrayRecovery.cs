@@ -66,6 +66,7 @@ public static class ArrayRecovery
                         instructions, definitions) is { } checkedIndex)
                 {
                     directArray.Type ??= directArrayType;
+                    TypeProvenArrayIndex(method, checkedIndex, memory.Index, definitions);
                     instruction.SetOperand(i, new ArrayAccess(directArray, checkedIndex));
                     if (instruction.OpCode == OpCode.Move && i == 1
                         && instruction.Destination is LocalVariable directDestination)
@@ -161,6 +162,45 @@ public static class ArrayRecovery
         }
 
         return null;
+    }
+
+    private static void TypeProvenArrayIndex(MethodAnalysisContext method, IOperand index, IOperand? addressIndex,
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        if (index is not LocalVariable checkedIndex)
+            return;
+
+        var int32 = method.AppContext.SystemTypes.SystemInt32Type;
+        if (checkedIndex.Type == null)
+            checkedIndex.Type = int32;
+        else if (checkedIndex.Type.FullName != "System.Int32")
+            return;
+
+        // Optimized ARM64 loops can keep a word-sized array index biased by a constant in an
+        // X register (e.g. start at 4 and access counter - 4). Recover the managed Int32 counter
+        // only when its phi has an integer seed and its back edge increments that same phi by one.
+        if (addressIndex is not LocalVariable counter
+            || !definitions.TryGetValue(counter, out var phi)
+            || phi is not { OpCode: OpCode.Phi, Operands.Count: 3 })
+            return;
+
+        var phiFirstInput = phi.Operands[1];
+        var phiSecondInput = phi.Operands[2];
+        var next = phiFirstInput as LocalVariable ?? phiSecondInput as LocalVariable;
+        if (next == null || phiFirstInput is not Immediate && phiSecondInput is not Immediate
+            || !definitions.TryGetValue(next, out var increment)
+            || increment is not { OpCode: OpCode.Add, Operands.Count: 3 }
+            || increment.Operands[1] is not LocalVariable source
+            || !ReferenceEquals(source, counter)
+            || increment.Operands[2] is not Immediate { Value: 1 })
+            return;
+
+        if ((counter.Type != null && counter.Type.FullName != "System.Int32")
+            || (next.Type != null && next.Type.FullName != "System.Int32"))
+            return;
+
+        counter.Type ??= int32;
+        next.Type ??= int32;
     }
 
     private static SzArrayTypeAnalysisContext? ResolveArrayType(IOperand operand,

@@ -456,6 +456,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Phi removal leaves a copy per merged version, most of which can share one local
         CopyCoalescer.Run(this);
+        DeadCopyEliminator.Run(ControlFlowGraph!);
 
         // Now out of SSA: clean up the per-edge copies that phi removal introduced (a local can have
         // several definitions merging at a join here, so this pass propagates conservatively), then

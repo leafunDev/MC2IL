@@ -642,7 +642,8 @@ public static class LocalVariables
                     changed |= PropagatePhi(instruction);
                     break;
                 case OpCode.Add or OpCode.Subtract or OpCode.Multiply:
-                    changed |= PropagateArithmetic(instruction, method);
+                    changed |= PropagateArithmetic(instruction, method)
+                        || PropagateIntegerArithmetic(instruction, method);
                     break;
                 case OpCode.Divide or OpCode.DivideUnsigned or OpCode.Modulo or OpCode.ModuloUnsigned:
                     changed |= PropagateArithmetic(instruction, method) || PropagateIntegerResult(instruction, method);
@@ -729,6 +730,40 @@ public static class LocalVariables
                 return SetTypeIfUnknown(destination, integerType);
 
         return false;
+    }
+
+    // Integer arithmetic often has an unknown accumulator on one side and a resolved field or
+    // call result on the other. A 32-bit native operation is enough to recover the accumulator's
+    // managed integer type; wider operations need all local operands typed as integers so pointer
+    // arithmetic is not mistaken for a numeric result.
+    private static bool PropagateIntegerArithmetic(Instruction instruction, MethodAnalysisContext method)
+    {
+        var hasIntegerOperand = false;
+        var requiresKnownIntegerOperands = instruction.OperandWidth != 32;
+
+        for (var i = 1; i < instruction.Operands.Count; i++)
+        {
+            var operand = instruction.Operands[i];
+            if (operand is Immediate)
+                continue;
+
+            TypeAnalysisContext? type = operand switch
+            {
+                LocalVariable local => local.Type,
+                FieldReference field => field.Field.FieldType,
+                _ => null,
+            };
+
+            var integerType = IntegerResultType(operand, method);
+            if (type != null && integerType == null)
+                return false;
+            if (type == null && requiresKnownIntegerOperands)
+                return false;
+
+            hasIntegerOperand |= integerType != null;
+        }
+
+        return hasIntegerOperand && PropagateIntegerResult(instruction, method);
     }
 
     // Logical operations on boolean flags stay boolean. Without this edge, negated/composed
