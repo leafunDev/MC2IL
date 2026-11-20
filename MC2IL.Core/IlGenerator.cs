@@ -193,6 +193,7 @@ public static class IlGenerator
             for (var i = 0; i < block.Instructions.Count; i++)
             {
                 InlineSingleUseFirstInput(block, i, graph, instructionMap, locals);
+                InlineSingleUseComparisonInput(block, i, graph, instructionMap, locals, body);
                 InlineSingleUseArrayLengthReceiver(block, i, graph, instructionMap, locals, body);
                 InlineSingleUseCallArguments(block, i, graph, instructionMap, locals, body);
                 if (fieldReadLocals != null)
@@ -524,6 +525,35 @@ public static class IlGenerator
                 { Parent: null, Local.IsThis: true, Field.IsStatic: false }] }
             && emitted is [var load, var field, _]
             && load.OpCode == CilOpCodes.Ldarg_0 && field.OpCode == CilOpCodes.Ldfld;
+    }
+
+    private static void InlineSingleUseComparisonInput(Block block, int index, ISILControlFlowGraph graph,
+        Dictionary<Instruction, List<CilInstruction>> instructionMap,
+        Dictionary<LocalVariable, CilLocalVariable> locals, CilMethodBody body)
+    {
+        var comparison = block.Instructions[index];
+        if (comparison is not { OpCode: >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned,
+                Operands: [_, LocalVariable or Immediate, LocalVariable bound] }
+            || bound.Type?.FullName != "System.Int32"
+            || !locals.TryGetValue(bound, out var slot)
+            || !instructionMap.TryGetValue(comparison, out var consumerIl))
+            return;
+
+        // A Count/Length load in the loop header should be part of the condition.
+        // Loading the already computed index first does not affect the dereference.
+        var load = consumerIl.FindIndex(il => il.OpCode == CilOpCodes.Ldloc && ReferenceEquals(il.Operand, slot));
+        if (load <= 0 || !HasOnlyPureLoadsBefore(consumerIl, load)
+            || CountLocalUses(graph, bound) != 1
+            || !TryFindSingleUseProducer(block, index, bound, out var producerBlock, out _, out var producer)
+            || producerBlock != block
+            || producer is not { OpCode: OpCode.Move, Operands: [_, FieldReference or ArrayLength] }
+            || !instructionMap.TryGetValue(producer, out var producerIl)
+            || producerIl.Count < 2 || producerIl[^1].OpCode != CilOpCodes.Stloc
+            || !ReferenceEquals(producerIl[^1].Operand, slot)
+            || !ProducesStandaloneStackValue(producerIl, body))
+            return;
+
+        RelocateSingleUseExpression(producer, producerIl, consumerIl, load, instructionMap, body);
     }
 
     private static void InlineSingleUseCallArguments(Block block, int consumerIndex, ISILControlFlowGraph graph,
