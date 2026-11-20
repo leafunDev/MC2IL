@@ -96,12 +96,15 @@ internal static class DelegateCombineRecovery
         }
 
         var combineIndex = body.Instructions.IndexOf(combineCalls[0]);
-        var significantBeforeCombine = body.Instructions
-            .Take(combineIndex)
-            .Where(instruction => instruction.OpCode.Code != CilCode.Nop)
-            .TakeLast(3)
-            .ToArray();
-        if (significantBeforeCombine.Length != 3
+        var significantBeforeCombine = new CilInstruction[3];
+        var remaining = significantBeforeCombine.Length;
+        for (var index = combineIndex - 1; index >= 0 && remaining > 0; index--)
+        {
+            var instruction = body.Instructions[index];
+            if (instruction.OpCode.Code != CilCode.Nop)
+                significantBeforeCombine[--remaining] = instruction;
+        }
+        if (remaining != 0
             || significantBeforeCombine[0].OpCode.Code != CilCode.Ldarg_0
             || significantBeforeCombine[1].OpCode.Code != CilCode.Ldfld
             || significantBeforeCombine[1].Operand is not IFieldDescriptor { } sourceField
