@@ -674,9 +674,15 @@ public static class IlGenerator
                     Operands: [_, ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array }] }
                 && MetadataResolver.IsSameType(argument.Type, array.ElementType)
                 && purePrefix;
+            var canInlineValueField = producer is { OpCode: OpCode.Move, OperandWidth: null,
+                    Operands: [_, FieldReference { Parent: null, Field.IsStatic: false,
+                        Local: { IsThis: false, Type: { IsValueType: true } and not ByRefTypeAnalysisContext } } field] }
+                && MetadataResolver.IsSameType(argument.Type, field.Field.FieldType)
+                && purePrefix;
             var canInlineDelegate = delegateParameter && producer.OpCode == OpCode.Newobj
                 && purePrefix && IsBoundDelegateExpression(producerIl);
-            if ((!canInlineCallResult && !canInlinePureExpression && !canInlineArrayElement && !canInlineDelegate)
+            if ((!canInlineCallResult && !canInlinePureExpression && !canInlineArrayElement
+                    && !canInlineValueField && !canInlineDelegate)
                 || !ProducesStandaloneStackValue(producerIl, body))
                 continue;
 
