@@ -97,7 +97,7 @@ public static class InjectedCheckRemover
                 : null;
 
             // Some IL2CPP builds share the failure block between the null and length checks.
-            return (removeNullChecks || thrown.ExceptionType == "System.IndexOutOfRangeException")
+            if ((removeNullChecks || thrown.ExceptionType == "System.IndexOutOfRangeException")
                 && (HasImplicitNullCheck(continuation, receiver, defOf,
                         arraysOnly: thrown.ExceptionType == "System.IndexOutOfRangeException",
                         allowNonThrowingComputations: thrown.ExceptionType == "System.NullReferenceException" && receiver is LocalVariable,
@@ -105,7 +105,10 @@ public static class InjectedCheckRemover
                     || thrown.ExceptionType == "System.NullReferenceException"
                     && (IsObjectAllocationCheck(checkedBlock, definition, continuation, receiver, defOf)
                         || HasImplicitNullCheckAfterGuardCopies(checkedBlock, nullComparison, continuation, receiver, addressed)
-                        || HasEarlierNonNullCheck(checkedBlock, definition, receiver, defOf, stableParameters)));
+                        || HasEarlierNonNullCheck(checkedBlock, definition, receiver, defOf, stableParameters))))
+                return true;
+            // An index-zero length check can compare a local against zero too.
+            // If the local did not prove a receiver check, try the bounds pattern.
         }
 
         return removeBoundsChecks && thrown.ExceptionType == "System.IndexOutOfRangeException"
