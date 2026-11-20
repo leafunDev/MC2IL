@@ -39,6 +39,7 @@ public static class ArrayRecovery
         var cfg = method.ControlFlowGraph!;
         var instructions = cfg.Instructions;
         var definitions = SingleDefinitions(instructions);
+        DominatorInfo? dominators = null;
         var changed = false;
 
         foreach (var instruction in instructions)
@@ -63,10 +64,11 @@ public static class ArrayRecovery
                         ? instruction.MemoryAccessSize == ElementSize(directArrayType.ElementType, pointerSize)
                         : instruction.IsCall || isMemoryComparison)
                     && TryRecoverBiasedArrayIndex(memory, directArray, directArrayType, pointerSize,
-                        instructions, definitions) is { } checkedIndex)
+                        instruction, cfg, instructions, definitions, ref dominators) is { } checkedIndex)
                 {
                     directArray.Type ??= directArrayType;
-                    TypeProvenArrayIndex(method, checkedIndex, memory.Index, definitions);
+                    TypeProvenArrayIndex(method, checkedIndex, memory.Index, directArray, pointerSize,
+                        instruction, cfg, instructions, definitions, ref dominators);
                     instruction.SetOperand(i, new ArrayAccess(directArray, checkedIndex));
                     if (instruction.OpCode == OpCode.Move && i == 1
                         && instruction.Destination is LocalVariable directDestination)
@@ -126,8 +128,9 @@ public static class ArrayRecovery
     }
 
     private static IOperand? TryRecoverBiasedArrayIndex(MemoryOperand memory, LocalVariable array,
-        SzArrayTypeAnalysisContext arrayType, int pointerSize, List<Instruction> instructions,
-        Dictionary<LocalVariable, Instruction?> definitions)
+        SzArrayTypeAnalysisContext arrayType, int pointerSize, Instruction access, ISILControlFlowGraph cfg,
+        List<Instruction> instructions, Dictionary<LocalVariable, Instruction?> definitions,
+        ref DominatorInfo? dominators)
     {
         if (memory.Index is not LocalVariable addressIndex)
             return null;
@@ -155,7 +158,8 @@ public static class ArrayRecovery
         foreach (var candidate in definitions)
         {
             if (!HasIndexBias(candidate.Key, addressIndex, bias, definitions, [], 0)
-                || !IsCheckedArrayIndex(candidate.Key, array, pointerSize, instructions, definitions))
+                || !IsCheckedArrayIndex(candidate.Key, array, pointerSize, access, cfg, instructions, definitions,
+                    requireInt32: false, ref dominators))
                 continue;
 
             return candidate.Key;
@@ -165,42 +169,87 @@ public static class ArrayRecovery
     }
 
     private static void TypeProvenArrayIndex(MethodAnalysisContext method, IOperand index, IOperand? addressIndex,
-        Dictionary<LocalVariable, Instruction?> definitions)
+        LocalVariable array, int pointerSize, Instruction access, ISILControlFlowGraph cfg,
+        List<Instruction> instructions, Dictionary<LocalVariable, Instruction?> definitions,
+        ref DominatorInfo? dominators)
     {
-        if (index is not LocalVariable checkedIndex)
+        if (index is not LocalVariable checkedIndex
+            || !IsCheckedArrayIndex(checkedIndex, array, pointerSize, access, cfg, instructions, definitions,
+                requireInt32: true, ref dominators))
             return;
 
-        var int32 = method.AppContext.SystemTypes.SystemInt32Type;
-        if (checkedIndex.Type == null)
-            checkedIndex.Type = int32;
-        else if (checkedIndex.Type.FullName != "System.Int32")
-            return;
-
-        // Optimized ARM64 loops can keep a word-sized array index biased by a constant in an
-        // X register (e.g. start at 4 and access counter - 4). Recover the managed Int32 counter
-        // only when its phi has an integer seed and its back edge increments that same phi by one.
-        if (addressIndex is not LocalVariable counter
+        if ((checkedIndex.Type != null && checkedIndex.Type.FullName != "System.Int32")
+            || addressIndex is not LocalVariable counter
+            || !HasUnconvertedIndexBias(checkedIndex, counter, definitions, [], 0)
             || !definitions.TryGetValue(counter, out var phi)
             || phi is not { OpCode: OpCode.Phi, Operands.Count: 3 })
             return;
 
+        // Optimized ARM64 loops can keep a word-sized array index biased by a constant in an
+        // X register (e.g. start at 4 and access counter - 4). Recover an Int32 counter only
+        // when an in-range 32-bit guard dominates the access and the phi is a bounded +1 induction.
+
         var phiFirstInput = phi.Operands[1];
         var phiSecondInput = phi.Operands[2];
         var next = phiFirstInput as LocalVariable ?? phiSecondInput as LocalVariable;
-        if (next == null || phiFirstInput is not Immediate && phiSecondInput is not Immediate
+        var seed = phiFirstInput is Immediate ? phiFirstInput : phiSecondInput;
+        if (next == null || !IsInt32Seed(seed, definitions)
             || !definitions.TryGetValue(next, out var increment)
             || increment is not { OpCode: OpCode.Add, Operands.Count: 3 }
-            || increment.Operands[1] is not LocalVariable source
-            || !ReferenceEquals(source, counter)
-            || increment.Operands[2] is not Immediate { Value: 1 })
+            || !IsIncrementOf(increment, counter))
             return;
 
         if ((counter.Type != null && counter.Type.FullName != "System.Int32")
             || (next.Type != null && next.Type.FullName != "System.Int32"))
             return;
 
+        var int32 = method.AppContext.SystemTypes.SystemInt32Type;
+        checkedIndex.Type ??= int32;
         counter.Type ??= int32;
         next.Type ??= int32;
+    }
+
+    private static bool IsInt32Seed(IOperand seed, Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        if (seed is Immediate immediate)
+            return immediate.Value is >= int.MinValue and <= int.MaxValue;
+
+        return seed is LocalVariable local
+            && definitions.TryGetValue(local, out var definition)
+            && definition is { OpCode: OpCode.Move, Operands: [_, Immediate value] }
+            && value.Value is >= int.MinValue and <= int.MaxValue;
+    }
+
+    private static bool HasUnconvertedIndexBias(LocalVariable candidate, LocalVariable counter,
+        Dictionary<LocalVariable, Instruction?> definitions, HashSet<LocalVariable> seen, int depth)
+    {
+        if (depth > 8 || !seen.Add(candidate))
+            return false;
+        if (ReferenceEquals(candidate, counter))
+            return true;
+        if (!definitions.TryGetValue(candidate, out var definition) || definition == null)
+            return false;
+
+        if (definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+            return HasUnconvertedIndexBias(source, counter, definitions, seen, depth + 1);
+        if (definition is { OpCode: OpCode.Add, Operands: [_, LocalVariable addLeft, Immediate] })
+            return HasUnconvertedIndexBias(addLeft, counter, definitions, seen, depth + 1);
+        if (definition is { OpCode: OpCode.Add, Operands: [_, Immediate, LocalVariable addRight] })
+            return HasUnconvertedIndexBias(addRight, counter, definitions, seen, depth + 1);
+        if (definition is { OpCode: OpCode.Subtract, Operands: [_, LocalVariable subtractLeft, Immediate] })
+            return HasUnconvertedIndexBias(subtractLeft, counter, definitions, seen, depth + 1);
+
+        return false;
+    }
+
+    private static bool IsIncrementOf(Instruction instruction, LocalVariable counter)
+    {
+        var left = instruction.Operands[1];
+        var right = instruction.Operands[2];
+        return left is LocalVariable leftLocal && ReferenceEquals(leftLocal, counter)
+                && right is Immediate { Value: 1 }
+            || right is LocalVariable rightLocal && ReferenceEquals(rightLocal, counter)
+                && left is Immediate { Value: 1 };
     }
 
     private static SzArrayTypeAnalysisContext? ResolveArrayType(IOperand operand,
@@ -270,27 +319,96 @@ public static class ArrayRecovery
     }
 
     private static bool IsCheckedArrayIndex(LocalVariable candidate, LocalVariable array, int pointerSize,
-        List<Instruction> instructions, Dictionary<LocalVariable, Instruction?> definitions)
+        Instruction access, ISILControlFlowGraph cfg, List<Instruction> instructions,
+        Dictionary<LocalVariable, Instruction?> definitions, bool requireInt32, ref DominatorInfo? dominators)
     {
+        var accessBlock = cfg.FindBlockByInstruction(access);
+        if (accessBlock == null)
+            return false;
+
         foreach (var branch in instructions)
         {
-            if (branch is not { OpCode: OpCode.ConditionalJump, Operands: [_, LocalVariable condition] }
-                || !definitions.TryGetValue(condition, out var comparison)
-                || comparison == null
-                || comparison.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqualUnsigned
-                || comparison.Operands.Count < 3)
+            if (branch is not { OpCode: OpCode.ConditionalJump, Operands: [Block taken, LocalVariable condition] })
                 continue;
 
-            if (IsCheckedPair(comparison.Operands[1], comparison.Operands[2])
-                || IsCheckedPair(comparison.Operands[2], comparison.Operands[1]))
+            var inverted = false;
+            var conditionValue = condition;
+            Instruction? comparison = null;
+            for (var depth = 0; depth < 8; depth++)
+            {
+                if (!definitions.TryGetValue(conditionValue, out var definition) || definition == null)
+                    break;
+
+                if (definition is { OpCode: OpCode.Not, Operands: [_, LocalVariable inner] })
+                {
+                    inverted = !inverted;
+                    conditionValue = inner;
+                    continue;
+                }
+
+                comparison = definition;
+                break;
+            }
+
+            if (comparison is not { Operands.Count: >= 3 }
+                || requireInt32 && comparison.OperandWidth != 32
+                || !TryGetInRangeTruth(comparison, candidate, array, pointerSize, definitions, out var trueIsInRange))
+                continue;
+
+            var branchBlock = cfg.FindBlockByInstruction(branch);
+            if (branchBlock == null || branchBlock.Successors.Count < 2)
+                continue;
+
+            var fallthrough = branchBlock.Successors.FirstOrDefault(successor => successor != taken);
+            if (fallthrough == null)
+                continue;
+
+            var inRangeBlock = trueIsInRange != inverted ? taken : fallthrough;
+            dominators ??= new DominatorInfo(cfg);
+            if (dominators.Dominates(inRangeBlock, accessBlock))
                 return true;
         }
 
         return false;
+    }
 
-        bool IsCheckedPair(IOperand indexOperand, IOperand lengthOperand) =>
-            ReferenceEquals(indexOperand, candidate)
-            && IsLengthOf(lengthOperand, array, pointerSize, definitions, [], 0);
+    private static bool TryGetInRangeTruth(Instruction comparison, LocalVariable candidate, LocalVariable array,
+        int pointerSize, Dictionary<LocalVariable, Instruction?> definitions, out bool trueIsInRange)
+    {
+        trueIsInRange = false;
+        var left = comparison.Operands[1];
+        var right = comparison.Operands[2];
+
+        var candidateOnLeft = ReferenceEquals(left, candidate);
+        var candidateOnRight = ReferenceEquals(right, candidate);
+        var leftIsLength = IsLengthOf(left, array, pointerSize, definitions, [], 0);
+        var rightIsLength = IsLengthOf(right, array, pointerSize, definitions, [], 0);
+
+        if (candidateOnLeft && rightIsLength)
+        {
+            if (comparison.OpCode is OpCode.CheckLess or OpCode.CheckLessUnsigned)
+            {
+                trueIsInRange = true;
+                return true;
+            }
+
+            if (comparison.OpCode is OpCode.CheckGreaterOrEqual or OpCode.CheckGreaterOrEqualUnsigned)
+                return true;
+        }
+
+        if (leftIsLength && candidateOnRight)
+        {
+            if (comparison.OpCode is OpCode.CheckGreater or OpCode.CheckGreaterUnsigned)
+            {
+                trueIsInRange = true;
+                return true;
+            }
+
+            if (comparison.OpCode is OpCode.CheckLessOrEqual or OpCode.CheckLessOrEqualUnsigned)
+                return true;
+        }
+
+        return false;
     }
 
     private static bool IsLengthOf(IOperand operand, LocalVariable array, int pointerSize,

@@ -107,7 +107,8 @@ public static class Simplifier
 
                     // A field read evaluates at this point. Inlining it into later tests and uses
                     // can repeat a mutable read or move it across a call that changes the field.
-                    if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable local, not (FieldReference or ArrayAccess)] }
+                    if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable local, var replacement] }
+                        && IsSafeToDuplicate(replacement)
                         && !arrayInputs.Contains(local))
                     {
                         if (IsLocalUsedAfterInstruction(block, i + 1, local, out var usedByMemory))
@@ -221,6 +222,11 @@ public static class Simplifier
         private void ReplaceLocalsUntilReassignment(Block startBlock, int startIndex, LocalVariable local,
             IOperand replacement, bool stopAtJoins)
         {
+            // A copy of another local represents the value at this point in time. Its source may
+            // be overwritten later, and a shared join cannot be rewritten differently per path.
+            if (replacement is LocalVariable)
+                stopAtJoins = true;
+
             var visited = new HashSet<Block>();
             var remaining = new Stack<(Block, int)>(_graph.Blocks.Count);
 
@@ -235,14 +241,23 @@ public static class Simplifier
             {
                 var (currentBlock, index) = remaining.Pop();
 
+                var stoppedOnPath = false;
+
                 // Process instructions starting at the given index
                 for (var i = index; i < currentBlock.Instructions.Count; i++)
                 {
                     var instruction = currentBlock.Instructions[i];
 
-                    // Stop on this branch when reassigned
-                    if (instruction.Destination is LocalVariable destLocal && destLocal == local)
-                        return;
+                    // Stop this path if either the copied local is written, or its source is
+                    // overwritten/address-taken. The other successors may still carry the old value.
+                    if ((instruction.Destination is LocalVariable destLocal
+                            && (ReferenceEquals(destLocal, local)
+                                || replacement is LocalVariable sourceLocal && ReferenceEquals(destLocal, sourceLocal)))
+                        || (replacement is LocalVariable addressedSource && TakesAddressOf(instruction, addressedSource)))
+                    {
+                        stoppedOnPath = true;
+                        break;
+                    }
 
                     // Replace operands
                     for (var j = 0; j < instruction.Operands.Count; j++)
@@ -272,12 +287,15 @@ public static class Simplifier
 
                         // The object a field is accessed on is an address just like a memory base.
                         else if (operand is FieldReference field && replacement is LocalVariable fieldReplacement &&
-                                 field.Local == local)
+                                 ReferenceEquals(field.Local, local))
                         {
                             field.Local = fieldReplacement;
                         }
                     }
                 }
+
+                if (stoppedOnPath)
+                    continue;
 
                 // Process successors
                 foreach (var successor in currentBlock.Successors)
@@ -292,6 +310,18 @@ public static class Simplifier
                 }
             }
         }
+
+        private static bool TakesAddressOf(Instruction instruction, LocalVariable local)
+        {
+            foreach (var operand in instruction.Operands)
+                if (operand is AddressOf { Target: LocalVariable addressed } && ReferenceEquals(addressed, local))
+                    return true;
+
+            return false;
+        }
+
+        private static bool IsSafeToDuplicate(IOperand source) =>
+            source is not (FieldReference or ArrayAccess or ArrayLength or MemoryOperand or AddressOf);
 
         private bool IsLocalUsedAfterInstruction(Block startBlock, int startIndex, LocalVariable local, out bool usedByMemory)
         {

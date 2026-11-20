@@ -123,10 +123,10 @@ public class ISILControlFlowGraph
             // Fully detach the block so no remaining block keeps a dangling reference to it.
             // (A reachable block can have an unreachable predecessor; leaving that reference
             // behind makes later passes such as dominator computation throw.)
-            foreach (var successor in block.Successors)
-                successor.Predecessors.Remove(block);
-            foreach (var predecessor in block.Predecessors)
-                predecessor.Successors.Remove(block);
+            foreach (var successor in block.Successors.ToArray())
+                RemoveEdge(block, successor);
+            foreach (var predecessor in block.Predecessors.ToArray())
+                RemoveEdge(predecessor, block);
 
             block.Successors.Clear();
             block.Predecessors.Clear();
@@ -209,33 +209,38 @@ public class ISILControlFlowGraph
                 if (block.Successors.Count != 1 && HasJumpOperandTo(block))
                     continue;
 
-                var jumpTarget = block.Successors.Count == 1 ? block.Successors[0] : null;
+                if (block.Successors.Count > 1)
+                    continue;
 
-                // Redirect predecessors to successors
-                foreach (var pred in block.Predecessors)
+                var jumpTarget = block.Successors.SingleOrDefault();
+                var predecessors = block.Predecessors.ToArray();
+                List<Block> replacementPredecessors = [];
+                List<(Instruction Phi, IOperand[] Operands)> phiUpdates = [];
+
+                // When an empty block is bypassed, each outgoing phi value is forwarded to the
+                // block's incoming edges. Keep the predecessor order and phi operands in lockstep.
+                if (jumpTarget != null && !TryBuildPhiForwarding(jumpTarget, block, predecessors,
+                        out replacementPredecessors, out phiUpdates))
+                    continue;
+
+                foreach (var pred in predecessors)
                 {
-                    if (pred.Instructions.Count > 0
+                    if (jumpTarget != null && pred.Instructions.Count > 0
                         && pred.Instructions[^1] is { OpCode: OpCode.Jump or OpCode.ConditionalJump } jump
                         && ReferenceEquals(jump.Operands[0], block))
-                        jump.SetOperand(0, jumpTarget!);
+                        jump.SetOperand(0, jumpTarget);
 
                     pred.Successors.Remove(block);
-                    foreach (var succ in block.Successors)
-                    {
-                        if (!pred.Successors.Contains(succ))
-                            pred.Successors.Add(succ);
-                    }
+                    if (jumpTarget != null && !pred.Successors.Contains(jumpTarget))
+                        pred.Successors.Add(jumpTarget);
                 }
 
-                // Redirect successors to predecessors
-                foreach (var succ in block.Successors)
+                if (jumpTarget != null)
                 {
-                    succ.Predecessors.Remove(block);
-                    foreach (var pred in block.Predecessors)
-                    {
-                        if (!succ.Predecessors.Contains(pred))
-                            succ.Predecessors.Add(pred);
-                    }
+                    jumpTarget.Predecessors.Clear();
+                    jumpTarget.Predecessors.AddRange(replacementPredecessors);
+                    foreach (var (phi, operands) in phiUpdates)
+                        phi.SetOperands(operands.ToList());
                 }
 
                 toRemove.Add(block);
@@ -243,6 +248,88 @@ public class ISILControlFlowGraph
         }
 
         RemoveBlocks(toRemove);
+    }
+
+    private static bool TryBuildPhiForwarding(Block successor, Block emptyBlock, Block[] incomingPredecessors,
+        out List<Block> replacementPredecessors, out List<(Instruction Phi, IOperand[] Operands)> phiUpdates)
+    {
+        var oldPredecessors = successor.Predecessors.ToArray();
+        var emptyIndex = Array.IndexOf(oldPredecessors, emptyBlock);
+        if (emptyIndex < 0)
+        {
+            replacementPredecessors = [];
+            phiUpdates = [];
+            return false;
+        }
+
+        replacementPredecessors = new List<Block>(oldPredecessors.Length + incomingPredecessors.Length - 1);
+        for (var i = 0; i < oldPredecessors.Length; i++)
+        {
+            if (i == emptyIndex)
+            {
+                foreach (var predecessor in incomingPredecessors)
+                    if (!oldPredecessors.Contains(predecessor))
+                        replacementPredecessors.Add(predecessor);
+                continue;
+            }
+
+            replacementPredecessors.Add(oldPredecessors[i]);
+        }
+
+        phiUpdates = [];
+        foreach (var phi in successor.Instructions)
+        {
+            if (phi.OpCode != OpCode.Phi)
+                break;
+            if (phi.Operands.Count != oldPredecessors.Length + 1)
+                return false;
+
+            var forwardedValue = phi.Operands[emptyIndex + 1];
+            var valuesByPredecessor = new Dictionary<Block, IOperand>();
+            for (var i = 0; i < oldPredecessors.Length; i++)
+                if (i != emptyIndex)
+                    valuesByPredecessor[oldPredecessors[i]] = phi.Operands[i + 1];
+
+            foreach (var predecessor in incomingPredecessors)
+            {
+                if (valuesByPredecessor.TryGetValue(predecessor, out var directValue)
+                    && !Equals(directValue, forwardedValue))
+                    return false;
+                valuesByPredecessor[predecessor] = forwardedValue;
+            }
+
+            var operands = new IOperand[replacementPredecessors.Count + 1];
+            operands[0] = phi.Operands[0];
+            for (var i = 0; i < replacementPredecessors.Count; i++)
+            {
+                if (!valuesByPredecessor.TryGetValue(replacementPredecessors[i], out var value))
+                    return false;
+                operands[i + 1] = value;
+            }
+
+            phiUpdates.Add((phi, operands));
+        }
+
+        return true;
+    }
+
+    /// <summary>Removes one CFG edge and the matching incoming value from each leading phi.</summary>
+    public void RemoveEdge(Block from, Block to)
+    {
+        var predecessorIndex = to.Predecessors.IndexOf(from);
+        from.Successors.Remove(to);
+        if (predecessorIndex < 0)
+            return;
+
+        foreach (var instruction in to.Instructions)
+        {
+            if (instruction.OpCode != OpCode.Phi)
+                break;
+            if (predecessorIndex + 1 < instruction.Operands.Count)
+                instruction.RemoveOperandAt(predecessorIndex + 1);
+        }
+
+        to.Predecessors.RemoveAt(predecessorIndex);
     }
 
     private bool HasJumpOperandTo(Block block) =>
@@ -622,9 +709,8 @@ public class ISILControlFlowGraph
         if (instructionIndex + 1 < block.Instructions.Count)
             SplitAndCreate(block, instructionIndex + 1);
 
-        foreach (var successor in block.Successors)
-            successor.Predecessors.Remove(block);
-        block.Successors.Clear();
+        foreach (var successor in block.Successors.ToArray())
+            RemoveEdge(block, successor);
 
         AddDirectedEdge(block, ExitBlock);
         block.CalculateBlockType();

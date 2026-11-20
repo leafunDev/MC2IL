@@ -34,8 +34,7 @@ public static class ConstantBranchFolder
 
             branch.OpCode = OpCode.Jump;
             branch.SetOperands(destination);
-            block.Successors.Remove(discarded);
-            discarded.Predecessors.Remove(block);
+            graph.RemoveEdge(block, discarded);
             block.CalculateBlockType();
             removedEdge = true;
         }

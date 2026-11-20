@@ -734,12 +734,15 @@ public static class LocalVariables
 
     // Integer arithmetic often has an unknown accumulator on one side and a resolved field or
     // call result on the other. A 32-bit native operation is enough to recover the accumulator's
-    // managed integer type; wider operations need all local operands typed as integers so pointer
-    // arithmetic is not mistaken for a numeric result.
+    // managed Int32 when the known operand is signed Int32. Otherwise every operand must have the
+    // same promoted integer type; mixed signedness and pointer arithmetic stay unresolved.
     private static bool PropagateIntegerArithmetic(Instruction instruction, MethodAnalysisContext method)
     {
-        var hasIntegerOperand = false;
-        var requiresKnownIntegerOperands = instruction.OperandWidth != 32;
+        if (instruction.Operands[0] is not LocalVariable { Type: null } destination)
+            return false;
+
+        TypeAnalysisContext? resultType = null;
+        var hasUnknownLocal = false;
 
         for (var i = 1; i < instruction.Operands.Count; i++)
         {
@@ -751,19 +754,38 @@ public static class LocalVariables
             {
                 LocalVariable local => local.Type,
                 FieldReference field => field.Field.FieldType,
+                ArrayLength => method.AppContext.SystemTypes.SystemInt32Type,
                 _ => null,
             };
 
-            var integerType = IntegerResultType(operand, method);
-            if (type != null && integerType == null)
-                return false;
-            if (type == null && requiresKnownIntegerOperands)
+            if (operand is LocalVariable { Type: null })
+            {
+                hasUnknownLocal = true;
+                if (instruction.OperandWidth != 32)
+                    return false;
+                continue;
+            }
+
+            if (type == null)
                 return false;
 
-            hasIntegerOperand |= integerType != null;
+            var integerType = IntegerResultType(operand, method);
+            if (integerType == null)
+                return false;
+            if (resultType != null && !ReferenceEquals(resultType, integerType))
+                return false;
+
+            resultType = integerType;
         }
 
-        return hasIntegerOperand && PropagateIntegerResult(instruction, method);
+        if (resultType == null)
+            return false;
+
+        if (hasUnknownLocal
+            && (instruction.OperandWidth != 32 || resultType.FullName != "System.Int32"))
+            return false;
+
+        return SetTypeIfUnknown(destination, resultType);
     }
 
     // Logical operations on boolean flags stay boolean. Without this edge, negated/composed
@@ -818,6 +840,7 @@ public static class LocalVariables
         {
             LocalVariable { Type: { } localType } => localType,
             FieldReference field => field.Field.FieldType,
+            ArrayLength => method.AppContext.SystemTypes.SystemInt32Type,
             _ => null,
         };
 

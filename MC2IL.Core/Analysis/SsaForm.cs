@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using MC2IL.Core.Graphs;
@@ -372,8 +373,11 @@ public class SsaForm
     public static void Remove(MethodAnalysisContext method)
     {
         var cfg = method.ControlFlowGraph!;
+        var usedRegisterNumbers = new HashSet<int>(method.Locals.Select(local => local.Register.Number));
+        var nextBlockId = cfg.Blocks.Max(block => block.ID) + 1;
 
-        foreach (var block in cfg.Blocks)
+        // Splitting an incoming edge adds blocks, so iterate only the original phi blocks.
+        foreach (var block in cfg.Blocks.ToList())
         {
             var phiInstructions = block.Instructions
                 .Where(i => i.OpCode == OpCode.Phi)
@@ -382,27 +386,37 @@ public class SsaForm
             if (phiInstructions.Count == 0)
                 continue;
 
-            for (var predIndex = 0; predIndex < block.Predecessors.Count; predIndex++)
+            var predecessors = block.Predecessors.ToArray();
+            for (var predIndex = 0; predIndex < predecessors.Length; predIndex++)
             {
-                var predecessor = block.Predecessors[predIndex];
-                var moves = new List<Instruction>();
+                var predecessor = predecessors[predIndex];
+                var copies = new List<(LocalVariable Destination, IOperand Source)>();
 
                 foreach (var phi in phiInstructions)
                 {
                     if (1 + predIndex >= phi.Operands.Count)
                         continue;
 
-                    var destination = phi.Operands[0];
+                    if (phi.Operands[0] is not LocalVariable destination)
+                        continue;
+
                     var source = phi.Operands[1 + predIndex];
 
                     // Skip redundant self-copies.
-                    if (Equals(destination, source))
+                    if (source is LocalVariable sourceLocal && ReferenceEquals(destination, sourceLocal))
                         continue;
 
-                    moves.Add(new Instruction(-1, OpCode.Move, destination, source));
+                    copies.Add((destination, source));
                 }
 
-                InsertBeforeTerminator(predecessor, moves);
+                if (copies.Count == 0)
+                    continue;
+
+                var insertionBlock = predecessor.Successors.Count > 1
+                    ? SplitEdge(cfg, predecessor, block, ref nextBlockId)
+                    : predecessor;
+                var moves = ScheduleParallelCopies(copies, method, usedRegisterNumbers);
+                InsertBeforeTerminator(insertionBlock, moves);
             }
 
             foreach (var phi in phiInstructions)
@@ -414,6 +428,84 @@ public class SsaForm
 
         cfg.RemoveNops();
         cfg.RemoveEmptyBlocks();
+    }
+
+    // Phi operands describe simultaneous assignments on an incoming edge. Schedule a destination
+    // only after its old value is no longer needed as another copy's source; break cycles with a
+    // fresh local so swaps preserve the pre-edge values.
+    private static List<Instruction> ScheduleParallelCopies(List<(LocalVariable Destination, IOperand Source)> copies,
+        MethodAnalysisContext method, HashSet<int> usedRegisterNumbers)
+    {
+        var pending = new List<(LocalVariable Destination, IOperand Source)>(copies);
+        var moves = new List<Instruction>(copies.Count);
+
+        while (pending.Count > 0)
+        {
+            var readyIndex = pending.FindIndex(candidate =>
+                !pending.Any(copy => copy.Source is LocalVariable source
+                    && ReferenceEquals(source, candidate.Destination)));
+
+            if (readyIndex >= 0)
+            {
+                var ready = pending[readyIndex];
+                pending.RemoveAt(readyIndex);
+                moves.Add(new Instruction(-1, OpCode.Move, ready.Destination, ready.Source));
+                continue;
+            }
+
+            var cycleDestination = pending[0].Destination;
+            var temporary = CreateParallelCopyTemporary(cycleDestination.Type, method, usedRegisterNumbers);
+            moves.Add(new Instruction(-1, OpCode.Move, temporary, cycleDestination));
+
+            for (var i = 0; i < pending.Count; i++)
+                if (pending[i].Source is LocalVariable source && ReferenceEquals(source, cycleDestination))
+                    pending[i] = (pending[i].Destination, temporary);
+        }
+
+        return moves;
+    }
+
+    private static LocalVariable CreateParallelCopyTemporary(TypeAnalysisContext? type, MethodAnalysisContext method,
+        HashSet<int> usedRegisterNumbers)
+    {
+        var number = 0;
+        while (!usedRegisterNumbers.Add(number))
+            number++;
+
+        var name = $"phiTemp{number}";
+        var temporary = new LocalVariable(name, new Register(number, name), type);
+        method.Locals.Add(temporary);
+        return temporary;
+    }
+
+    private static Block SplitEdge(ISILControlFlowGraph cfg, Block predecessor, Block target, ref int nextBlockId)
+    {
+        var successorIndex = predecessor.Successors.IndexOf(target);
+        var predecessorIndex = target.Predecessors.IndexOf(predecessor);
+        if (successorIndex < 0 || predecessorIndex < 0)
+            throw new InvalidOperationException("Cannot split a missing CFG edge.");
+
+        var branch = predecessor.Instructions.LastOrDefault();
+        if (branch is not { OpCode: OpCode.ConditionalJump, Operands: [Block, _] } conditional)
+            throw new InvalidOperationException("A multi-successor phi predecessor is not a conditional branch.");
+        var isTakenEdge = ReferenceEquals(conditional.Operands[0], target);
+
+        var edgeBlock = new Block { ID = nextBlockId++ };
+        edgeBlock.Predecessors.Add(predecessor);
+        edgeBlock.Successors.Add(target);
+        edgeBlock.Instructions.Add(new Instruction(-1, OpCode.Jump, target));
+        edgeBlock.CalculateBlockType();
+
+        predecessor.Successors[successorIndex] = edgeBlock;
+        target.Predecessors[predecessorIndex] = edgeBlock;
+
+        // A conditional's explicit target identifies the taken edge. The other edge is the
+        // fallthrough, which IlGenerator derives from Successors and will now route through edgeBlock.
+        if (isTakenEdge)
+            conditional.SetOperand(0, edgeBlock);
+
+        cfg.Blocks.Add(edgeBlock);
+        return edgeBlock;
     }
 
     /// <summary>
