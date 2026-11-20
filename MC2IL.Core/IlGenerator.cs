@@ -1969,7 +1969,9 @@ public static class IlGenerator
             || context.Name != ".ctor"
             || targetMethod is not { Name: ".ctor", IsStatic: false, Parameters.Count: 0 }
             || targetMethod.DeclaringType is not { } targetType
-            || context.DeclaringType?.BaseType is not { } baseType
+            || context.DeclaringType is not { BaseType: { } baseType } declaringType
+            // C# decompilers recognize the trivial closure constructor by its base call.
+            || ClosureConstructorRecovery.IsDisplayClass(declaringType)
             || !SameType(baseType, targetType))
             return false;
 
