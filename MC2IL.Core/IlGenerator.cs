@@ -1643,6 +1643,12 @@ public static class IlGenerator
 
                 var importedMethod = targetMethod.ToMethodDescriptor();
 
+                // A call can write straight into a private struct return buffer field.
+                var resultField = instruction is { OpCode: OpCode.Call, Operands: [_, FieldReference fieldResult, ..] }
+                    ? fieldResult : null;
+                if (resultField is { Field.IsStatic: false })
+                    LoadFieldReceiver(resultField, method, locals);
+
                 var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
 
                 if (!targetMethod.IsStatic) // Load 'this' param
@@ -1690,7 +1696,10 @@ public static class IlGenerator
                 // signature we later resolved, so go by the signature and balance the stack
                 if (!targetMethod.IsVoid)
                 {
-                    if (instruction.OpCode == OpCode.Call)
+                    if (resultField != null)
+                        instructions.Add(resultField.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
+                            resultField.Field.ToFieldDescriptor());
+                    else if (instruction.OpCode == OpCode.Call)
                         StoreToOperand(instruction.Operands[1], method, locals, writeLine);
                     else
                         instructions.Add(CilOpCodes.Pop);

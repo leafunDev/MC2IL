@@ -74,6 +74,23 @@ internal static class StructReturnFieldRecovery
         var positions = GetLinearPositions(terminal);
         foreach (var group in stores.Values)
             FoldAggregateCopy(group, result, definitions, reads, positions);
+
+        foreach (var group in stores.Values)
+        {
+            var remaining = group.Where(store => store.OpCode != OpCode.Nop).ToArray();
+            if (remaining is not [var store]
+                || store is not { OperandWidth: null, Operands: [FieldReference { Parent: null } field, LocalVariable value] }
+                || value.Type != field.Field.FieldType || !reads.TryGetValue(value, out var readsOfValue) || readsOfValue != 1
+                || !definitions.TryGetValue(value, out var definition)
+                || definition is not { OpCode: OpCode.Call, Operands: [MethodAnalysisContext target, ..] }
+                || target.ReturnType != value.Type || !ComesBefore(definition, store, positions))
+                continue;
+
+            // A private return buffer is not visible to intervening calls. Store the
+            // value immediately after its producer, with no change to call order.
+            definition.SetOperand(definition.DestinationOperandIndex, field);
+            Remove(store);
+        }
     }
 
     private static void FoldAggregateCopy(List<Instruction> group, LocalVariable result,
@@ -88,6 +105,7 @@ internal static class StructReturnFieldRecovery
 
         var size = fields[0].FieldType.FullName == "System.Double" ? sizeof(double) : sizeof(float);
         var seen = new HashSet<FieldAnalysisContext>();
+        var projections = new List<Instruction>(group.Count);
         LocalVariable? source = null;
         foreach (var lane in group)
         {
@@ -96,6 +114,7 @@ internal static class StructReturnFieldRecovery
                 || width != size || parent.Offset != root.Offset || !fields.Contains(destination.Field)
                 || !seen.Add(destination.Field) || destination.Offset != root.Offset + destination.Field.Offset
                 || component.Type != destination.Field.FieldType
+                || !reads.TryGetValue(component, out var readsOfComponent) || readsOfComponent != 1
                 || !definitions.TryGetValue(component, out var definition)
                 || definition is not { OpCode: OpCode.Move, OperandWidth: null,
                     Operands: [_, FieldReference { Parent: null, Field: var field, Local: var aggregate }] }
@@ -104,6 +123,7 @@ internal static class StructReturnFieldRecovery
                 || !ComesBefore(definition, lane, positions))
                 return;
             source = aggregate;
+            projections.Add(definition);
         }
 
         // All uses of the original value are scalar projections. The original call result
@@ -112,14 +132,16 @@ internal static class StructReturnFieldRecovery
             || !definitions.TryGetValue(source, out var call)
             || call is not { OpCode: OpCode.Call, Operands: [MethodAnalysisContext target, ..] }
             || target.ReturnType != source.Type
-            || group.Any(lane => !ComesBefore(call, definitions[(LocalVariable)lane.Operands[1]]!, positions)))
+            || projections.Any(projection => !ComesBefore(call, projection, positions)))
             return;
 
         store.SetOperands(new FieldReference(root.Field, result, root.Offset), source);
         store.MemoryAccessSize = null;
-        foreach (var redundant in group)
-            if (redundant != store)
-                Remove(redundant);
+        reads[source] = 1;
+        for (var i = 0; i < group.Count - 1; i++)
+            Remove(group[i]);
+        foreach (var projection in projections)
+            Remove(projection);
     }
 
     private static Dictionary<Instruction, int> GetLinearPositions(Block terminal)
