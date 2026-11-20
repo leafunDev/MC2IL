@@ -806,7 +806,8 @@ public static class IlGenerator
         var sequence = instructions.Where(instruction => instruction.OpCode != CilOpCodes.Nop).ToArray();
         return sequence is
             [var receiver, var target, var constructor, _]
-            && (receiver.OpCode == CilOpCodes.Ldnull || receiver.OpCode == CilOpCodes.Ldarg_0)
+            && (receiver.OpCode == CilOpCodes.Ldnull || receiver.OpCode == CilOpCodes.Ldarg_0
+                || receiver is { Operand: CilLocalVariable } && receiver.OpCode == CilOpCodes.Ldloc)
             && target.OpCode == CilOpCodes.Ldftn && constructor.OpCode == CilOpCodes.Newobj
             || sequence is [var boundReceiver, var duplicate, var virtualTarget, var virtualConstructor, _]
             && boundReceiver.OpCode == CilOpCodes.Ldarg_0 && duplicate.OpCode == CilOpCodes.Dup
