@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.CodeDom.Compiler;
 using System.Linq;
 using System.Reflection;
@@ -306,7 +307,8 @@ public static class CsFileUtils
     /// <param name="writer">The writer to write the custom attribute strings to</param>
     /// <param name="analyze">True to call <see cref="HasCustomAttributes.AnalyzeCustomAttributeData"/> before generating.</param>
     /// <param name="includeIncomplete">True to emit custom attributes even if they have required parameters that aren't known</param>
-    public static void WriteCustomAttributeStrings(HasCustomAttributes context, IndentedTextWriter writer, bool analyze = true, bool includeIncomplete = true)
+    public static void WriteCustomAttributeStrings(HasCustomAttributes context, IndentedTextWriter writer,
+        bool analyze = true, bool includeIncomplete = true, IReadOnlyCollection<string>? excludedAttributeTypeNames = null)
     {
         if (analyze)
             context.AnalyzeCustomAttributeData();
@@ -316,6 +318,9 @@ public static class CsFileUtils
 
         foreach (var analyzedCustomAttribute in context.CustomAttributes!)
         {
+            if (excludedAttributeTypeNames?.Contains(analyzedCustomAttribute.Constructor.DeclaringType?.FullName ?? string.Empty) == true)
+                continue;
+
             if (!includeIncomplete && !analyzedCustomAttribute.IsSuitableForEmission)
                 continue;
 

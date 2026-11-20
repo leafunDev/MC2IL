@@ -20,6 +20,13 @@ public class DiffableCsOutputFormat : MC2ILOutputFormat
 {
     public static bool IncludeMethodLength = false;
 
+    private static readonly HashSet<string> StateMachineAttributeNames =
+    [
+        "System.Runtime.CompilerServices.AsyncStateMachineAttribute",
+        "System.Runtime.CompilerServices.AsyncIteratorStateMachineAttribute",
+        "System.Runtime.CompilerServices.IteratorStateMachineAttribute"
+    ];
+
     public override string OutputFormatId => "diffable-cs";
     public override string OutputFormatName => "Diffable C#";
 
@@ -354,7 +361,9 @@ public class DiffableCsOutputFormat : MC2ILOutputFormat
 
     private static void WriteMethod(IndentedTextWriter writer, MethodAnalysisContext method)
     {
-        if (method is InjectedMethodAnalysisContext)
+        if (method is InjectedMethodAnalysisContext
+            || method.IsCompilerGeneratedBasedOnCustomAttributes
+            || HasCompilerGeneratedMethodName(method.Name))
             return;
 
         //Custom attributes for method. Includes a trailing newline
@@ -389,6 +398,11 @@ public class DiffableCsOutputFormat : MC2ILOutputFormat
         writer.WriteLineNoTabs(string.Empty);
     }
 
+    private static bool HasCompilerGeneratedMethodName(string name) =>
+        name.Length > 0 && name[0] == '<'
+        && (name.Contains(">g__", StringComparison.Ordinal)
+            || name.Contains(">b__", StringComparison.Ordinal));
+
     //get/set/add/remove/raise
     private static void WriteAccessor(IndentedTextWriter writer, MethodAnalysisContext accessor, string accessorType, MethodAttributes parentVisibility)
     {
@@ -404,7 +418,8 @@ public class DiffableCsOutputFormat : MC2ILOutputFormat
     }
 
     private static void WriteCustomAttributes(IndentedTextWriter writer, HasCustomAttributes owner)
-        => CsFileUtils.WriteCustomAttributeStrings(owner, writer, true, true);
+        => CsFileUtils.WriteCustomAttributeStrings(owner, writer, true, true,
+            owner is MethodAnalysisContext ? StateMachineAttributeNames : null);
 
     private static string InvariantValue(object? value)
         => value is null ? "null" : value is IFormattable f ? f.ToString(null, CultureInfo.InvariantCulture) : value.ToString() ?? "";

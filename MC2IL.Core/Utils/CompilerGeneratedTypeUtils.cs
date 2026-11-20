@@ -21,6 +21,7 @@ public static class CompilerGeneratedTypeUtils
             || name.StartsWith("<PrivateImplementationDetails>", StringComparison.Ordinal)
             || name.StartsWith("<", StringComparison.Ordinal)
                 && (name.Contains(">d__", StringComparison.Ordinal)
+                    || name.EndsWith(">d", StringComparison.Ordinal)
                     || name.Contains(">c__Iterator", StringComparison.Ordinal)
                     || name.Contains(">c__AnonStorey", StringComparison.Ordinal)
                     || name.Contains(">c__DisplayClass", StringComparison.Ordinal));
