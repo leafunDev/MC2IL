@@ -72,6 +72,15 @@ To discover the assembly names in a game without exporting files:
 
 For source reading, add `--reuse-singleton-instances` to reuse an earlier `MonoSingleton<T>.Instance` result for later reads of the same closed type. This can change behavior if the singleton changes between calls, so the default output preserves both calls.
 
+### Extract strings
+
+Select **Extract strings to a text file** in the wizard or run:
+
+    MC2IL.exe --game-path "C:\Games\Example.apk" --output-as strings --output-to mc2il_strings
+    MC2IL.exe --game-path "C:\Games\libil2cpp.so" --output-as strings --output-to mc2il_strings
+
+Both commands write only `strings.txt` in the output directory. A package or game folder includes the full IL2CPP string literal table (including empty, short and duplicate values); a standalone binary needs no metadata. Native scanning looks for printable ASCII/UTF-8 and aligned UTF-16 (ASCII or Unicode text with a byte order mark). It records file offsets and defaults to four characters; use `--strings-min-length 1` to include shorter native runs. Control characters within an entry are escaped so each entry stays on one line. Strings generated at runtime or stored in compressed or encrypted data are not recovered by the native scan.
+
 ## Output formats
 
 | Format | Output |
@@ -83,6 +92,7 @@ For source reading, add `--reuse-singleton-instances` to reuse an earlier `MonoS
 | dll_throw_null | Managed DLLs with throw-null method bodies |
 | diffable-cs | C#-oriented text output for comparing runs |
 | isil | Instruction-set-independent analysis dump |
+| strings | IL2CPP literals and native string candidates in `strings.txt` |
 | wasmmappings | WebAssembly method mappings |
 | wasm_name_section | WebAssembly name section |
 | dummydll | Legacy-compatible dummy DLL output |

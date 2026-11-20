@@ -45,6 +45,7 @@ public class MC2ILCorePlugin : MC2ILPlugin
         OutputFormatRegistry.Register<AsmResolverDllOutputFormatIlRecovery>();
         OutputFormatRegistry.Register<DiffableCsOutputFormat>();
         OutputFormatRegistry.Register<IsilDumpOutputFormat>();
+        OutputFormatRegistry.Register<StringTableOutputFormat>();
         OutputFormatRegistry.Register<WasmMappingOutputFormat>();
         OutputFormatRegistry.Register<WasmNameSectionOutputFormat>();
 

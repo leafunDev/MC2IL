@@ -21,6 +21,7 @@ public class MC2ILRuntimeArgs
 
     public IEnumerable<MC2ILOutputFormat>? OutputFormats;
     public bool ListAssemblies;
+    public bool StringsFromStandaloneBinary;
     public string OutputRootDirectory = null!;
 
     public bool LowMemoryMode;

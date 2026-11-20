@@ -535,6 +535,12 @@ internal static class Program
         if (assemblyNames?.Any(string.IsNullOrEmpty) == true)
             throw new SoftException("--csharp-assemblies requires a comma-separated list of nonempty assembly names.");
 
+        var requestedFormats = options.OutputFormatIds.Distinct().ToArray();
+        var onlyStrings = requestedFormats is [StringTableOutputFormat.FormatId];
+        if (options.StringsMinimumLength is { } minimumLength
+            && (minimumLength < 1 || !requestedFormats.Contains(StringTableOutputFormat.FormatId)))
+            throw new SoftException("--strings-min-length requires a positive integer and --output-as strings.");
+
         MC2ILApi.ConfigureLib(false);
 
         var result = new MC2ILRuntimeArgs { ListAssemblies = options.ListAssemblies };
@@ -549,7 +555,17 @@ internal static class Program
                 options.GamePath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) + options.GamePath[1..];
 #endif
 
-            ResolvePathsFromCommandLine(options.GamePath, options.ExeName, ref result);
+            if (onlyStrings && options.GamePath is { } binaryPath && File.Exists(binaryPath)
+                && Path.GetExtension(binaryPath).ToLowerInvariant() is not (".apk" or ".xapk" or ".apkm" or ".ipa" or ".tipa"))
+            {
+                if (options.ProcessorsToUse.Any() || options.ProcessorConfigOptions.Any() || options.WasmFrameworkFilePath != null)
+                    throw new SoftException("A standalone string scan does not use processing layers or WASM analysis options.");
+                result.PathToAssembly = binaryPath;
+                result.StringsFromStandaloneBinary = true;
+                result.Valid = true;
+            }
+            else
+                ResolvePathsFromCommandLine(options.GamePath, options.ExeName, ref result);
         }
         else
         {
@@ -575,11 +591,14 @@ internal static class Program
 
         // if(string.IsNullOrEmpty(options.OutputFormatId))      // throw new SoftException("No output format specified, so nothing to do!");
 
-        if (options.OutputFormatIds.Any() == true)
+        if (requestedFormats.Length != 0)
         {
             try
             {
-                var formats = options.OutputFormatIds.Distinct().Select(OutputFormatRegistry.GetFormat).ToList();
+                var formats = requestedFormats.Select(id => id == StringTableOutputFormat.FormatId
+                        && options.StringsMinimumLength is { } length
+                    ? new StringTableOutputFormat(length)
+                    : OutputFormatRegistry.GetFormat(id)).ToList();
                 var sourceIndex = formats.FindIndex(format => format is CSharpOutputFormat);
                 var dllIndex = formats.FindIndex(format => format.GetType() == typeof(AsmResolverDllOutputFormatIlRecovery));
                 if (sourceIndex >= 0 && dllIndex >= 0)
@@ -736,6 +755,11 @@ internal static class Program
             }
         }
 
+        if (!runtimeArgs.ListAssemblies && runtimeArgs.ProcessingLayersToRun.Count == 0
+            && runtimeArgs.WasmFrameworkJsFile == null
+            && runtimeArgs.OutputFormats?.ToArray() is [StringTableOutputFormat strings])
+            return ExportStringsOnly(runtimeArgs, strings, executionStart);
+
         GCSettings.LatencyMode = runtimeArgs.LowMemoryMode ? GCLatencyMode.Interactive : GCLatencyMode.SustainedLowLatency;
 
         if (runtimeArgs.WasmFrameworkJsFile != null)
@@ -834,6 +858,39 @@ internal static class Program
         MC2ILPluginManager.CallOnFinish();
 
         Logger.InfoNewline($"Done. Total execution time: {(DateTime.Now - executionStart).TotalMilliseconds}ms");
+        return 0;
+    }
+
+    private static int ExportStringsOnly(MC2ILRuntimeArgs args, StringTableOutputFormat format, DateTime start)
+    {
+        try
+        {
+            var target = Path.GetFullPath(Path.Combine(args.OutputRootDirectory, "strings.txt"));
+            if (string.Equals(target, Path.GetFullPath(args.PathToAssembly), StringComparison.OrdinalIgnoreCase)
+                || (!args.StringsFromStandaloneBinary
+                    && string.Equals(target, Path.GetFullPath(args.PathToMetadata), StringComparison.OrdinalIgnoreCase)))
+                throw new SoftException("The output strings.txt would overwrite the input. Select a different --output-to directory.");
+
+            var metadata = args.StringsFromStandaloneBinary
+                ? null
+                : LibMC2ILContextBuilder.ReadMetadataFromFile(args.PathToMetadata, args.UnityVersion);
+
+            Logger.InfoNewline("Scanning binary for printable strings...");
+            format.Export(File.ReadAllBytes(args.PathToAssembly), metadata, args.OutputRootDirectory);
+        }
+        catch (InvalidMetadataHeaderException e)
+        {
+            return ReportInvalidMetadataHeader(args, e);
+        }
+        catch
+        {
+            CleanupExtractedFiles();
+            throw;
+        }
+
+        CleanupExtractedFiles();
+        MC2ILPluginManager.CallOnFinish();
+        Logger.InfoNewline($"Done. Total execution time: {(DateTime.Now - start).TotalMilliseconds}ms");
         return 0;
     }
 

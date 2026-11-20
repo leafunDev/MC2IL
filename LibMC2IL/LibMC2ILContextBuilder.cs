@@ -141,6 +141,14 @@ public sealed class LibMC2ILContextBuilder
         return builder.Build();
     }
 
+    /// <summary>Reads an IL2CPP metadata file without opening a native binary or resolving methods.</summary>
+    public static Il2CppMetadata ReadMetadataFromFile(string metadataPath, UnityVersion unityVersion)
+    {
+        var builder = new LibMC2ILContextBuilder();
+        builder.LoadMetadata(File.ReadAllBytes(metadataPath), unityVersion);
+        return builder._context.Metadata;
+    }
+
     public static LibMC2ILContext BuildFromFiles(string pePath, string metadataPath, UnityVersion unityVersion)
     {
         var builder = new LibMC2ILContextBuilder();

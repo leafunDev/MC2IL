@@ -25,6 +25,7 @@ internal static class ConsoleUi
         new("Export DLLs with throw-null method bodies", "dll_throw_null", "Stub methods that throw on invocation"),
         new("Export C#-oriented source", "diffable-cs", "Readable source output for comparison"),
         new("Export ISIL analysis dump", "isil", "Instruction-level method analysis"),
+        new("Extract strings to a text file", Core.OutputFormats.StringTableOutputFormat.FormatId, "Native strings and IL2CPP literals"),
         new("Export WebAssembly method mappings", "wasmmappings", "Method names mapped to WASM functions"),
         new("Export WebAssembly name section", "wasm_name_section", "Names extracted from a WASM module")
     ];
@@ -73,16 +74,17 @@ internal static class ConsoleUi
         if (actionIndex < 0)
             return null;
 
+        var stringsOnly = Actions[actionIndex].FormatId == Core.OutputFormats.StringTableOutputFormat.FormatId;
         var inputKind = Select("Select game input", new[]
         {
             "Browse for a package file    APK / XAPK / APKM / IPA / TIPA",
             "Browse for a Unity game folder",
-            "Enter or paste a path manually"
+            stringsOnly ? "Enter a binary, game folder, or package path" : "Enter or paste a path manually"
         }, 0);
         if (inputKind < 0)
             return null;
 
-        var gamePath = SelectInputPath(inputKind);
+        var gamePath = SelectInputPath(inputKind, stringsOnly);
         if (gamePath == null)
             return null;
 
@@ -145,9 +147,9 @@ internal static class ConsoleUi
 
         Console.WriteLine();
         WriteAccent("ANALYSIS OPTIONS");
-        var lowMemory = AskYesNo("Use low-memory mode?", defaultValue: false);
+        var lowMemory = !stringsOnly && AskYesNo("Use low-memory mode?", defaultValue: false);
         var verbose = AskYesNo("Show detailed diagnostic log?", defaultValue: false);
-        var reuseSingletons = AskYesNo("Reuse singleton instances for later reads?", defaultValue: false);
+        var reuseSingletons = !stringsOnly && AskYesNo("Reuse singleton instances for later reads?", defaultValue: false);
         var recoveryTargets = Actions[actionIndex].FormatId is "dll_il_recovery" or ILanguageDecompiler.CSharpOutputFormat.FormatId
             ? Prompt("RECOVERY TARGETS", "Leave blank for all methods, or enter Full.Type or Full.Type::Method (comma-separated).")
             : string.Empty;
@@ -159,9 +161,12 @@ internal static class ConsoleUi
         WriteLabel("Output", outputPath);
         if (exportsCSharp)
             WriteLabel("C# assemblies", sourceAssemblies ?? "All");
-        WriteLabel("Low memory", lowMemory ? "On" : "Off");
         WriteLabel("Verbose log", verbose ? "On" : "Off");
-        WriteLabel("Reuse singletons", reuseSingletons ? "On" : "Off");
+        if (!stringsOnly)
+        {
+            WriteLabel("Low memory", lowMemory ? "On" : "Off");
+            WriteLabel("Reuse singletons", reuseSingletons ? "On" : "Off");
+        }
         if (recoveryTargets.Length != 0)
             WriteLabel("Recovery targets", recoveryTargets);
         Console.WriteLine();
@@ -193,10 +198,10 @@ internal static class ConsoleUi
         return args.ToArray();
     }
 
-    private static string? SelectInputPath(int inputKind)
+    private static string? SelectInputPath(int inputKind, bool allowBinary)
     {
         if (inputKind == 2)
-            return PromptValidInputPath();
+            return PromptValidInputPath(allowBinary);
 
         var result = inputKind == 0
             ? NativeFilePicker.PickGamePackage()
@@ -208,14 +213,16 @@ internal static class ConsoleUi
             return result.Path;
 
         WriteStatus("A native picker is unavailable on this system. Enter a path below.", ConsoleColor.Yellow);
-        return PromptValidInputPath();
+        return PromptValidInputPath(allowBinary);
     }
 
-    private static string? PromptValidInputPath()
+    private static string? PromptValidInputPath(bool allowBinary)
     {
         while (true)
         {
-            var path = Prompt("GAME PATH", "APK / XAPK / APKM / IPA / TIPA or Unity game folder");
+            var path = Prompt("GAME PATH", allowBinary
+                ? "Binary file, game package, or Unity game folder"
+                : "APK / XAPK / APKM / IPA / TIPA or Unity game folder");
             if (File.Exists(path) || Directory.Exists(path))
                 return path;
             WriteStatus("That path does not exist. Choose a file/folder or press Ctrl+C to cancel.", ConsoleColor.Yellow);
@@ -374,6 +381,8 @@ internal static class ConsoleUi
             SetProgress(57, "Preparing analysis", "Running selected processors.");
         else if (line.IndexOf("Invoking processing layers", StringComparison.Ordinal) >= 0)
             SetProgress(63, "Analyzing game", "Applying processing layers.");
+        else if (line.IndexOf("Scanning binary for printable strings", StringComparison.Ordinal) >= 0)
+            SetProgress(75, "Extracting strings", "Scanning the binary for text.");
         else if (line.IndexOf("Finding key function addresses", StringComparison.Ordinal) >= 0)
             SetProgress(68, "Preparing method recovery", "Resolving native function addresses.");
         else if (line.StartsWith("Outputting as ", StringComparison.Ordinal))
