@@ -487,6 +487,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         EqualityBranchInverter.Run(this);
 
         StructReturnFieldRecovery.Run(this);
+        StructArgumentFieldRecovery.Run(this);
         DeadCodeEliminator.Run(ControlFlowGraph!, MetadataResolver.FindMethodMetadataReads(this),
             discardUnusedCallResults: true);
 
