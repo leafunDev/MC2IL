@@ -272,6 +272,7 @@ public static class IlGenerator
             EmitUnrecoveredReturn(context, definition, writeLine);
         }
 
+        CilSingleUseMathInliner.Run(body, locals);
         CilBranchCleanup.Run(body);
         SetRecoveredMaxStack(body);
     }

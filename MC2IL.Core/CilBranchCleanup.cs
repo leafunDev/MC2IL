@@ -195,7 +195,7 @@ internal static class CilBranchCleanup
     }
 
     // Before offsets are assigned, distinct instructions can compare equal in AsmResolver.
-    private sealed class InstructionIdentity : IEqualityComparer<CilInstruction>
+    internal sealed class InstructionIdentity : IEqualityComparer<CilInstruction>
     {
         public static readonly InstructionIdentity Instance = new();
 
