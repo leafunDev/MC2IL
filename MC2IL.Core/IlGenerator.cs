@@ -193,6 +193,7 @@ public static class IlGenerator
 
             for (var i = 0; i < block.Instructions.Count; i++)
             {
+                InlineReferenceComparisonInputs(block, i, graph, instructionMap, inlineLocals, body);
                 InlineSingleUseFirstInput(block, i, graph, instructionMap, inlineLocals);
                 InlineSingleUseComparisonInput(block, i, graph, instructionMap, inlineLocals, body);
                 InlineSingleUseArrayLengthReceiver(block, i, graph, instructionMap, inlineLocals, body);
@@ -527,6 +528,29 @@ public static class IlGenerator
                 isReceiver ? candidate => IsStackNeutralArgumentProducer(candidate, consumer, instructionMap, locals) : null);
             return;
         }
+    }
+
+    private static void InlineReferenceComparisonInputs(Block block, int comparisonIndex, ISILControlFlowGraph graph,
+        Dictionary<Instruction, List<CilInstruction>> instructionMap,
+        Dictionary<LocalVariable, CilLocalVariable> locals, CilMethodBody body)
+    {
+        var comparison = block.Instructions[comparisonIndex];
+        if (comparison is not { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, OperandWidth: null or 64,
+                Operands: [_, LocalVariable { Type: { } leftType } left, LocalVariable { Type: { } rightType } right] }
+            || !IsManagedReference(leftType) || !IsManagedReference(rightType)
+            || !locals.ContainsKey(left) || !locals.ContainsKey(right)
+            || !TryFindSingleUseProducer(block, comparisonIndex, right, out var rightBlock, out var rightIndex, out var rightProducer)
+            || rightProducer is not { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.IsStatic: false }] }
+            || !instructionMap.TryGetValue(rightProducer, out var rightIl)
+            || !HasStandaloneStackEffect(rightIl, body, rightIl.Count, 0)
+            || !TryFindSingleUseProducer(rightBlock, rightIndex, left, out _, out _, out var leftProducer)
+            || CountLocalUses(graph, left) != 1 || CountLocalUses(graph, right) != 1)
+            return;
+
+        // Both field and call reads keep their evaluation order. The first reference
+        // remains on the stack while the second is loaded before ceq.
+        if (TryInlineStackValue(leftProducer, comparison, left, instructionMap, locals))
+            TryInlineStackValue(rightProducer, comparison, right, instructionMap, locals);
     }
 
     private static bool IsStackNeutralArgumentProducer(Instruction candidate, Instruction consumer,
