@@ -50,6 +50,20 @@ public static class FlagConditionRecovery
                 definition.SetOperands(definition.Operands[0], op0!, op1!);
             }
         }
+
+        // ARM64 CMP's zero flag may be read as a value by CSET or CSEL, without a
+        // conditional branch. Fold it after classifying branches that need the flag cluster.
+        foreach (var entry in defOf)
+        {
+            if (entry.Key.Register.Name != "Z"
+                || entry.Value is not { OpCode: OpCode.CheckEqual,
+                    Operands: [var destination, LocalVariable { Register.Name: "TEMP1" } difference, Immediate { Value: 0 }] }
+                || Def(difference, defOf) is not { OpCode: OpCode.Subtract, Operands: [_, var left, var right] } subtract
+                || subtract.OperandWidth != entry.Value.OperandWidth)
+                continue;
+
+            entry.Value.SetOperands(destination, left, right);
+        }
     }
 
     private static Dictionary<LocalVariable, Instruction> BuildDefMap(ISILControlFlowGraph cfg)

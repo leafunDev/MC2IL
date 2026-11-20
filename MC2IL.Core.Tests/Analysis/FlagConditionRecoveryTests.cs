@@ -78,6 +78,27 @@ public class FlagConditionRecoveryTests
         Assert.That(def.Operands[2], Is.EqualTo(B));
     }
 
+    [TestCase(true)]
+    [TestCase(false)]
+    public void RecoversArm64ZeroFlagReturnedAsAValue(bool sameWidth)
+    {
+        var difference = Flag("TEMP1");
+        var zeroFlag = Flag("Z");
+        var comparison = new Instruction(1, OpCode.CheckEqual, zeroFlag, difference, Imm(0)) { OperandWidth = 32 };
+        var graph = new ISILControlFlowGraph(
+        [
+            new Instruction(0, OpCode.Subtract, difference, A, B) { OperandWidth = sameWidth ? 32 : null },
+            comparison,
+            new Instruction(2, OpCode.Return, zeroFlag),
+        ]);
+
+        FlagConditionRecovery.Run(graph);
+
+        Assert.That(comparison.Operands[1], Is.EqualTo(sameWidth ? A : difference));
+        Assert.That(comparison.Operands[2], Is.EqualTo(sameWidth ? (IOperand)B : Imm(0)));
+        Assert.That(comparison.OperandWidth, Is.EqualTo(32));
+    }
+
     [Test]
     public void RecoversSignedLessThan()
     {
