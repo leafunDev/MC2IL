@@ -25,6 +25,9 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     /// <summary>Reuse repeated MonoSingleton.Instance values when generating readable output.</summary>
     public bool ReuseSingletonInstances { get; set; }
 
+    /// <summary>Limit which managed method bodies are recovered. Null selects all methods.</summary>
+    public OutputFormats.RecoveryScope? RecoveryScope { get; set; }
+
     /// <summary>
     /// The IL2CPP binary file this application was loaded from
     /// </summary>

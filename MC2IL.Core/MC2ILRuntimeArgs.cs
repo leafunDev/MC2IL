@@ -24,4 +24,5 @@ public class MC2ILRuntimeArgs
 
     public bool LowMemoryMode;
     public bool ReuseSingletonInstances;
+    public IReadOnlyList<string> RecoverySelectors = [];
 }

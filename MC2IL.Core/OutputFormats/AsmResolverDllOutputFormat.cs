@@ -140,6 +140,8 @@ public abstract class AsmResolverDllOutputFormat : MC2ILOutputFormat
 
     protected abstract void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext);
     
+    protected virtual RecoveryScope? GetRecoveryScope(ApplicationAnalysisContext context) => null;
+
     private void FillAllMethodBodies(ApplicationAnalysisContext context)
     {
         var work = new List<(TypeAnalysisContext Type, MethodAnalysisContext Method)>();
@@ -157,7 +159,9 @@ public abstract class AsmResolverDllOutputFormat : MC2ILOutputFormat
         }
 
         var completedMethodCount = 0;
-        var progressInterval = Math.Max(1, work.Count / 100);
+        var scope = GetRecoveryScope(context);
+        var progressTotal = scope == null ? work.Count : work.Count(pair => scope.Includes(pair.Method));
+        var progressInterval = Math.Max(1, progressTotal / 100);
 
         void FillOne((TypeAnalysisContext Type, MethodAnalysisContext Method) pair)
         {
@@ -170,9 +174,12 @@ public abstract class AsmResolverDllOutputFormat : MC2ILOutputFormat
                 var managedMethod = methodCtx.GetExtraData<MethodDefinition>("AsmResolverMethod") ?? throw new($"AsmResolver method not found in method analysis context for {typeContext.FullName}.{methodCtx.Name}");
 
                 FillMethodBody(managedMethod, methodCtx);
-                var completed = System.Threading.Interlocked.Increment(ref completedMethodCount);
-                if (completed % progressInterval == 0 || completed == work.Count)
-                    Logger.InfoNewline($"Decompiling methods: {completed}/{work.Count}", "Progress");
+                if (scope == null || scope.Includes(methodCtx))
+                {
+                    var completed = System.Threading.Interlocked.Increment(ref completedMethodCount);
+                    if (completed % progressInterval == 0 || completed == progressTotal)
+                        Logger.InfoNewline($"Decompiling methods: {completed}/{progressTotal}", "Progress");
+                }
             }
 #if !DEBUG
             catch (System.Exception e)

@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection.PortableExecutable;
 using ICSharpCode.Decompiler;
+using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.CSharp.ProjectDecompiler;
 using ICSharpCode.Decompiler.Metadata;
 using MC2IL.Core.Api;
@@ -46,19 +47,23 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
                 foreach (var path in assemblies)
                     File.Copy(path, Path.Combine(outputRoot, Path.GetFileName(path)), overwrite: true);
 
-            var usedDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var sourceAssemblies = assemblies
+                .Select(path => (Path: path, Types: context.RecoveryScope?.TopLevelTypesIn(Path.GetFileName(path)).ToArray()))
+                .Where(assembly => assembly.Types is not { Length: 0 })
+                .ToArray();
 
-            for (var i = 0; i < assemblies.Length; i++)
+            var usedDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (var i = 0; i < sourceAssemblies.Length; i++)
             {
-                var path = assemblies[i];
+                var (path, selectedTypes) = sourceAssemblies[i];
                 var name = Path.GetFileNameWithoutExtension(path);
-                Logger.InfoNewline($"Writing C# for {name} ({i + 1}/{assemblies.Length})", "CSharpOutput");
+                Logger.InfoNewline($"Writing C# for {name} ({i + 1}/{sourceAssemblies.Length})", "CSharpOutput");
 
                 var directoryName = WholeProjectDecompiler.CleanUpFileName(name, null);
                 var uniqueName = directoryName;
                 for (var suffix = 2; !usedDirectories.Add(uniqueName); suffix++)
                     uniqueName = $"{directoryName}_{suffix}";
-                WriteAssembly(path, Path.Combine(sourceRoot, uniqueName));
+                WriteAssembly(path, Path.Combine(sourceRoot, uniqueName), selectedTypes);
             }
         }
         finally
@@ -74,15 +79,47 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
         }
     }
 
-    private static void WriteAssembly(string path, string outputDirectory)
+    private static void WriteAssembly(string path, string outputDirectory, string[]? selectedTypes)
     {
         using var module = new PEFile(path, PEStreamOptions.PrefetchEntireImage);
         var resolver = new UniversalAssemblyResolver(path, throwOnError: false,
             module.DetectTargetFrameworkId(), module.DetectRuntimePack(), PEStreamOptions.PrefetchMetadata);
         var settings = new DecompilerSettings { ThrowOnAssemblyResolveErrors = false };
-        var decompiler = new SourceProjectDecompiler(settings, resolver);
-
         Directory.CreateDirectory(outputDirectory);
+
+        if (selectedTypes != null)
+        {
+            var remaining = new HashSet<string>(selectedTypes, StringComparer.Ordinal);
+            var source = new CSharpDecompiler(module, resolver, settings);
+            var usedFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var metadata = module.Metadata;
+            foreach (var handle in metadata.TypeDefinitions)
+            {
+                var type = metadata.GetTypeDefinition(handle);
+                if (!type.GetDeclaringType().IsNil)
+                    continue;
+                var ns = metadata.GetString(type.Namespace);
+                var name = metadata.GetString(type.Name);
+                var fullName = string.IsNullOrEmpty(ns) ? name : ns + "." + name;
+                if (!remaining.Remove(fullName))
+                    continue;
+
+                var stem = WholeProjectDecompiler.CleanUpFileName(fullName, null);
+                var fileName = stem;
+                for (var suffix = 2; !usedFileNames.Add(fileName); suffix++)
+                    fileName = $"{stem}_{suffix}";
+
+                var text = source.DecompileTypesAsString(new[] { handle });
+                File.WriteAllText(Path.Combine(outputDirectory, fileName + ".cs"),
+                    "// Scoped export: only selected method bodies were recovered." + Environment.NewLine + text);
+            }
+
+            foreach (var type in remaining.OrderBy(type => type, StringComparer.Ordinal))
+                Logger.WarnNewline($"Selected type {type} was not found in {module.Name}.", "CSharpOutput");
+            return;
+        }
+
+        var decompiler = new SourceProjectDecompiler(settings, resolver);
         decompiler.DecompileProject(module, outputDirectory, TextWriter.Null);
 
         if (decompiler.Errors.Count > 0)

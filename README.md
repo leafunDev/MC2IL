@@ -58,6 +58,12 @@ This writes `.cs` files under `mc2il_out/CSharp/<assembly>/`. MC2IL recovers met
 
 Choose **Export both DLL and C# files** in the wizard or pass `--output-as dll_il_recovery csharp` to keep the DLLs in the output directory as well.
 
+When working on one part of a game, use `--recover-only` with the DLL or C# recovery formats. Enter comma-separated full type names or `Type::Method` names (case sensitive). A type selects all its methods and nested types; a method name selects all overloads. The terminal wizard offers the same option under **Recovery targets**.
+
+    dotnet run --no-build --configuration Release --project MC2IL/MC2IL.csproj --framework net10.0 -- --game-path "C:\Games\Example.apk" --output-as csharp --recover-only "Oxide.Anvil::CanPickup,CanvasHelper" --output-to mc2il_focused
+
+Scoped C# output includes only the containing types. Scoped DLLs keep all type and member declarations for reference resolution. Other game method bodies are marked as excluded; select the whole type when examining its constructors, accessors, or generated nested types.
+
 For source reading, add `--reuse-singleton-instances` to reuse an earlier `MonoSingleton<T>.Instance` result for later reads of the same closed type. This can change behavior if the singleton changes between calls, so the default output preserves both calls.
 
 ## Output formats

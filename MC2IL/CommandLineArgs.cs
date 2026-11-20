@@ -45,6 +45,9 @@ public class CommandLineArgs
     [Option("output-as", HelpText = "Specify the ID of the output format you wish to use.")]
     public IEnumerable<string> OutputFormatIds { get; set; } = new List<string>();
 
+    [Option("recover-only", HelpText = "Recover only the specified types or methods (Full.Type or Full.Type::Method; comma-separated). Applies to csharp and dll_il_recovery.", Separator = ',')]
+    public IEnumerable<string> RecoverySelectors { get; set; } = new List<string>();
+
     [Option("output-to", HelpText = "Root directory to output to. Defaults to mc2il_out in the current working directory.")]
     public string OutputRootDir { get; set; } = Path.GetFullPath("mc2il_out");
 

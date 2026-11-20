@@ -123,6 +123,9 @@ internal static class ConsoleUi
         var lowMemory = AskYesNo("Use low-memory mode?", defaultValue: false);
         var verbose = AskYesNo("Show detailed diagnostic log?", defaultValue: false);
         var reuseSingletons = AskYesNo("Reuse singleton instances for later reads?", defaultValue: false);
+        var recoveryTargets = Actions[actionIndex].FormatId is "dll_il_recovery" or ILanguageDecompiler.CSharpOutputFormat.FormatId
+            ? Prompt("RECOVERY TARGETS", "Leave blank for all methods, or enter Full.Type or Full.Type::Method (comma-separated).")
+            : string.Empty;
 
         Console.WriteLine();
         WriteAccent("READY TO START");
@@ -132,6 +135,8 @@ internal static class ConsoleUi
         WriteLabel("Low memory", lowMemory ? "On" : "Off");
         WriteLabel("Verbose log", verbose ? "On" : "Off");
         WriteLabel("Reuse singletons", reuseSingletons ? "On" : "Off");
+        if (recoveryTargets.Length != 0)
+            WriteLabel("Recovery targets", recoveryTargets);
         Console.WriteLine();
 
         if (!AskYesNo("Start recovery now?", defaultValue: true))
@@ -148,6 +153,11 @@ internal static class ConsoleUi
         if (lowMemory) args.Add("--low-memory-mode");
         if (verbose) args.Add("--verbose");
         if (reuseSingletons) args.Add("--reuse-singleton-instances");
+        if (recoveryTargets.Length != 0)
+        {
+            args.Add("--recover-only");
+            args.Add(recoveryTargets);
+        }
         return args.ToArray();
     }
 

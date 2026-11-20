@@ -23,6 +23,8 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
     public override string OutputFormatName => "DLL files with IL Recovery";
 
+    protected override RecoveryScope? GetRecoveryScope(ApplicationAnalysisContext context) => context.RecoveryScope;
+
     public override List<AssemblyDefinition> BuildAssemblies(ApplicationAnalysisContext context)
     {
         //We're going to need key function addresses, so grab them. This way the logging is more consistent
@@ -58,6 +60,19 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         {
             if (!FrameworkPropertyRecovery.TryEmitGetter(methodContext, methodDefinition))
                 FillMethodBodyWithStub(methodDefinition);
+            return;
+        }
+
+        if (methodContext.AppContext.RecoveryScope is { } scope && !scope.Includes(methodContext))
+        {
+            // A default return would look like genuine game logic in a scoped decompilation.
+            var factory = module.CorLibTypeFactory;
+            var exceptionCtor = factory.CorLibScope
+                .CreateTypeReference("System", "NotSupportedException")
+                .CreateMemberReference(".ctor", MethodSignature.CreateInstance(factory.Void, [factory.String]));
+            instructions.Add(CilOpCodes.Ldstr, "Method body excluded by --recover-only.");
+            instructions.Add(CilOpCodes.Newobj, exceptionCtor);
+            instructions.Add(CilOpCodes.Throw);
             return;
         }
 

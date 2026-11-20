@@ -562,6 +562,7 @@ internal static class Program
 
         result.LowMemoryMode = options.LowMemoryMode;
         result.ReuseSingletonInstances = options.ReuseSingletonInstances;
+        result.RecoverySelectors = options.RecoverySelectors.ToArray();
 
         // if(string.IsNullOrEmpty(options.OutputFormatId))      // throw new SoftException("No output format specified, so nothing to do!");
 
@@ -700,6 +701,14 @@ internal static class Program
         if (!runtimeArgs.Valid)
             throw new SoftException("Arguments have Valid = false");
 
+        if (runtimeArgs.RecoverySelectors.Count != 0
+            && (runtimeArgs.OutputFormats == null || !runtimeArgs.OutputFormats.Any()
+                || runtimeArgs.OutputFormats.Any(format => format is not (AsmResolverDllOutputFormatIlRecovery or CSharpOutputFormat))))
+        {
+            CleanupExtractedFiles();
+            throw new SoftException("--recover-only requires --output-as csharp or dll_il_recovery.");
+        }
+
         MC2ILApi.RuntimeOptions = runtimeArgs;
 
         var executionStart = DateTime.Now;
@@ -760,6 +769,21 @@ internal static class Program
         //Run processing layers
         Logger.InfoNewline("Invoking processing layers...");
         RunProcessingLayers(runtimeArgs, processingLayer => processingLayer.Process(MC2ILApi.CurrentAppContext));
+
+        if (runtimeArgs.RecoverySelectors.Count != 0)
+        {
+            try
+            {
+                var scope = RecoveryScope.Resolve(MC2ILApi.CurrentAppContext, runtimeArgs.RecoverySelectors);
+                MC2ILApi.CurrentAppContext.RecoveryScope = scope;
+                Logger.InfoNewline($"Selected {scope.MethodCount} method declarations for scoped recovery.");
+            }
+            catch (ArgumentException e)
+            {
+                CleanupExtractedFiles();
+                throw new SoftException(e.Message);
+            }
+        }
 
         var outputStart = DateTime.Now;
 
