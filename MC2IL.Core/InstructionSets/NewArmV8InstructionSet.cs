@@ -768,15 +768,19 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                     }
                     else
                     {
+                        // The two S/D destinations receive separate scalar loads. Keep
+                        // their widths so offset zero resolves to the first nested field.
+                        int? scalarSize = instruction.Op0Reg is >= Arm64Register.S0 and <= Arm64Register.S31
+                            or >= Arm64Register.D0 and <= Arm64Register.D31 ? pairSize : null;
                         if (instruction.Op0Kind == Arm64OperandKind.Register && IsReg31(instruction.Op0Reg))
                             Add(address, OpCode.Nop); // discard the first loaded value into WZR/XZR
                         else
-                            Add(address, OpCode.Move, ConvertOperand(instruction, 0), MemOperand());
+                            Add(address, OpCode.Move, ConvertOperand(instruction, 0), MemOperand()).MemoryAccessSize = scalarSize;
 
                         if (instruction.Op1Kind == Arm64OperandKind.Register && IsReg31(instruction.Op1Reg))
                             Add(address, OpCode.Nop); // discard the second loaded value into WZR/XZR
                         else
-                            Add(address, OpCode.Move, ConvertOperand(instruction, 1), MemOperand(pairSize));
+                            Add(address, OpCode.Move, ConvertOperand(instruction, 1), MemOperand(pairSize)).MemoryAccessSize = scalarSize;
                     }
 
                     EmitWriteback(beforeAccess: false);
