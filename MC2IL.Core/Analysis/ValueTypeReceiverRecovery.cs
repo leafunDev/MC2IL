@@ -1,12 +1,125 @@
+using System;
 using System.Collections.Generic;
+using System.Reflection;
 using MC2IL.Core.Graphs;
+using MC2IL.Core.InstructionSets;
 using MC2IL.Core.ISIL;
 using MC2IL.Core.Model.Contexts;
+using MC2IL.Core.Utils;
 
 namespace MC2IL.Core.Analysis;
 
 internal static class ValueTypeReceiverRecovery
 {
+    internal static void ResolveStaticFieldAddresses(MethodAnalysisContext method)
+    {
+        if (!method.Locals.Exists(local => local.Type is StaticFieldStorageTypeAnalysisContext))
+            return;
+
+        var instructions = method.ControlFlowGraph!.Instructions;
+        Dictionary<LocalVariable, LocalVariable>? copies = null;
+        var pointerFitsInWord = method.AppContext.Binary.is32Bit;
+        foreach (var call in instructions)
+        {
+            if (!call.IsCall || call.Operands[0] is not MethodAnalysisContext
+                { IsStatic: false, DeclaringType: { IsValueType: true } valueType })
+                continue;
+
+            var receiverIndex = call.OpCode == OpCode.Call ? 2 : 1;
+            if (call.Operands.Count <= receiverIndex
+                || call.Operands[receiverIndex] is not LocalVariable receiver
+                || FindStorage(receiver) is not
+                    { Type: StaticFieldStorageTypeAnalysisContext { OwnerType: var owner } } storage
+                || owner is ReferencedTypeAnalysisContext || owner.GenericParameters.Count != 0
+                || FindUniqueField(owner, 0, isStatic: true) is not { } field
+                || !MetadataResolver.IsSameType(field.FieldType, valueType)
+                || (field.DeclaringType != method.DeclaringType && field.Visibility != FieldAttributes.Public))
+                continue;
+
+            // A direct pointer to the static storage block is the address of its offset-zero field.
+            call.SetOperand(receiverIndex, new AddressOf(new FieldReference(field, storage, 0)));
+        }
+
+        LocalVariable? FindStorage(LocalVariable receiver)
+        {
+            if (receiver.Type is StaticFieldStorageTypeAnalysisContext)
+                return receiver;
+
+            // A call can type its receiver before inference reaches the native register copy.
+            // Trace only full-width SSA copies back to the known storage load.
+            if (copies == null)
+            {
+                copies = [];
+                foreach (var instruction in instructions)
+                    if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable destination, LocalVariable source] }
+                        && (instruction.OperandWidth != 32 || pointerFitsInWord))
+                        copies[destination] = source;
+            }
+            for (var depth = 0; depth < 16 && copies.TryGetValue(receiver, out var source); depth++)
+            {
+                if (source.Type is StaticFieldStorageTypeAnalysisContext)
+                    return source;
+                receiver = source;
+            }
+            return null;
+        }
+    }
+
+    internal static void BindStackConstructorReceivers(MethodAnalysisContext method)
+    {
+        if (method.Name != ".cctor" || method.AppContext.InstructionSet is not NewArmV8InstructionSet)
+            return;
+
+        foreach (var block in method.ControlFlowGraph!.Blocks)
+        for (var i = 0; i < block.Instructions.Count; i++)
+        {
+            var call = block.Instructions[i];
+            if (call is not { OpCode: OpCode.CallVoid, Operands: [Immediate target, Register receiver, ..] }
+                || !method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates)
+                || candidates is not [{ Name: ".ctor", IsStatic: false, DeclaringType: { IsValueType: true } valueType }])
+                continue;
+
+            var size = TypeSizes.UnboxedSize(valueType, 8);
+            if (size is not (4 or 8))
+                continue;
+
+            // Bind the argument before SSA so a subsequent stack read sees the result
+            // written by the constructor, rather than the preceding zero fill.
+            Dictionary<Register, Instruction>? lastWrites = null;
+            for (var j = i - 1; j >= 0; j--)
+            {
+                var previous = block.Instructions[j];
+                if (previous.OpCode == OpCode.Nop)
+                    continue;
+                if (previous is not { OpCode: OpCode.Move, Operands: [Register destination, var source] })
+                    break;
+                if (destination == receiver)
+                {
+                    if (source is AddressOf { Target: Register slot }
+                        && slot.Name.StartsWith("stack_-", StringComparison.Ordinal)
+                        && lastWrites != null && lastWrites.TryGetValue(slot, out var initialization)
+                        && initialization.MemoryAccessSize == size && initialization.Operands[1] is Immediate { Value: 0 }
+                        && !UsesAddressInOtherArguments(call, receiver))
+                        call.SetOperand(1, source);
+                    break;
+                }
+                if (source is not (Register or Immediate) || source is Register alias && alias == receiver)
+                    break;
+                lastWrites ??= [];
+                if (!lastWrites.ContainsKey(destination))
+                    lastWrites.Add(destination, previous);
+            }
+        }
+    }
+
+    private static bool UsesAddressInOtherArguments(Instruction call, Register receiver)
+    {
+        for (var i = 2; i < call.Operands.Count; i++)
+            if (call.Operands[i] is Register argument && argument == receiver)
+                return true;
+        return false;
+    }
+
     internal static void Run(MethodAnalysisContext method)
     {
         var graph = method.ControlFlowGraph!;
@@ -67,7 +180,7 @@ internal static class ValueTypeReceiverRecovery
         }
     }
 
-    private static FieldAnalysisContext? FindUniqueField(TypeAnalysisContext owner, int offset)
+    private static FieldAnalysisContext? FindUniqueField(TypeAnalysisContext owner, int offset, bool isStatic = false)
     {
         FieldAnalysisContext? match = null;
         for (var type = owner; type != null; type = type.BaseType)
@@ -77,12 +190,17 @@ internal static class ValueTypeReceiverRecovery
 
             foreach (var field in type.Fields)
             {
-                if (field.IsStatic || field.BackingData?.FieldOffset != offset)
+                if (field.IsStatic != isStatic || (field.Attributes & FieldAttributes.Literal) != 0
+                    || field.BackingData?.FieldOffset != offset)
                     continue;
                 if (match != null)
                     return null;
                 match = field;
             }
+
+            // Each type has a separate block for its static fields.
+            if (isStatic)
+                break;
         }
 
         return match;
