@@ -88,6 +88,9 @@ internal static class CilBranchCleanup
             // If either outcome reaches the same instruction, only consume the condition.
             if (target != null && TryInvert(instruction, out var inverse))
             {
+                if (!referenced.Contains(instruction))
+                    FoldZeroTests(body, i, referenced, ref inverse);
+
                 if (ReferenceEquals(target, nextInstruction) || nextInstruction is { } samePath
                     && IsUnconditionalBranch(samePath) && ReferenceEquals(TargetOf(samePath), target))
                 {
@@ -125,6 +128,45 @@ internal static class CilBranchCleanup
             instructions.Clear();
             instructions.AddRange(kept);
         }
+    }
+
+    private static void FoldZeroTests(CilMethodBody body, int index, HashSet<CilInstruction> referenced,
+        ref CilOpCode inverse)
+    {
+        var instructions = body.Instructions;
+        var branch = instructions[index];
+        // Fold ceq against zero into the branch. Native flags can leave several such tests.
+        while (true)
+        {
+            var compare = FindPrevious(index);
+            if (compare < 0 || instructions[compare].OpCode != CilOpCodes.Ceq)
+                break;
+
+            var zero = FindPrevious(compare);
+            if (zero < 0 || !IsZero(instructions[zero]))
+                break;
+
+            MakeNop(instructions[compare]);
+            MakeNop(instructions[zero]);
+            (branch.OpCode, inverse) = (inverse, branch.OpCode);
+            index = zero;
+        }
+
+        int FindPrevious(int index)
+        {
+            for (var i = index - 1; i >= 0; i--)
+            {
+                if (referenced.Contains(instructions[i]))
+                    break;
+                if (instructions[i].OpCode != CilOpCodes.Nop)
+                    return i;
+            }
+            return -1;
+        }
+
+        static bool IsZero(CilInstruction instruction) =>
+            instruction.OpCode == CilOpCodes.Ldc_I4_0
+            || instruction.OpCode == CilOpCodes.Ldc_I4 && instruction.Operand is 0;
     }
 
     private static void RemoveUnusedCondition(CilMethodBody body, int pop, HashSet<CilInstruction> referenced)

@@ -45,6 +45,7 @@ internal static class FloatAggregateRecovery
             return;
 
         var graph = method.ControlFlowGraph!;
+        RecoverVirtualReturnStores(graph);
         if (!method.ParameterOperands.Any(operand => operand is Register register
                 && IsAggregateParameter(register))
             && !graph.Instructions.Any(instruction => instruction.OpCode == OpCode.PackFloatAggregate
@@ -213,6 +214,72 @@ internal static class FloatAggregateRecovery
                     return fields[(int)((laneOffset - offset) / width)];
                 }
             }
+        }
+    }
+
+    private static void RecoverVirtualReturnStores(ISILControlFlowGraph graph)
+    {
+        HashSet<LocalVariable>? reads = null;
+        foreach (var block in graph.Blocks)
+        for (var i = 0; i < block.Instructions.Count; i++)
+        {
+            var call = block.Instructions[i];
+            if (call is not { OpCode: OpCode.Call, NullCheckReceiver: true,
+                    Operands: [MethodAnalysisContext { IsVirtual: true, ReturnType: var type },
+                        LocalVariable { Register.Name: "X0" } result, ..] }
+                || Arm64CallingConventionResolver.GetFloatAggregateFields(type) is not { } fields)
+                continue;
+
+            // An indirect call was lifted with an X0 placeholder before its signature was known.
+            // The native result instead arrives in V0–V3. Match a complete copy into one field.
+            var index = i + 1;
+            while (index < block.Instructions.Count && block.Instructions[index] is
+                { OpCode: OpCode.Nop } or { OpCode: OpCode.Move,
+                    Operands: [LocalVariable { Register.Name: "X0" }, FieldReference] })
+                index++;
+
+            var start = index;
+            if (index == block.Instructions.Count
+                || block.Instructions[index] is not { OpCode: OpCode.Move, Operands: [FieldReference destination, _] })
+                continue;
+
+            var target = destination.Parent ?? destination;
+            if (target is not { Parent: null, Field.IsStatic: false } || target.Field.FieldType != type)
+                continue;
+
+            var width = fields[0].FieldType.FullName == "System.Double" ? 8 : 4;
+            var lane = 0;
+            for (; index < block.Instructions.Count && lane < fields.Length; index++)
+            {
+                var store = block.Instructions[index];
+                if (store.OpCode == OpCode.Nop)
+                    continue;
+
+                if (store is not { OpCode: OpCode.Move, MemoryAccessSize: var size,
+                        Operands: [FieldReference field, LocalVariable source] }
+                    || size != width || !ReferenceEquals(field.Local, target.Local)
+                    || source.Register.Name != $"V{lane}"
+                    || field.Offset != target.Offset + fields[lane].Offset
+                    || !(field.Parent?.Field == target.Field && field.Field == fields[lane]
+                        || lane == 0 && ReferenceEquals(field, target)))
+                    break;
+
+                lane++;
+            }
+
+            if (lane != fields.Length)
+                continue;
+
+            reads ??= new HashSet<LocalVariable>(graph.Instructions.SelectMany(DeadCodeEliminator.UsedLocals));
+            if (reads.Contains(result))
+                continue;
+
+            result.Type = type;
+            var first = block.Instructions[start];
+            first.SetOperands(target, result);
+            first.MemoryAccessSize = null;
+            for (var j = start + 1; j < index; j++)
+                Remove(block.Instructions[j]);
         }
     }
 

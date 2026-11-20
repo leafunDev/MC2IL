@@ -137,7 +137,9 @@ public static class IlGenerator
         List<(CilInstruction BranchInstruction, Block TargetBlock)> pendingBlockBranchFixups = [];
         HashSet<LocalVariable>? fieldReadLocals = null;
 
-        foreach (var block in GetCilBlockOrder(graph))
+        var isIteratorMoveNext = context.Name == "MoveNext" && context.DeclaringType is { } declaringType
+            && IteratorFactoryRecovery.IsIteratorType(declaringType);
+        foreach (var block in GetCilBlockOrder(graph, isIteratorMoveNext))
         {
             if (block == graph.EntryBlock || block == graph.ExitBlock)
                 continue;
@@ -1066,7 +1068,7 @@ public static class IlGenerator
         _ => 0
     };
 
-    private static IEnumerable<Block> GetCilBlockOrder(ISILControlFlowGraph graph)
+    private static IEnumerable<Block> GetCilBlockOrder(ISILControlFlowGraph graph, bool isIteratorMoveNext)
     {
         // Analysis can move the entry's first real block to the end when it splits
         // edges. Start there, while preserving the relative layout of other blocks.
@@ -1076,10 +1078,21 @@ public static class IlGenerator
             first = successor;
 
         if (first != graph.EntryBlock && first != graph.ExitBlock && graph.Blocks.Contains(first))
+        {
             yield return first;
+            // Metadata initialization can leave a trampoline at the entry of MoveNext.
+            // Keep the state dispatch at the front where C# decompilers look for it.
+            while (isIteratorMoveNext && first.Successors is [var next] && next != graph.ExitBlock
+                && first.Instructions.All(instruction => instruction.OpCode is OpCode.Nop or OpCode.Jump)
+                && visited.Add(first) && !visited.Contains(next))
+            {
+                first = next;
+                yield return first;
+            }
+        }
 
         foreach (var block in graph.Blocks)
-            if (block != first)
+            if (block != first && (!isIteratorMoveNext || !visited.Contains(block)))
                 yield return block;
     }
 
@@ -1742,7 +1755,10 @@ public static class IlGenerator
 
                 LoadOperand(leftOperand, method, locals, writeLine, leftExpectedType);
                 if (apply32BitIntegerWidth)
-                    instructions.Add(Integer32InputConversion(instruction.OpCode));
+                {
+                    if (!isReferenceEquality || !IsInt32StackValue(leftOperand, leftExpectedType))
+                        instructions.Add(Integer32InputConversion(instruction.OpCode));
+                }
                 else if (isShift && instruction.OperandWidth == 64)
                     instructions.Add(leftExpectedType?.FullName is "System.UInt32" or "System.UInt64" or "System.UIntPtr"
                         ? CilOpCodes.Conv_U8
@@ -1751,9 +1767,10 @@ public static class IlGenerator
                     instructions.Add(conv1);
                 LoadOperand(rightOperand, method, locals, writeLine, rightExpectedType);
                 if (apply32BitIntegerWidth)
-                    instructions.Add(instruction.OpCode is OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned
-                        ? CilOpCodes.Conv_I4
-                        : Integer32InputConversion(instruction.OpCode));
+                {
+                    if (!isReferenceEquality || !IsInt32StackValue(rightOperand, rightExpectedType))
+                        instructions.Add(isShift ? CilOpCodes.Conv_I4 : Integer32InputConversion(instruction.OpCode));
+                }
                 else if (floatConversion is { } conv2 && NeedsFloatArithmeticConversion(rightOperand, conv2))
                     instructions.Add(conv2);
 
@@ -2715,6 +2732,16 @@ public static class IlGenerator
             or "System.Int64" or "System.UInt64" or "System.IntPtr" or "System.UIntPtr"
             ? type
             : null;
+    }
+
+    private static bool IsInt32StackValue(IOperand operand, TypeAnalysisContext? expectedType)
+    {
+        if (operand is Immediate { Value: >= int.MinValue and <= int.MaxValue } && expectedType == null)
+            return true;
+        var type = operand is Immediate ? expectedType : OperandType(operand);
+        return (type?.IsEnumType == true ? type.EnumUnderlyingType?.FullName : type?.FullName) is
+            "System.Boolean" or "System.Byte" or "System.SByte" or "System.Char"
+            or "System.Int16" or "System.UInt16" or "System.Int32" or "System.UInt32";
     }
 
     private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
