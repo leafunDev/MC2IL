@@ -31,18 +31,14 @@ public static class DeadCodeEliminator
         {
             foreach (var instruction in block.Instructions)
             {
-                if (!IsRemovable(instruction) && discardableLoads?.Contains(instruction) != true)
-                {
+                if (instruction.Destination is not LocalVariable destination
+                    || !IsRemovable(instruction) && discardableLoads?.Contains(instruction) != true)
                     continue;
-                }
 
                 removable.Add(instruction);
-                if (instruction.Destination is LocalVariable destination)
-                {
-                    if (!definitions.TryGetValue(destination, out var writes))
-                        definitions[destination] = writes = [];
-                    writes.Add(instruction);
-                }
+                if (!definitions.TryGetValue(destination, out var writes))
+                    definitions[destination] = writes = [];
+                writes.Add(instruction);
             }
         }
 
