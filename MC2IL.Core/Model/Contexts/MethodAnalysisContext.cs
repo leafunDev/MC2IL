@@ -460,6 +460,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
         // make joins explicit, so forwarding a value is an unconditional global substitution.
         SsaSimplifier.Run(this);
+        ValueTypeReceiverRecovery.ResolveRefArgumentFieldAddresses(this);
         FloatAggregateRecovery.RecoverByRefArgumentLanes(this);
         BooleanFlagSimplifier.TypeMaskedReturnMerges(this);
 

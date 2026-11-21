@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using MC2IL.Core.Graphs;
 using MC2IL.Core.InstructionSets;
@@ -11,6 +12,50 @@ namespace MC2IL.Core.Analysis;
 
 internal static class ValueTypeReceiverRecovery
 {
+    internal static void ResolveRefArgumentFieldAddresses(MethodAnalysisContext method)
+    {
+        if (method.IsStatic || method.DeclaringType is not { IsValueType: false } owner
+            || owner.GenericParameters.Count != 0
+            || method.AppContext.InstructionSet is not NewArmV8InstructionSet
+            || method.ParameterLocals.FirstOrDefault(local => local.IsThis) is not { } self)
+            return;
+
+        var instructions = method.ControlFlowGraph!.Instructions;
+        Dictionary<LocalVariable, FieldAnalysisContext>? fieldsByAddress = null;
+        foreach (var instruction in instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Add, OperandWidth: null or 64,
+                    Operands: [LocalVariable address, LocalVariable receiver, Immediate { Value: > 0 and <= int.MaxValue } offset] }
+                || !ReferenceEquals(receiver, self)
+                || FindUniqueField(owner, (int)offset.Value) is not { } field
+                || (field.Attributes & FieldAttributes.InitOnly) != 0
+                || (field.DeclaringType != owner && field.Visibility != FieldAttributes.Public))
+                continue;
+
+            (fieldsByAddress ??= []).Add(address, field);
+        }
+
+        if (fieldsByAddress == null)
+            return;
+
+        // In SSA the same address definition can reach a call after other calls and
+        // argument preparation. Taking the address of a field on this is non-throwing.
+        foreach (var call in instructions)
+        {
+            if (!call.IsCall || call.Operands[0] is not MethodAnalysisContext target)
+                continue;
+            var firstArgument = (call.OpCode == OpCode.Call ? 2 : 1) + (target.IsStatic ? 0 : 1);
+            for (var i = 0; i < target.Parameters.Count && firstArgument + i < call.Operands.Count; i++)
+            {
+                if (target.Parameters[i].ParameterType is ByRefTypeAnalysisContext { ElementType: var elementType }
+                    && call.Operands[firstArgument + i] is LocalVariable address
+                    && fieldsByAddress.TryGetValue(address, out var field)
+                    && MetadataResolver.IsSameType(field.FieldType, elementType))
+                    call.SetOperand(firstArgument + i, new AddressOf(new FieldReference(field, self, field.Offset)));
+            }
+        }
+    }
+
     internal static void ResolveStaticFieldAddresses(MethodAnalysisContext method)
     {
         if (!method.Locals.Exists(local => local.Type is StaticFieldStorageTypeAnalysisContext))
