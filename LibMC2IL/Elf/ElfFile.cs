@@ -315,7 +315,32 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
         if (GetDynamicEntryOfType(ElfDynamicType.DT_INIT) is { } dtInit)
             initArray = initArray.Append(dtInit.Value).ToArray();
 
-        _initializerPointers = initArray.Select(a => MapVirtualAddressToRaw(a)).ToList();
+        var validInitializerPointers = new List<long>(initArray.Length);
+        var skippedInitializers = 0;
+        foreach (var address in initArray)
+        {
+            // Packed/custom IL2CPP ELF files may retain junk entries in DT_INIT_ARRAY.
+            // Only accept pointers into file-backed executable PT_LOAD segments.
+            var isExecutableAddress = _elfProgramHeaderEntries.Any(segment =>
+                (segment.Flags & ElfProgramHeaderFlags.PF_X) != 0
+                && address >= segment.VirtualAddress
+                && address - segment.VirtualAddress < segment.RawSize);
+            var rawAddress = isExecutableAddress
+                ? MapVirtualAddressToRaw(address, throwOnError: false)
+                : VirtToRawInvalidNoMatch;
+            if (rawAddress < 0)
+            {
+                skippedInitializers++;
+                continue;
+            }
+
+            validInitializerPointers.Add(rawAddress);
+        }
+
+        if (skippedInitializers > 0)
+            LibLogger.WarnNewline($"Skipped {skippedInitializers} invalid or non-executable ELF initializer pointers; continuing with {validInitializerPointers.Count} valid entries.");
+
+        _initializerPointers = validInitializerPointers;
     }
 
     public override (ulong pCodeRegistration, ulong pMetadataRegistration) FindCodeAndMetadataReg(Il2CppMetadata metadata)

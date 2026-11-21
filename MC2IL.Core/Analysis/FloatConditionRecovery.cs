@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using MC2IL.Core.Graphs;
 using MC2IL.Core.ISIL;
+using MC2IL.Core.Model.Contexts;
 
 namespace MC2IL.Core.Analysis;
 
@@ -22,6 +24,86 @@ internal static class FloatConditionRecovery
     }
 
     private readonly record struct Comparison(IOperand Left, IOperand Right, FloatingPointPrecision Precision);
+
+    internal static void SimplifyOrderedInequalityBranches(ISILControlFlowGraph graph, SystemTypesContext types)
+    {
+        Dictionary<LocalVariable, int>? uses = null;
+        foreach (var block in graph.Blocks)
+        {
+            if (!TryGetStrictBranch(block, out var first, out var firstJump, out var ordered, out var secondBlock)
+                || secondBlock.Predecessors is not [var predecessor] || predecessor != block
+                || !TryGetStrictBranch(secondBlock, out var second, out var secondJump, out var sameTarget, out var equalOrUnordered)
+                || sameTarget != ordered || first.OpCode == second.OpCode
+                || secondBlock.Instructions.Any(instruction => instruction != second && instruction != secondJump && instruction.OpCode != OpCode.Nop)
+                || first.Operands is not [LocalVariable firstResult, var left, var right, FloatingPointPrecision precision]
+                || second.Operands is not [LocalVariable secondResult, var secondLeft, var secondRight, FloatingPointPrecision secondPrecision]
+                || precision != secondPrecision || !Equals(left, secondLeft) || !Equals(right, secondRight)
+                || equalOrUnordered == graph.ExitBlock)
+                continue;
+
+            // For a known non-NaN operand, !(a < b || a > b) is a == b || IsNaN(variable).
+            // Use the existing short-circuit blocks so the C# decompiler can express that directly.
+            var variable = IsOrderedLiteral(right, precision) ? left : IsOrderedLiteral(left, precision) ? right : null;
+            // Pass IsNaN the same precision used by the native comparison.
+            var type = precision.IsDouble ? types.SystemDoubleType : types.SystemSingleType;
+            if (variable is not LocalVariable local || local.Type != type)
+                continue;
+
+            var isNaN = type.Methods.FirstOrDefault(candidate => candidate is
+                { Name: "IsNaN", IsStatic: true, ReturnType.FullName: "System.Boolean", Parameters: [var parameter] }
+                && parameter.ParameterType == type);
+            if (isNaN == null)
+                continue;
+
+            uses ??= graph.Blocks.SelectMany(candidate => candidate.Instructions)
+                .SelectMany(DeadCodeEliminator.UsedLocals).GroupBy(local => local)
+                .ToDictionary(group => group.Key, group => group.Count());
+            if (!uses.TryGetValue(firstResult, out var firstUses) || firstUses != 1
+                || !uses.TryGetValue(secondResult, out var secondUses) || secondUses != 1)
+                continue;
+
+            first.OpCode = OpCode.CheckEqual;
+            second.OpCode = OpCode.Call;
+            second.SetOperands(isNaN, secondResult, variable);
+            firstJump.SetOperand(0, equalOrUnordered);
+            secondJump.SetOperand(0, equalOrUnordered);
+            graph.RemoveEdge(block, ordered);
+            block.Successors.Add(equalOrUnordered);
+            equalOrUnordered.Predecessors.Add(block);
+        }
+    }
+
+    private static bool TryGetStrictBranch(Block block, out Instruction comparison, out Instruction jump,
+        out Block taken, out Block fallthrough)
+    {
+        comparison = jump = null!;
+        taken = fallthrough = null!;
+        if (block.Instructions.Count < 2
+            || block.Instructions[^1] is not { OpCode: OpCode.ConditionalJump, Operands: [Block target, LocalVariable condition] } branch
+            || block.Successors is not [_, _] || !block.Successors.Contains(target))
+            return false;
+
+        var beforeJump = block.Instructions.Count - 2;
+        while (beforeJump >= 0 && block.Instructions[beforeJump].OpCode == OpCode.Nop)
+            beforeJump--;
+        if (beforeJump < 0 || block.Instructions[beforeJump] is not { OpCode: OpCode.CheckLess or OpCode.CheckGreater,
+                Operands: [var result, _, _, FloatingPointPrecision] } relation || result != condition)
+            return false;
+
+        comparison = relation;
+        jump = branch;
+        taken = target;
+        fallthrough = block.Successors.First(successor => successor != target);
+        return true;
+    }
+
+    private static bool IsOrderedLiteral(IOperand operand, FloatingPointPrecision precision) =>
+        (operand, precision.IsDouble) switch
+        {
+            (FloatLiteral literal, false) => !float.IsNaN(literal.Value),
+            (DoubleLiteral literal, true) => !double.IsNaN(literal.Value),
+            _ => false,
+        };
 
     public static void Run(Dictionary<LocalVariable, Instruction> definitions)
     {

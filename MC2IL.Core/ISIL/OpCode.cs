@@ -144,6 +144,16 @@ public enum OpCode
     Box,
 
     /// <summary>
+    /// Casts the reference in op 3 to the managed type in op 2 and stores it in op 1.
+    /// </summary>
+    CastClass,
+
+    /// <summary>
+    /// Stores the reference in op 3 in op 1 if it is compatible with the managed type in op 2, or null otherwise.
+    /// </summary>
+    IsInst,
+
+    /// <summary>
     /// Throws a new instance of the exception type described by op 1.
     /// </summary>
     Throw,

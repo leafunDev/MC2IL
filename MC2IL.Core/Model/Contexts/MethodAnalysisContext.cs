@@ -5,6 +5,7 @@ using System.Linq;
 using System.Reflection;
 using MC2IL.Core.Analysis;
 using MC2IL.Core.Graphs;
+using MC2IL.Core.InstructionSets;
 using MC2IL.Core.ISIL;
 using MC2IL.Core.Logging;
 using MC2IL.Core.Utils;
@@ -368,6 +369,30 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     [MemberNotNull(nameof(ConvertedIsil))]
     public void Analyze()
     {
+        var diagnosticDumpPath = Environment.GetEnvironmentVariable("MC2IL_DUMP_METHOD_IR");
+        var diagnosticMethodFilter = Environment.GetEnvironmentVariable("MC2IL_DUMP_METHOD_FILTER");
+        void DumpMethodIr(string stage)
+        {
+            if (string.IsNullOrEmpty(diagnosticDumpPath)
+                || (!string.IsNullOrEmpty(diagnosticMethodFilter) && !FullName.Contains(diagnosticMethodFilter))
+                || ControlFlowGraph == null)
+                return;
+
+            var dump = new System.Text.StringBuilder();
+            dump.AppendLine($"===== {FullName} [{stage}] =====");
+            foreach (var instruction in ControlFlowGraph.Instructions)
+            {
+                dump.Append(instruction).Append(" | ");
+                foreach (var operand in instruction.Operands)
+                    dump.Append(operand.GetType().Name).Append(':').Append(operand).Append("; ");
+                dump.AppendLine();
+            }
+            if (stage == "after final cleanup")
+                dump.AppendLine(AppContext.InstructionSet.PrintAssembly(this));
+            lock (typeof(MethodAnalysisContext))
+                System.IO.File.AppendAllText(diagnosticDumpPath, dump.ToString());
+        }
+
         if (MaxMethodSizeBytes != -1 && RawBytes.Length > MaxMethodSizeBytes)
         {
             Logger.WarnNewline($"Method {FullName} is too big ({RawBytes.Length} bytes), skipping analysis.");
@@ -404,6 +429,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Create locals
         SsaForm.Build(this);
         LocalVariables.CreateAll(this);
+        DumpMethodIr("after locals");
+        if (AppContext.InstructionSet is NewArmV8InstructionSet)
+            PcRelativeMemoryRecovery.Run(ControlFlowGraph);
         FloatLiteralRecovery.RecoverNativeLoads(this);
 
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
@@ -415,6 +443,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // field-resolution fixpoint - all while still in SSA form, so every local is
         // single-assignment and a type, once known, is stable for that value.
         MetadataResolver.ResolveAll(this);
+        DumpMethodIr("after metadata resolver");
         FloatAggregateRecovery.RecoverAggregateStackReceivers(this);
         DeadCodeEliminator.Run(this);
 
@@ -436,6 +465,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+        DumpMethodIr("after type resolution");
         if (ArmV7DynamicFieldAccessRecovery.Run(this))
             LocalVariables.ResolveTypesAndFields(this);
         ValueTypeReceiverRecovery.ResolveStaticFieldAddresses(this);
@@ -512,6 +542,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Only remove guards once the managed operations that replace their checks are known.
         InlinedFieldGetterRecovery.Run(this);
         InjectedCheckRemover.Run(this);
+        Arm64TypeCheckRecovery.Run(this);
+        Arm64ReferenceCastRecovery.Run(this);
         if (ArrayStoreGuardRecovery.Run(this))
             InjectedCheckRemover.Run(this, removeNullChecks: true, removeBoundsChecks: false);
         ArrayRecovery.MergeReloadedLoopArrayLengths(ControlFlowGraph!);
@@ -521,6 +553,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ConstantBranchFolder.Run(this);
         Arm64ClampRecovery.Run(this);
         ConstantBranchFolder.MergeConstantReturnPaths(this);
+        FloatConditionRecovery.SimplifyOrderedInequalityBranches(ControlFlowGraph, AppContext.SystemTypes);
 
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);
@@ -531,6 +564,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
             discardUnusedCallResults: true);
 
         LocalVariables.RemoveUnused(this);
+        DumpMethodIr("after final cleanup");
     }
 
     public void AddWarning(string warning) => AnalysisWarnings.Add(warning);

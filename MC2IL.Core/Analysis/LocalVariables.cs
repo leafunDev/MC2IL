@@ -241,8 +241,8 @@ public static class LocalVariables
     /// </summary>
     public static void ResolveTypesAndFields(MethodAnalysisContext method)
     {
-        // This fixpoint changes only operands and local types, not the CFG's block or instruction
-        // membership. Reuse one traversal across every seed and propagation sweep.
+        // Resolving a native call can materialize aggregate arguments in the CFG. Refresh the
+        // traversal after resolving calls so their new definitions participate in type propagation.
         var instructions = method.ControlFlowGraph!.Instructions;
 
         // Seed types from fixed ground truth - the method's own signature, and type-metadata global
@@ -277,6 +277,11 @@ public static class LocalVariables
             changed |= MetadataResolver.ResolveCallsViaMethodInfo(method, instructions);
             changed |= MetadataResolver.ResolveAmbiguousCalls(method, instructions);
             changed |= MetadataResolver.ResolveVirtualCalls(method, instructions);
+            if (changed)
+            {
+                instructions = method.ControlFlowGraph!.Instructions;
+                SeedFloatAggregateTypes(instructions);
+            }
             changed |= PropagateFromCallResults(method, instructions);
             changed |= MetadataResolver.ResolveFieldOffsets(method, instructions);
             changed |= RefineAbsoluteMemoryPlaceholderTypes(instructions);
@@ -353,7 +358,7 @@ public static class LocalVariables
 
                     var specializedConstructor = new ConcreteGenericMethodAnalysisContext(constructor, expectedType.GenericArguments, []);
                     constructorCall.SetOperand(0, specializedConstructor);
-                    specializedConstructor.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(constructorCall, specializedConstructor);
+                    specializedConstructor.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(constructorCall, specializedConstructor, method);
                 }
             }
         }

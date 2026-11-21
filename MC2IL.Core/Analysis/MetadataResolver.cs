@@ -778,11 +778,11 @@ public static class MetadataResolver
                 // exception-raiser call graph or a returned exception object that is actually thrown.
                 if (ThrowHelperRecovery.GetThrownException(method.AppContext, target) is { } thrown)
                 {
-                    // IL2CPP emits the null and bounds stubs next to one another. An apparent
-                    // use of X0 by the next stub is a fallthrough artefact if the first itself
-                    // reaches the exception raiser.
-                    if (thrown.FullName is "System.NullReferenceException" or "System.IndexOutOfRangeException"
-                        && ThrowHelperRecovery.IsExceptionRaiser(method.AppContext, target))
+                    // A use of X0 after a verified non-returning helper is a fallthrough artefact.
+                    if ((thrown.FullName is "System.NullReferenceException" or "System.IndexOutOfRangeException"
+                            && ThrowHelperRecovery.IsExceptionRaiser(method.AppContext, target))
+                        || (thrown.FullName == "System.InvalidCastException"
+                            && ThrowHelperRecovery.IsArm64InvalidCastRaiser(method.AppContext, target)))
                     {
                         callInstruction.OpCode = OpCode.Throw;
                         callInstruction.SetOperands(thrown);
@@ -834,7 +834,7 @@ public static class MetadataResolver
                 continue;
 
             callInstruction.SetOperand(0, singleTargetMethod);
-            singleTargetMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(callInstruction, singleTargetMethod);
+            singleTargetMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(callInstruction, singleTargetMethod, method);
         }
 
         if (throwTopologyChanged)
@@ -914,7 +914,7 @@ public static class MetadataResolver
             {
                 var preferred = PreferredOf(candidates);
                 instruction.SetOperand(0, preferred);
-                preferred.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, preferred);
+                preferred.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, preferred, method);
                 changed = true;
                 continue;
             }
@@ -945,7 +945,7 @@ public static class MetadataResolver
                 continue;
 
             instruction.SetOperand(0, match);
-            match.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, match);
+            match.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, match, method);
             changed = true;
         }
 
@@ -1006,7 +1006,7 @@ public static class MetadataResolver
                     break;
 
                 instruction.SetOperand(0, getComponent);
-                getComponent.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, getComponent);
+                getComponent.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, getComponent, method);
                 changed = true;
                 break;
             }
@@ -1142,7 +1142,7 @@ public static class MetadataResolver
                 continue;
 
             instruction.SetOperand(0, constructor);
-            constructor.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, constructor);
+            constructor.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, constructor, method);
             changed = true;
         }
 
@@ -1274,7 +1274,7 @@ public static class MetadataResolver
             }
 
             instruction.SetOperand(0, representedMethod);
-            representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
+            representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod, method);
             changed = true;
         }
 
@@ -1349,7 +1349,7 @@ public static class MetadataResolver
 
                 instruction.OpCode = representedMethod.IsVoid ? OpCode.CallVoid : OpCode.Call;
                 instruction.SetOperand(0, representedMethod);
-                callingConventions.RemapRawArguments(instruction, representedMethod);
+                callingConventions.RemapRawArguments(instruction, representedMethod, method);
                 changed = true;
                 continue;
             }
@@ -1380,7 +1380,7 @@ public static class MetadataResolver
             {
                 instruction.OpCode = OpCode.Call; // same operand layout as IndirectCall, and we've resolved it now
                 instruction.SetOperand(0, resolved);
-                resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, resolved);
+                resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, resolved, method);
             }
 
             Instruction? methodInfoRead = null;
@@ -1494,7 +1494,7 @@ public static class MetadataResolver
             operands.AddRange(tailCall.Operands.Skip(2));
             tailCall.SetOperands(operands);
             tailCall.OpCode = targetMethod.IsVoid ? OpCode.CallVoid : OpCode.Call;
-            callingConventions?.RemapRawArguments(tailCall, targetMethod);
+            callingConventions?.RemapRawArguments(tailCall, targetMethod, method);
 
             if (!homeBlocks.TryGetValue(tailCall, out var block))
                 return;

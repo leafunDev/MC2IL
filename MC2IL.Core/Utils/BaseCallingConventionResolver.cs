@@ -72,6 +72,9 @@ public abstract class BaseCallingConventionResolver
 
     // Stack values are not present in the raw register layout. Keep typed placeholders for them
     // so later arguments from the other register bank retain their parameter positions.
+    public virtual void RemapRawArguments(Instruction call, MethodAnalysisContext resolved, MethodAnalysisContext caller)
+        => RemapRawArguments(call, resolved);
+
     public virtual void RemapRawArguments(Instruction call, MethodAnalysisContext resolved)
     {
         var app = resolved.AppContext;

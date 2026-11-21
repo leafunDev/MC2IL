@@ -1597,6 +1597,21 @@ public static class IlGenerator
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
+            case OpCode.CastClass:
+            case OpCode.IsInst:
+                var castField = instruction.Operands[0] as FieldReference;
+                if (castField is { Field.IsStatic: false })
+                    LoadFieldReceiver(castField, method, locals);
+
+                LoadOperand(instruction.Operands[2], method, locals, writeLine);
+                instructions.Add(instruction.OpCode == OpCode.IsInst ? CilOpCodes.Isinst : CilOpCodes.Castclass,
+                    ((TypeAnalysisContext)instruction.Operands[1]).ToTypeSignature().ToTypeDefOrRef());
+                if (castField != null)
+                    instructions.Add(castField.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, castField.Field.ToFieldDescriptor());
+                else
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
             case OpCode.Throw:
                 if (instruction.Operands is [TypeAnalysisContext exceptionType]
                     && exceptionType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0) is { } exceptionCtor)

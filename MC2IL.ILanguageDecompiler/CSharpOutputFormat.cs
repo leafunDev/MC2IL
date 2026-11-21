@@ -217,9 +217,8 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
 
     private static void RemoveInjectedAttributes(SyntaxTree syntaxTree)
     {
-        var usingNamespaces = syntaxTree.Descendants.OfType<UsingDeclaration>()
-            .Select(usingDirective => usingDirective.Import.ToString())
-            .ToHashSet(StringComparer.Ordinal);
+        var usingNamespaces = new HashSet<string>(syntaxTree.Descendants.OfType<UsingDeclaration>()
+            .Select(usingDirective => usingDirective.Import.ToString()), StringComparer.Ordinal);
 
         foreach (var section in syntaxTree.Descendants.OfType<AttributeSection>().ToArray())
         {
@@ -228,10 +227,10 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
                 var typeName = attribute.Type.ToString();
                 var shortName = typeName.Split('.').Last();
                 var nameWithoutSuffix = shortName.EndsWith("Attribute", StringComparison.Ordinal)
-                    ? shortName[..^"Attribute".Length]
+                    ? shortName.Substring(0, shortName.Length - "Attribute".Length)
                     : shortName;
                 var namespaceName = typeName.Contains('.')
-                    ? typeName[..typeName.LastIndexOf('.')]
+                    ? typeName.Substring(0, typeName.LastIndexOf('.'))
                     : null;
 
                 var isCompilerGenerated = nameWithoutSuffix == "CompilerGenerated"

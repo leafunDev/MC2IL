@@ -64,6 +64,29 @@ public static class ThrowHelperRecovery
         return result;
     }
 
+    internal static bool IsArm64InvalidCastRaiser(ApplicationAnalysisContext appContext, ulong address)
+    {
+        if (appContext.InstructionSet is not NewArmV8InstructionSet arm64)
+            return false;
+
+        var raise = appContext.GetOrCreateKeyFunctionAddresses().il2cpp_vm_exception_raise;
+        if (raise == 0)
+            return false;
+
+        // The native helper calls an exception factory followed immediately by a raiser.
+        // Looking for both avoids treating a factory that merely returns an exception as a throw.
+        var calls = arm64.InspectPotentialThrowHelper(appContext, address, true).CallTargets;
+        for (var i = 1; i < calls.Count; i++)
+        {
+            if (GetThrownException(appContext, calls[i - 1])?.FullName == "System.InvalidCastException"
+                && (calls[i] == raise
+                    || arm64.InspectPotentialThrowHelper(appContext, calls[i], true).CallTargets.Contains(raise)))
+                return true;
+        }
+
+        return false;
+    }
+
     private static bool ReachesCall(ApplicationAnalysisContext appContext, ulong address, ulong wanted, int depth, HashSet<ulong> visited)
     {
         if (address == wanted)

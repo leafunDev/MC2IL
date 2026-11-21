@@ -571,6 +571,7 @@ public class Il2CppMetadata : ClassReadingBinaryReader
 
             LibLogger.Verbose("\tBuilding Lookup Table for field defaults...");
             start = DateTime.Now;
+            var skippedInvalidFieldDefaultValues = 0;
             for (var i = 0; i < fieldDefaultValues.Length; i++)
             {
                 if(MetadataVersion >= 104 && i == fieldDefaultValues.Length - 1 && (fieldDefaultValues[i].fieldIndex.Value == -1 || fieldDefaultValues[i].fieldIndex.Value == int.MaxValue))
@@ -578,9 +579,21 @@ public class Il2CppMetadata : ClassReadingBinaryReader
                     //v106 changed it to int.MaxValue, which we will also test for and skip.
                     continue;
                 var il2CppFieldDefaultValue = fieldDefaultValues[i];
+                if ((uint)il2CppFieldDefaultValue.fieldIndex.Value >= (uint)fieldDefs.Length)
+                {
+                    // Custom metadata can contain placeholder field-default rows that do not
+                    // reference a field in this image. The default is optional metadata; it must
+                    // not prevent the valid type and method tables from loading.
+                    skippedInvalidFieldDefaultValues++;
+                    continue;
+                }
+
                 _fieldDefaultValueLookup[il2CppFieldDefaultValue.fieldIndex] = il2CppFieldDefaultValue;
                 _fieldDefaultLookupNew[GetFieldDefinitionFromIndex(il2CppFieldDefaultValue.fieldIndex)] = il2CppFieldDefaultValue;
             }
+
+            if (skippedInvalidFieldDefaultValues > 0)
+                LibLogger.WarnNewline($"Skipped {skippedInvalidFieldDefaultValues} field-default entries with out-of-range field indices ({fieldDefs.Length} fields available). This may indicate custom metadata.");
 
             LibLogger.VerboseNewline($"OK ({(DateTime.Now - start).TotalMilliseconds} ms)");
 
