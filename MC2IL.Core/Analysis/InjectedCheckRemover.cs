@@ -21,6 +21,7 @@ public static class InjectedCheckRemover
     {
         var defOf = BuildDefMap(cfg, parameters, out var stableParameters, out var addressed);
         var ignoredExceptionConstructions = FindUnusedExceptionConstructions(cfg);
+        var redundantLengthLoads = new HashSet<Instruction>();
         var removedAny = false;
 
         foreach (var block in cfg.Blocks)
@@ -56,7 +57,7 @@ public static class InjectedCheckRemover
             if (terminator.Operands[1] is not LocalVariable condition
                 || !TryGetDefinitionBefore(block, terminator, condition, defOf, out var definition)
                 || !IsInjectedCheck(block, definition, thrown, throwOnTrue, defOf, stableParameters, addressed, throwOnTrue ? falseTarget : trueTarget,
-                    removeNullChecks, removeBoundsChecks))
+                    removeNullChecks, removeBoundsChecks, redundantLengthLoads))
                 continue;
 
             RemoveThrowEdge(block, throwTarget, throwOnTrue ? falseTarget : trueTarget);
@@ -68,7 +69,7 @@ public static class InjectedCheckRemover
 
         // delete any throw blocks
         cfg.RemoveUnreachableBlocks();
-        DeadCodeEliminator.Run(cfg);
+        DeadCodeEliminator.Run(cfg, redundantLengthLoads);
     }
 
     private static void RemoveThrowEdge(Block block, Block throwTarget, Block continuation)
@@ -83,7 +84,7 @@ public static class InjectedCheckRemover
 
     private static bool IsInjectedCheck(Block checkedBlock, Instruction definition, InjectedThrow thrown, bool throwOnTrue,
         Dictionary<LocalVariable, Instruction> defOf, HashSet<LocalVariable> stableParameters, HashSet<LocalVariable> addressed, Block continuation,
-        bool removeNullChecks, bool removeBoundsChecks)
+        bool removeNullChecks, bool removeBoundsChecks, HashSet<Instruction> redundantLengthLoads)
     {
         if (TryGetNullComparison(checkedBlock, definition, throwOnTrue, defOf,
                 out var nullComparison, out var comparisonBranchOnTrue, out var receiver)
@@ -112,7 +113,7 @@ public static class InjectedCheckRemover
         }
 
         return removeBoundsChecks && thrown.ExceptionType == "System.IndexOutOfRangeException"
-            && IsArrayBoundsCheck(definition, throwOnTrue, continuation, defOf, removeNullChecks);
+            && IsArrayBoundsCheck(checkedBlock, definition, throwOnTrue, continuation, defOf, removeNullChecks, redundantLengthLoads);
     }
 
     private static bool HasImplicitNullCheckAfterGuardCopies(Block guard, Instruction comparison,
@@ -703,8 +704,8 @@ public static class InjectedCheckRemover
     // Only erase a bounds guard after array recovery has produced both its length and the
     // corresponding element access. Otherwise the generated IL would have no operation left
     // to enforce the same bounds check.
-    private static bool IsArrayBoundsCheck(Instruction definition, bool throwOnTrue, Block continuation,
-        Dictionary<LocalVariable, Instruction> defOf, bool removeNullChecks)
+    private static bool IsArrayBoundsCheck(Block guard, Instruction definition, bool throwOnTrue, Block continuation,
+        Dictionary<LocalVariable, Instruction> defOf, bool removeNullChecks, HashSet<Instruction> redundantLengthLoads)
     {
         if (definition.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqualUnsigned
             || definition.Operands.Count < 3)
@@ -726,6 +727,16 @@ public static class InjectedCheckRemover
                 && IsBoundsFailure(definition.OpCode, lengthIndex == 1, throwOnTrue,
                     access.Index is Immediate { Value: 0 }))
             {
+                // With no observable work between ldlen and the matched access, ldelem/stelem
+                // performs the same null and range checks. The old length load can die if unread.
+                if (receiverGuard == null
+                    && definition.Operands[lengthIndex] is LocalVariable length
+                    && defOf.TryGetValue(length, out var load)
+                    && load is { OpCode: OpCode.Move, Operands: [_, ArrayLength { Array: var lengthArray }] }
+                    && ReferenceEquals(lengthArray, access.Array) && operation != null
+                    && IsImmediatelyBeforeBoundsBranch(guard, load, definition, continuation, operation, lengthArray))
+                    redundantLengthLoads.Add(load);
+
                 if (receiverGuard is { } receiver)
                 {
                     receiver.Call.NullCheckReceiver = true;
@@ -735,6 +746,33 @@ public static class InjectedCheckRemover
             }
         }
 
+        return false;
+    }
+
+    private static bool IsImmediatelyBeforeBoundsBranch(Block guard, Instruction load, Instruction comparison,
+        Block continuation, Instruction access, LocalVariable array)
+    {
+        var index = guard.Instructions.IndexOf(load);
+        if (index < 0 || guard.Instructions.IndexOf(comparison) <= index)
+            return false;
+        for (var i = index + 1; i < guard.Instructions.Count - 1; i++)
+            if (guard.Instructions[i] != comparison && guard.Instructions[i].OpCode != OpCode.Nop)
+                return false;
+
+        var seen = new HashSet<Block>();
+        for (var block = continuation; seen.Add(block);)
+        {
+            foreach (var instruction in block.Instructions)
+            {
+                if (instruction == access)
+                    return true;
+                if (ReferenceEquals(instruction.Destination, array))
+                    return false;
+            }
+            if (block.Successors is not [var next])
+                break;
+            block = next;
+        }
         return false;
     }
 

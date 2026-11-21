@@ -46,8 +46,10 @@ public static class FlagConditionRecovery
                 // Rewrite the condition's defining instruction in place into a single comparison.
                 // Its destination (the condition local the branch reads) is preserved.
                 var definition = defOf[condition];
+                var width = FindComparisonWidth(condition, op0!, op1!, defOf, 0);
                 definition.OpCode = relop;
                 definition.SetOperands(definition.Operands[0], op0!, op1!);
+                definition.OperandWidth = width is 32 or 64 ? width : definition.OperandWidth;
             }
         }
 
@@ -64,6 +66,32 @@ public static class FlagConditionRecovery
 
             entry.Value.SetOperands(destination, left, right);
         }
+    }
+
+    private static int? FindComparisonWidth(IOperand condition, IOperand left, IOperand right,
+        Dictionary<LocalVariable, Instruction> defOf, int depth)
+    {
+        if (depth > 5 || ReferenceEquals(condition, left) || ReferenceEquals(condition, right)
+            || Def(AsLocal(condition), defOf) is not { } definition)
+            return null;
+
+        if (definition is { OpCode: OpCode.Subtract or (>= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned),
+                OperandWidth: 32 or 64, Operands: [_, var a, var b] }
+            && Equals(a, left) && Equals(b, right))
+            return definition.OperandWidth;
+
+        if (definition.OpCode is not (OpCode.And or OpCode.Or or OpCode.Not or >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned))
+            return null;
+
+        int? width = null;
+        for (var i = 1; i < definition.Operands.Count; i++)
+        {
+            var operandWidth = FindComparisonWidth(definition.Operands[i], left, right, defOf, depth + 1);
+            if (operandWidth == 0 || width.HasValue && operandWidth.HasValue && width != operandWidth)
+                return 0;
+            width ??= operandWidth;
+        }
+        return width;
     }
 
     private static Dictionary<LocalVariable, Instruction> BuildDefMap(ISILControlFlowGraph cfg)

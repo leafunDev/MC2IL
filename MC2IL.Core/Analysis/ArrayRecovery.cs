@@ -31,6 +31,86 @@ public static class ArrayRecovery
         GroupInitialisers(cfg);
     }
 
+    internal static void MergeReloadedLoopArrayLengths(ISILControlFlowGraph cfg)
+    {
+        // Native loops may load the array on the initial edge and reload it at the latch.
+        // When both edges only carry that field to ldlen, put the read back in the loop test.
+        // It still happens on every iteration, after the body can have changed the field.
+        var headers = cfg.Blocks.Where(block => block.Predecessors.Count == 2
+            && block.BlockType == BlockType.TwoWay
+            && block.Instructions.FirstOrDefault(i => i.OpCode != OpCode.Nop) is
+                { OpCode: OpCode.Move, Operands: [LocalVariable, ArrayLength] }).ToArray();
+        if (headers.Length == 0)
+            return;
+
+        var instructions = cfg.Instructions;
+        var definitions = instructions.Where(i => i.Destination is LocalVariable)
+            .ToLookup(i => (LocalVariable)i.Destination!);
+        var uses = instructions.SelectMany(DeadCodeEliminator.UsedLocals).ToLookup(local => local);
+        var dominators = new DominatorInfo(cfg);
+        foreach (var header in headers)
+        {
+            var length = header.Instructions.First(i => i.OpCode != OpCode.Nop);
+            if (length.Operands[1] is not ArrayLength { Array: var array }
+                || uses[array].Count() != 1 || definitions[array].Count() != 2
+                || header.Predecessors.Count(predecessor => dominators.Dominates(header, predecessor)) != 1
+                || FindEdgeRead(header.Predecessors[0], header, array) is not { } entry
+                || FindEdgeRead(header.Predecessors[1], header, array) is not { } backedge
+                || !ReferenceEquals(entry.Field.Field, backedge.Field.Field)
+                || !ReferenceEquals(entry.Field.Local, backedge.Field.Local)
+                || entry.Removed.Any(backedge.Removed.Contains))
+                continue;
+
+            foreach (var instruction in entry.Removed.Concat(backedge.Removed))
+            {
+                instruction.OpCode = OpCode.Nop;
+                instruction.SetOperands();
+            }
+            header.Instructions.Insert(header.Instructions.IndexOf(length),
+                new Instruction(-1, OpCode.Move, [array, entry.Field]));
+        }
+
+        (FieldReference Field, List<Instruction> Removed)? FindEdgeRead(Block current, Block next, LocalVariable value)
+        {
+            var seen = new HashSet<Block> { next };
+            var removed = new List<Instruction>();
+            while (seen.Add(current) && current.Successors is [var successor] && successor == next)
+            {
+                for (var i = current.Instructions.Count - 1; i >= 0; i--)
+                {
+                    var instruction = current.Instructions[i];
+                    if (ReferenceEquals(instruction.Destination, value))
+                    {
+                        removed.Add(instruction);
+                        if (instruction is { OpCode: OpCode.Move, Operands: [_, FieldReference { Parent: null,
+                            Local: { IsThis: true, Type.IsValueType: false } receiver, Field.IsStatic: false,
+                            Field.FieldType: SzArrayTypeAnalysisContext } field] } && !definitions.Contains(receiver))
+                            return (field, removed);
+
+                        if (instruction is { OpCode: OpCode.Move, Operands: [_, LocalVariable copied] }
+                            && uses[copied].Count() == 1 && definitions[copied].Count() == 1)
+                        {
+                            value = copied;
+                            continue;
+                        }
+                        return null;
+                    }
+                    if (instruction.OpCode is OpCode.Nop or OpCode.Jump
+                        || instruction is { OpCode: OpCode.Move, Operands: [LocalVariable { Type.FullName: "System.Int32" }, Immediate] }
+                        || instruction is { OpCode: OpCode.Add, Operands: [LocalVariable { Type.FullName: "System.Int32" },
+                            LocalVariable { Type.FullName: "System.Int32" }, Immediate { Value: 1 }] })
+                        continue;
+                    return null;
+                }
+                if (current.Predecessors is not [var predecessor])
+                    break;
+                next = current;
+                current = predecessor;
+            }
+            return null;
+        }
+    }
+
     // IL2CPP may compute the indexed base in one instruction and load/store through it in
     // another. Resolve that address in SSA, while its array and index still denote single values.
     public static void RecoverSplitElementAccesses(MethodAnalysisContext method)
@@ -108,7 +188,8 @@ public static class ArrayRecovery
                 {
                     if (offset.Multiplier != stride || dataOffset != 0)
                         continue;
-                    elementIndex = dynamicIndex;
+                    elementIndex = FindEquivalentCheckedIndex(dynamicIndex, split.Array, pointerSize,
+                        instruction, cfg, instructions, definitions, ref dominators) ?? dynamicIndex;
                 }
                 else
                 {
@@ -196,6 +277,37 @@ public static class ArrayRecovery
                 return true;
             }
         }
+    }
+
+    private static LocalVariable? FindEquivalentCheckedIndex(LocalVariable index, LocalVariable array, int pointerSize,
+        Instruction access, ISILControlFlowGraph cfg, List<Instruction> instructions,
+        Dictionary<LocalVariable, Instruction?> definitions, ref DominatorInfo? dominators)
+    {
+        if (cfg.FindBlockByInstruction(access) is not { } accessBlock)
+            return null;
+
+        foreach (var branch in instructions)
+        {
+            if (branch is not { OpCode: OpCode.ConditionalJump, Operands: [Block taken, LocalVariable condition] }
+                || !definitions.TryGetValue(condition, out var test)
+                || test is not { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, OperandWidth: 32,
+                    Operands: [_, LocalVariable left, LocalVariable right] })
+                continue;
+
+            var equivalent = ReferenceEquals(left, index) ? right : ReferenceEquals(right, index) ? left : null;
+            if (equivalent == null || !IsArrayIndex(equivalent) || cfg.FindBlockByInstruction(branch) is not { } guard)
+                continue;
+            var equal = test.OpCode == OpCode.CheckEqual ? taken : guard.Successors.FirstOrDefault(block => block != taken);
+            if (equal?.Predecessors is not [var predecessor] || predecessor != guard)
+                continue;
+
+            dominators ??= new DominatorInfo(cfg);
+            if (dominators.Dominates(equal, accessBlock)
+                && IsCheckedArrayIndex(equivalent, array, pointerSize, access, cfg, instructions, definitions,
+                    requireInt32: true, ref dominators))
+                return equivalent;
+        }
+        return null;
     }
 
     private static IOperand? TryRecoverBiasedArrayIndex(MemoryOperand memory, LocalVariable array,
@@ -436,7 +548,8 @@ public static class ArrayRecovery
 
             var inRangeBlock = trueIsInRange != inverted ? taken : fallthrough;
             dominators ??= new DominatorInfo(cfg);
-            if (dominators.Dominates(inRangeBlock, accessBlock))
+            if (inRangeBlock.Predecessors is [var predecessor] && predecessor == branchBlock
+                && dominators.Dominates(inRangeBlock, accessBlock))
                 return true;
         }
 

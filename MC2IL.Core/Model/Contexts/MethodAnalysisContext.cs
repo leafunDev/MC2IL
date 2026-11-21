@@ -506,6 +506,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InjectedCheckRemover.Run(this);
         if (ArrayStoreGuardRecovery.Run(this))
             InjectedCheckRemover.Run(this, removeNullChecks: true, removeBoundsChecks: false);
+        ArrayRecovery.MergeReloadedLoopArrayLengths(ControlFlowGraph!);
 
         LocalVariables.TypeAddressedLocals(this);
 

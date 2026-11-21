@@ -1437,11 +1437,15 @@ public static class MetadataResolver
             if (first < 0 || first >= last)
                 return;
 
+            var checkedReceiver = klassRead.Operands[1] is MemoryOperand { Base: LocalVariable receiver }
+                && HasDirectNonNullEdge(block, receiver);
             for (var i = first + 1; i < last; i++)
             {
                 var candidate = block.Instructions[i];
                 if (candidate == targetRead || candidate == methodInfoRead || candidate.OpCode == OpCode.Nop
-                    || candidate is { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable or Immediate] })
+                    || candidate is { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable or Immediate] }
+                    || checkedReceiver && candidate is { OpCode: OpCode.Move, Operands: [LocalVariable,
+                        FieldReference { Field.IsStatic: false, Field.FieldType: not CustomModifierTypeAnalysisContext }] })
                     continue;
                 return;
             }
@@ -1451,6 +1455,18 @@ public static class MetadataResolver
                 discardableDispatchLoads.Add(targetRead);
             if (methodInfoRead != null && homeBlocks.TryGetValue(methodInfoRead, out var methodInfoBlock) && methodInfoBlock == block)
                 discardableDispatchLoads.Add(methodInfoRead);
+        }
+
+        bool HasDirectNonNullEdge(Block block, LocalVariable receiver)
+        {
+            if (block.Predecessors is not [var guard] || guard.Successors.Count != 2
+                || guard.Instructions.LastOrDefault() is not { OpCode: OpCode.ConditionalJump, Operands: [Block taken, LocalVariable predicate] }
+                || !definitions.TryGetValue(predicate, out var comparison)
+                || comparison is not { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [_, var lhs, var rhs] }
+                || !(lhs is Immediate { Value: 0 } && ReferenceEquals(rhs, receiver)
+                    || rhs is Immediate { Value: 0 } && ReferenceEquals(lhs, receiver)))
+                return false;
+            return (comparison.OpCode == OpCode.CheckNotEqual) == (taken == block);
         }
 
         void RewriteTailCall(Instruction tailCall, MethodAnalysisContext targetMethod)

@@ -194,9 +194,10 @@ public static class IlGenerator
             for (var i = 0; i < block.Instructions.Count; i++)
             {
                 InlineReferenceComparisonInputs(block, i, graph, instructionMap, inlineLocals, body);
+                // Keep the field and ldlen together so the comparison can inline the full expression.
+                InlineSingleUseArrayLengthReceiver(block, i, graph, instructionMap, inlineLocals, body);
                 InlineSingleUseFirstInput(block, i, graph, instructionMap, inlineLocals);
                 InlineSingleUseComparisonInput(block, i, graph, instructionMap, inlineLocals, body);
-                InlineSingleUseArrayLengthReceiver(block, i, graph, instructionMap, inlineLocals, body);
                 InlineSingleUseCallArguments(block, i, graph, instructionMap, inlineLocals, body);
                 if (fieldReadLocals != null)
                     InlineSingleUseFieldReceiver(block, i, graph, fieldReadLocals, instructionMap, inlineLocals, body);
@@ -1861,7 +1862,7 @@ public static class IlGenerator
                 LoadOperand(leftOperand, method, locals, writeLine, leftExpectedType);
                 if (apply32BitIntegerWidth)
                 {
-                    if (!isReferenceEquality || !IsInt32StackValue(leftOperand, leftExpectedType))
+                    if (!isComparison || !IsInt32StackValue(leftOperand, leftExpectedType))
                         instructions.Add(Integer32InputConversion(instruction.OpCode));
                 }
                 else if (isShift && instruction.OperandWidth == 64)
@@ -1873,7 +1874,7 @@ public static class IlGenerator
                 LoadOperand(rightOperand, method, locals, writeLine, rightExpectedType);
                 if (apply32BitIntegerWidth)
                 {
-                    if (!isReferenceEquality || !IsInt32StackValue(rightOperand, rightExpectedType))
+                    if (!isComparison || !IsInt32StackValue(rightOperand, rightExpectedType))
                         instructions.Add(isShift ? CilOpCodes.Conv_I4 : Integer32InputConversion(instruction.OpCode));
                 }
                 else if (floatConversion is { } conv2 && NeedsFloatArithmeticConversion(rightOperand, conv2))
