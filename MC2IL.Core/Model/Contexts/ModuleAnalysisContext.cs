@@ -14,7 +14,8 @@ public class ModuleAnalysisContext : HasCustomAttributesAndName
     /// <inheritdoc />
     public override string DefaultName => _assemblyContext.Definition!.Image.Name!;
 
-    public ModuleAnalysisContext(AssemblyAnalysisContext asmCtx) : base(asmCtx.Definition?.ModuleToken ?? 1, asmCtx.AppContext)
+    public ModuleAnalysisContext(AssemblyAnalysisContext asmCtx)
+        : base(asmCtx.Definition?.ModuleToken is > 0 and var moduleToken ? moduleToken : 1, asmCtx.AppContext)
     {
         _assemblyContext = asmCtx;
         

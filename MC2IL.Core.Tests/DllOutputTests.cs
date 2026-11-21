@@ -65,6 +65,21 @@ public class DllOutputTests
     }
 
     [Test]
+    public void DefaultOutputWritesAttributesOnTheManifestModule()
+    {
+        var appContext = TestGameLoader.LoadSimpleV106Game();
+        var assembly = new AsmResolverDllOutputFormatDefault().BuildAssemblies(appContext)
+            .Single(a => a.Name == "UnityEngine.CoreModule");
+        using var stream = new MemoryStream();
+        assembly.WriteManifest(stream, new ManagedPEImageBuilder(ThrowErrorListener.Instance));
+        var module = ModuleDefinition.FromBytes(stream.ToArray());
+        var safetyRules = module.CustomAttributes.Single(attribute =>
+            attribute.Constructor?.DeclaringType?.FullName == "System.Runtime.CompilerServices.RefSafetyRulesAttribute");
+
+        Assert.That(safetyRules.Signature!.FixedArguments.Single().Element, Is.EqualTo(11));
+    }
+
+    [Test]
     public void MscorlibIsItsOwnCorLib()
     {
         var appContext = TestGameLoader.LoadSimple2019Game();
