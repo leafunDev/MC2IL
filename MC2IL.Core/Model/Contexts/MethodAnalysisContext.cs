@@ -95,6 +95,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
     public override AssemblyAnalysisContext CustomAttributeAssembly => DeclaringType?.DeclaringAssembly ?? throw new("Subclasses of MethodAnalysisContext should override CustomAttributeAssembly if they have custom attributes");
 
+    /// <summary>Attributes attached to the return parameter, when IL2CPP provides its token.</summary>
+    public HasCustomAttributes? ReturnParameterCustomAttributes { get; }
+
     public override string DefaultName => Definition?.Name ?? throw new("Subclasses of MethodAnalysisContext should override DefaultName");
 
     public string FullName => DeclaringType == null ? Name : $"{DeclaringType.FullName}::{Name}";
@@ -316,12 +319,32 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         {
             InitCustomAttributeData();
 
+            // A parameter token with row ID zero means there is no return parameter entry.
+            var returnToken = Definition.returnParameterToken;
+            if ((returnToken & 0x00FFFFFF) != 0)
+                ReturnParameterCustomAttributes = new ReturnParameterAttributeContext(this, returnToken);
+
             for (var i = 0; i < Definition.InternalParameterData!.Length; i++)
             {
                 var parameterDefinition = Definition.InternalParameterData![i];
                 Parameters.Add(new(parameterDefinition, i, this));
             }
         }
+    }
+
+    private sealed class ReturnParameterAttributeContext : HasCustomAttributes
+    {
+        private readonly MethodAnalysisContext _method;
+
+        public ReturnParameterAttributeContext(MethodAnalysisContext method, uint token) : base(token, method.AppContext)
+        {
+            _method = method;
+            InitCustomAttributeData();
+        }
+
+        protected override int CustomAttributeIndex => -1;
+        public override AssemblyAnalysisContext CustomAttributeAssembly => _method.CustomAttributeAssembly;
+        public override string ToString() => $"Return parameter of {_method}";
     }
 
     public void EnsureRawBytes()

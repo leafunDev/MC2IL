@@ -279,11 +279,15 @@ public static class AsmResolverAssemblyPopulator
                     var methodDef = method.GetExtraData<MethodDefinition>("AsmResolverMethod")!;
                     CopyCustomAttributes(method, methodDef.CustomAttributes);
 
-                    var parameterDefinitions = methodDef.ParameterDefinitions;
                     foreach (var parameterAnalysisContext in method.Parameters)
                     {
-                        CopyCustomAttributes(parameterAnalysisContext, parameterDefinitions[parameterAnalysisContext.ParameterIndex].CustomAttributes);
+                        var parameter = methodDef.Parameters[parameterAnalysisContext.ParameterIndex].Definition!;
+                        CopyCustomAttributes(parameterAnalysisContext, parameter.CustomAttributes);
                     }
+
+                    if (method.ReturnParameterCustomAttributes is { } returnAttributes
+                        && (returnAttributes.RawIl2CppCustomAttributeData.Length != 0 || returnAttributes.CustomAttributes is { Count: > 0 }))
+                        CopyCustomAttributes(returnAttributes, methodDef.Parameters.ReturnParameter.GetOrCreateDefinition().CustomAttributes);
                 }
 
                 foreach (var field in type.Fields)

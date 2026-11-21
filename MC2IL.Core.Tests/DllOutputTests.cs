@@ -49,6 +49,22 @@ public class DllOutputTests
     }
 
     [Test]
+    public void DefaultOutputWritesAttributesOnTheReturnParameter()
+    {
+        var appContext = TestGameLoader.LoadSimpleV106Game();
+        var assembly = new AsmResolverDllOutputFormatDefault().BuildAssemblies(appContext)
+            .Single(a => a.Name == "mscorlib");
+        using var stream = new MemoryStream();
+        assembly.WriteManifest(stream, new ManagedPEImageBuilder(ThrowErrorListener.Instance));
+        var module = ModuleDefinition.FromBytes(stream.ToArray());
+        var span = module.TopLevelTypes.Single(type => type.Namespace == "System" && type.Name == "ReadOnlySpan`1");
+        var getter = span.Methods.Single(method => method.Name == "get_Item");
+
+        Assert.That(getter.Parameters.ReturnParameter.Definition!.CustomAttributes.Select(a => a.Constructor?.DeclaringType?.FullName),
+            Does.Contain("System.Runtime.CompilerServices.IsReadOnlyAttribute"));
+    }
+
+    [Test]
     public void MscorlibIsItsOwnCorLib()
     {
         var appContext = TestGameLoader.LoadSimple2019Game();
