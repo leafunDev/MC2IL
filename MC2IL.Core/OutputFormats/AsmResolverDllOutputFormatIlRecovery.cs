@@ -83,13 +83,16 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             methodContext.Analyze();
 
             if (methodContext.ConvertedIsil.Count == 0)
+            {
                 FillMethodBodyWithStub(methodDefinition);
+            }
             else
+            {
                 IlGenerator.GenerateIl(methodContext, methodDefinition);
+                Interlocked.Increment(ref SuccessfulMethodCount);
+            }
 
             //WriteControlFlowGraph(methodContext, Path.Combine(Environment.CurrentDirectory, "MC2IL", "bin", "Debug", "net9.0", "mc2il_out", "cfg"));
-
-            Interlocked.Increment(ref SuccessfulMethodCount);
         }
         catch (Exception e)
         {

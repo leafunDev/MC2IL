@@ -387,7 +387,7 @@ internal static class ConsoleUi
             SetProgress(68, "Preparing method recovery", "Resolving native function addresses.");
         else if (line.StartsWith("Outputting as ", StringComparison.Ordinal))
             SetProgress(70, "Generating output", "Building managed assemblies.");
-        else if (line.IndexOf("successfully decompiled (", StringComparison.Ordinal) >= 0)
+        else if (line.StartsWith("Emitted recovered IL for ", StringComparison.Ordinal))
             SetProgress(98, "Writing final DLL files", line);
         else if (line.StartsWith("Done. Total execution time", StringComparison.Ordinal))
             SetProgress(100, "Complete", "MC2IL finished processing.");

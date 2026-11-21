@@ -73,10 +73,7 @@ public abstract class AsmResolverDllOutputFormat : MC2ILOutputFormat
         Logger.VerboseNewline($"{(DateTime.Now - start).TotalMilliseconds:F1}ms", "DllOutput");
 
         if (TotalMethodCount != 0)
-        {
-            var percent = Math.Round((SuccessfulMethodCount / (float)TotalMethodCount) * 100);
-            Logger.InfoNewline($"{percent}% of methods successfully decompiled ({SuccessfulMethodCount} / {TotalMethodCount})", "DllOutput");
-        }
+            Logger.InfoNewline($"Emitted recovered IL for {SuccessfulMethodCount} / {TotalMethodCount} methods. Recovered bodies may be partial.", "DllOutput");
     }
 
     public virtual List<AssemblyDefinition> BuildAssemblies(ApplicationAnalysisContext context)
