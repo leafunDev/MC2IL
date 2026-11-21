@@ -342,12 +342,25 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
             Add(address, opCode, operands);
         }
 
-        void AddReturn(Register? tailCallResult = null)
+        void AddReturn(Register? tailCallResult = null, bool readFloatLanes = false)
         {
             if (context.IsVoid)
+            {
                 Add(address, OpCode.Return);
+            }
+            else if (readFloatLanes && Arm64CallingConventionResolver.GetFloatAggregateFields(context.ReturnType) is { } fields)
+            {
+                // Homogeneous floating-point aggregates leave one field in each of V0-V3.
+                var result = new Register(null, "TEMP_RETURN_AGGREGATE");
+                var pack = Add(address, OpCode.PackFloatAggregate, result, context.ReturnType);
+                for (var lane = 0; lane < fields.Length; lane++)
+                    pack.AddOperands([new Register(null, $"V{lane}")]);
+                Add(address, OpCode.Return, result);
+            }
             else
+            {
                 Add(address, OpCode.Return, tailCallResult ?? CallingConventions.ReturnValueSourceRegister(context));
+            }
         }
 
         bool DiscardZeroRegisterDestination()
@@ -1355,7 +1368,7 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
             case Arm64Mnemonic.RET:
             case Arm64Mnemonic.RETAA:
             case Arm64Mnemonic.RETAB:
-                AddReturn();
+                AddReturn(readFloatLanes: true);
                 break;
             case Arm64Mnemonic.CBZ:
             case Arm64Mnemonic.CBNZ:

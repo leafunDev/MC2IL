@@ -28,7 +28,7 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
             return false;
 
         var returnType = ctx.ReturnType;
-        if (!returnType.IsValueType || IsFloatingPoint(returnType))
+        if (!returnType.IsValueType || IsFloatingPoint(returnType) || GetFloatAggregateFields(returnType) != null)
             return false;
 
         var size = TypeSizes.UnboxedSize(returnType, PtrSize);
