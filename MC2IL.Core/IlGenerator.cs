@@ -2382,6 +2382,9 @@ public static class IlGenerator
 
         switch (operand)
         {
+            case DefaultValue defaultValue:
+                PushDefaultOf(defaultValue.Type, method);
+                break;
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
                 instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
                 break;

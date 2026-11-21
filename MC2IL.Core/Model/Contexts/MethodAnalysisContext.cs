@@ -468,12 +468,17 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         for (var i = 0; i < 8 && ConstantFolder.Run(this); i++)
             SsaSimplifier.Run(this);
 
+        // Copy propagation has exposed register-word uses of packed struct arguments.
+        if (PackedByteAggregateRecovery.RecoverParameters(this))
+            LocalVariables.ResolveTypesAndFields(this);
+
         Arm64UncheckedCastRecovery.Run(this);
         Arm64RemainderRecovery.Run(this);
 
         InternalCallGuardRemover.Run(this);
         KeyFunctionRecovery.Run(this);
         TrivialConstructorRecovery.Run(this);
+        PackedByteAggregateRecovery.RecoverReturns(this);
 
         ArrayRecovery.RecoverSplitElementAccesses(this);
         SsaForm.Remove(this);
