@@ -277,7 +277,7 @@ public static class LocalVariables
             changed |= MetadataResolver.ResolveCallsViaMethodInfo(method, instructions);
             changed |= MetadataResolver.ResolveAmbiguousCalls(method, instructions);
             changed |= MetadataResolver.ResolveVirtualCalls(method, instructions);
-            changed |= PropagateFromCallParameters(method, instructions);
+            changed |= PropagateFromCallResults(method, instructions);
             changed |= MetadataResolver.ResolveFieldOffsets(method, instructions);
             changed |= RefineAbsoluteMemoryPlaceholderTypes(instructions);
             changed |= RgctxResolver.Run(method, instructions);
@@ -286,6 +286,12 @@ public static class LocalVariables
             changed |= PropagateTypesOnce(method, instructions);
             changed |= SpecializeSingleUseDelegateAllocations(method, instructions);
             changed |= MetadataResolver.ResolveConstructorCalls(method, instructions);
+
+            // A use as a base class or interface is only a fallback. Give the defining
+            // loads, copies and phis a chance to establish the type before filling it
+            // from a call argument; otherwise derived field accesses can be lost.
+            if (!changed)
+                changed = PropagateFromCallParameters(instructions);
         }
     }
 
@@ -1102,7 +1108,23 @@ public static class LocalVariables
             or RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext
             or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext);
 
-    private static bool PropagateFromCallParameters(MethodAnalysisContext method, List<Instruction> instructions)
+    private static bool PropagateFromCallResults(MethodAnalysisContext method, List<Instruction> instructions)
+    {
+        var changed = false;
+        foreach (var instruction in instructions)
+        {
+            if (!instruction.IsCall || instruction.Operands[0] is not MethodAnalysisContext calledMethod
+                || instruction.Destination is not LocalVariable returnValue)
+                continue;
+
+            var producedType = calledMethod.Name is ".ctor" or ".cctor" ? calledMethod.DeclaringType : calledMethod.ReturnType;
+            if (producedType != method.AppContext.SystemTypes.SystemVoidType)
+                changed |= SetTypeIfUnknown(returnValue, producedType);
+        }
+        return changed;
+    }
+
+    private static bool PropagateFromCallParameters(List<Instruction> instructions)
     {
         var changed = false;
 
@@ -1140,7 +1162,6 @@ public static class LocalVariables
                 if (producedType != method.AppContext.SystemTypes.SystemVoidType)
                     changed |= PropagateProducedType(returnValue, producedType);
             }
-
 
             // Call operands
             // 0. Target
