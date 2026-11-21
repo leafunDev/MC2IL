@@ -510,6 +510,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         LocalVariables.TypeAddressedLocals(this);
 
         ConstantBranchFolder.Run(this);
+        Arm64ClampRecovery.Run(this);
 
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);

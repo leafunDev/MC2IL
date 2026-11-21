@@ -29,6 +29,9 @@ public class Instruction : IOperand
     // A scalar native absolute value emitted as a managed math call.
     public bool IsLiftedFloatAbs;
 
+    // Scalar FMIN has native NaN semantics and can be part of an inlined clamp.
+    public bool IsLiftedFloatMin;
+
     public OpCode OpCode
     {
         get;

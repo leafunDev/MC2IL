@@ -1025,7 +1025,8 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                             Add(address, OpCode.Call, mathMethod, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1))
                                 .IsLiftedFloatAbs = instruction.Mnemonic == Arm64Mnemonic.FABS;
                         else
-                            Add(address, OpCode.Call, mathMethod, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                            Add(address, OpCode.Call, mathMethod, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2))
+                                .IsLiftedFloatMin = instruction.Mnemonic == Arm64Mnemonic.FMIN;
                     }
                     else
                         Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} not yet implemented."));
