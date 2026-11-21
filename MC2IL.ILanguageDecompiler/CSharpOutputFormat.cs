@@ -132,14 +132,18 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
         using var module = new PEFile(path, PEStreamOptions.PrefetchEntireImage);
         var resolver = new UniversalAssemblyResolver(path, throwOnError: false,
             module.DetectTargetFrameworkId(), module.DetectRuntimePack(), PEStreamOptions.PrefetchMetadata);
-        var settings = new DecompilerSettings { ThrowOnAssemblyResolveErrors = false };
+        var settings = new DecompilerSettings
+        {
+            ThrowOnAssemblyResolveErrors = false,
+            UseNestedDirectoriesForNamespaces = true,
+        };
         Directory.CreateDirectory(outputDirectory);
 
         if (selectedTypes != null)
         {
             var remaining = new HashSet<string>(selectedTypes, StringComparer.Ordinal);
             var source = new CSharpDecompiler(module, resolver, settings);
-            var usedFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var usedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var metadata = module.Metadata;
             foreach (var handle in metadata.TypeDefinitions)
             {
@@ -152,13 +156,17 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
                 if (!remaining.Remove(fullName))
                     continue;
 
-                var stem = WholeProjectDecompiler.CleanUpFileName(fullName, null);
-                var fileName = stem;
-                for (var suffix = 2; !usedFileNames.Add(fileName); suffix++)
-                    fileName = $"{stem}_{suffix}";
+                var relativePath = WholeProjectDecompiler.GetFileNameForType(ns, name, ".cs",
+                    settings.UseNestedDirectoriesForNamespaces);
+                var directory = Path.GetDirectoryName(relativePath) ?? string.Empty;
+                var stem = Path.GetFileNameWithoutExtension(relativePath);
+                var uniquePath = relativePath;
+                for (var suffix = 2; !usedPaths.Add(uniquePath); suffix++)
+                    uniquePath = Path.Combine(directory, $"{stem}_{suffix}.cs");
 
                 var text = source.DecompileTypesAsString(new[] { handle });
-                File.WriteAllText(Path.Combine(outputDirectory, fileName + ".cs"),
+                Directory.CreateDirectory(Path.Combine(outputDirectory, directory));
+                File.WriteAllText(Path.Combine(outputDirectory, uniquePath),
                     "// Scoped export: only selected method bodies were recovered." + Environment.NewLine + text);
             }
 

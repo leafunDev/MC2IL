@@ -54,7 +54,7 @@ Choose **Decompile to C# source files** in the wizard, or select `csharp` on the
 
     dotnet run --configuration Release --project MC2IL/MC2IL.csproj --framework net10.0 -- --game-path "C:\Games\Example.apk" --output-as csharp --output-to mc2il_out
 
-This writes `.cs` files under `mc2il_out/CSharp/<assembly>/`. MC2IL recovers method bodies and uses the bundled ILSpy engine to generate C#. The intermediate DLLs are temporary. Use a fresh output directory when comparing different game versions, so files from removed types do not carry over. The generated source may need edits before it can compile.
+This writes `.cs` files under `mc2il_out/CSharp/<assembly>/`. Namespaces use nested folders, for example `Oxide.GUISystem.AnvilGUI` is written to `CSharp/Assembly-CSharp/Oxide/GUISystem/AnvilGUI.cs`. Types in the global namespace are written directly to the assembly folder. MC2IL recovers method bodies and uses the bundled ILSpy engine to generate C#. The intermediate DLLs are temporary. Use a fresh output directory when comparing different game versions, so files from removed types do not carry over. The generated source may need edits before it can compile.
 
 Choose **Export both DLL and C# files** in the wizard or pass `--output-as dll_il_recovery csharp` to keep the DLLs in the output directory as well.
 
