@@ -686,6 +686,24 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
         return _exportNameTable.Select(kv => new KeyValuePair<string, ulong>(kv.Key, kv.Value.VirtualAddress));
     }
 
+    /// <summary>Returns the file-backed bytes remaining in the executable load segment at a virtual address.</summary>
+    public ulong GetExecutableFileBytesAvailable(ulong address)
+    {
+        // Managed IL2CPP methods may be in an executable section separate from .text.
+        foreach (var segment in _elfProgramHeaderEntries)
+        {
+            if (segment.Type != ElfProgramEntryType.PT_LOAD || (segment.Flags & ElfProgramHeaderFlags.PF_X) == 0
+                || address < segment.VirtualAddress)
+                continue;
+
+            var offset = address - segment.VirtualAddress;
+            if (offset < segment.RawSize)
+                return segment.RawSize - offset;
+        }
+
+        return 0;
+    }
+
     public override ulong GetVirtualAddressOfPrimaryExecutableSection() => _elfSectionHeaderEntries.FirstOrDefault(s => s.Name == ".text")?.VirtualAddress ?? 0;
 
     public override ReadOnlySpan<byte> GetEntirePrimaryExecutableSection()
