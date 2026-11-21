@@ -136,6 +136,7 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
         {
             ThrowOnAssemblyResolveErrors = false,
             UseNestedDirectoriesForNamespaces = true,
+            FileScopedNamespaces = false,
             // ILSpy uses this setting to add readability labels to positional bool literals.
             NonTrailingNamedArguments = false,
         };

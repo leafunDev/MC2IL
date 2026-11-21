@@ -78,11 +78,12 @@ public class DiffableCsOutputFormat : MC2ILOutputFormat
                 var stringWriter = new StringWriter();
                 var writer = new IndentedTextWriter(stringWriter, "\t");
 
-                //Namespace at top of file
-                if (!string.IsNullOrEmpty(type.Namespace))
+                var hasNamespace = !string.IsNullOrEmpty(type.Namespace);
+                if (hasNamespace)
                 {
-                    writer.WriteLine($"namespace {type.Namespace};");
-                    writer.WriteLineNoTabs(string.Empty);
+                    writer.WriteLine($"namespace {type.Namespace}");
+                    writer.WriteLine('{');
+                    writer.Indent++;
                 }
                 else
                 {
@@ -91,6 +92,12 @@ public class DiffableCsOutputFormat : MC2ILOutputFormat
                 }
 
                 WriteType(writer, type);
+
+                if (hasNamespace)
+                {
+                    writer.Indent--;
+                    writer.WriteLine('}');
+                }
 
                 ret[path] = stringWriter;
             }
