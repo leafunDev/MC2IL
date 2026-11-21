@@ -436,6 +436,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+        if (ArmV7DynamicFieldAccessRecovery.Run(this))
+            LocalVariables.ResolveTypesAndFields(this);
         ValueTypeReceiverRecovery.ResolveStaticFieldAddresses(this);
         MetadataInitGuardRemover.RunClassReloads(this);
         MetadataResolver.RecoverDelegateTargets(this);

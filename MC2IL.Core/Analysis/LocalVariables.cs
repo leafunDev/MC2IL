@@ -1159,7 +1159,7 @@ public static class LocalVariables
             {
                 var producedType = calledMethod.Name is ".ctor" or ".cctor" ? calledMethod.DeclaringType : calledMethod.ReturnType;
 
-                if (producedType != method.AppContext.SystemTypes.SystemVoidType)
+                if (producedType != calledMethod.AppContext.SystemTypes.SystemVoidType)
                     changed |= PropagateProducedType(returnValue, producedType);
             }
 

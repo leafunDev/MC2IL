@@ -184,6 +184,41 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                     }
                     return;
                 }
+                case ArmInstructionId.ARM_INS_VPUSH:
+                case ArmInstructionId.ARM_INS_VPOP:
+                {
+                    var pop = id == ArmInstructionId.ARM_INS_VPOP;
+                    var registers = new List<Register>(ops.Length);
+                    foreach (var operand in ops)
+                    {
+                        if (operand.Type != ArmOperandType.Register)
+                        {
+                            registers.Clear();
+                            break;
+                        }
+                        registers.Add(Reg(operand.Register.Name));
+                    }
+                    if (registers.Count == 0 || registers.Count != ops.Length)
+                        break;
+
+                    var widths = registers.Select(register => register.Name.StartsWith("d", StringComparison.Ordinal) ? 8 : 4).ToArray();
+                    var totalBytes = widths.Sum();
+                    if (!pop) Add(OpCode.ShiftStack, new Immediate(-totalBytes));
+
+                    var offset = 0;
+                    for (var i = 0; i < registers.Count; i++)
+                    {
+                        var slot = new StackOffset(offset);
+                        var transfer = pop
+                            ? Move(registers[i], slot)
+                            : Add(OpCode.Move, slot, registers[i]);
+                        transfer.MemoryAccessSize = widths[i];
+                        offset += widths[i];
+                    }
+
+                    if (pop) Add(OpCode.ShiftStack, new Immediate(totalBytes));
+                    return;
+                }
                 case ArmInstructionId.ARM_INS_MOV:
                 case ArmInstructionId.ARM_INS_MOVW:
                 case ArmInstructionId.ARM_INS_MOVT:

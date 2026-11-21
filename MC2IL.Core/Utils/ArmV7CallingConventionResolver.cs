@@ -20,6 +20,53 @@ internal sealed class ArmV7CallingConventionResolver : BaseCallingConventionReso
     public override IOperand[] ResolveForManaged(MethodAnalysisContext ctx) => Resolve(ctx, incoming: true);
     internal IOperand[] ResolveForCall(MethodAnalysisContext ctx) => Resolve(ctx, incoming: false);
 
+    public override void RemapRawArguments(Instruction call, MethodAnalysisContext resolved)
+    {
+        var app = resolved.AppContext;
+        if (!HasRawArgumentLayout(call, app))
+            return;
+
+        var argumentBase = ArgBase(call);
+        var nextRegister = ReturnsViaHiddenBuffer(resolved) ? 1 : 0;
+        var operands = new List<IOperand>();
+        for (var i = 0; i < argumentBase; i++)
+            operands.Add(call.Operands[i]);
+
+        void Append(TypeAnalysisContext? type)
+        {
+            var paired = type?.FullName is "System.Double" or "System.Int64" or "System.UInt64";
+            var size = paired
+                ? 8
+                : type is { IsValueType: true, IsEnumType: false }
+                    ? TypeSizes.UnboxedSize(type, 4)
+                    : 4;
+            var isPrimitive = type?.FullName is "System.Boolean" or "System.Byte" or "System.SByte"
+                or "System.Char" or "System.Int16" or "System.UInt16" or "System.Int32" or "System.UInt32"
+                or "System.Single" or "System.IntPtr" or "System.UIntPtr";
+            var needsAggregateRecovery = paired
+                || type is { IsValueType: true, IsEnumType: false } && !isPrimitive;
+            if (paired)
+                nextRegister = (nextRegister + 1) & ~1;
+
+            var slot = nextRegister;
+            nextRegister += (int)System.Math.Max(1, (size + 3) / 4);
+            if (needsAggregateRecovery && type != null)
+                operands.Add(new UnrecoveredCallArgument(type));
+            else if (slot < CoreRegisters.Length)
+                operands.Add(call.Operands[argumentBase + slot]);
+            else
+                operands.Add(new StackOffset((slot - CoreRegisters.Length) * 4));
+        }
+
+        if (!resolved.IsStatic)
+            Append(null);
+        foreach (var parameter in resolved.Parameters)
+            Append(parameter.ParameterType);
+        Append(null); // IL2CPP MethodInfo* argument
+
+        call.SetOperands(operands);
+    }
+
     private IOperand[] Resolve(MethodAnalysisContext ctx, bool incoming)
     {
         var result = new List<IOperand>();
