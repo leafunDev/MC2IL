@@ -920,8 +920,9 @@ public static class MetadataInitGuardRemover
     private static bool ClassifyBlock(Block block, long? metadataFlagAddress,
         ref bool sawMetadataInit, ref bool sawClassInit, ref bool sawFlagStore)
     {
-        foreach (var instruction in block.Instructions)
+        for (var index = 0; index < block.Instructions.Count; index++)
         {
+            var instruction = block.Instructions[index];
             switch (instruction.OpCode)
             {
                 case OpCode.Jump:
@@ -942,10 +943,7 @@ public static class MetadataInitGuardRemover
 
                 case OpCode.Move when instruction.Operands is [MemoryOperand { IsConstant: true } flag, var value]
                     && metadataFlagAddress == flag.Addend
-                    && (value is Immediate { Value: 1 } || value is LocalVariable flagValue
-                        && block.Instructions.Any(candidate => candidate is
-                            { OpCode: OpCode.Move, Operands: [LocalVariable destination, Immediate { Value: 1 }] }
-                            && ReferenceEquals(destination, flagValue))):
+                    && IsInitializedFlagValue(block, index, value):
                     sawFlagStore = true;
                     break;
 
@@ -957,6 +955,38 @@ public static class MetadataInitGuardRemover
         }
 
         return true;
+    }
+
+    private static bool IsInitializedFlagValue(Block block, int before, IOperand value)
+    {
+        if (value is not LocalVariable)
+            return value is Immediate { Value: 1 };
+
+        // A compiler can load the flag byte's value into a callee-saved register
+        // before the guard. Walk back through unique incoming edges, using only
+        // definitions that can reach the store on that path.
+        var visited = new HashSet<Block>();
+        for (var remaining = 16; remaining > 0 && visited.Add(block); remaining--)
+        {
+            for (var index = before - 1; index >= 0; index--)
+            {
+                var definition = block.Instructions[index];
+                if (!ReferenceEquals(definition.Destination, value))
+                    continue;
+                if (definition is not { OpCode: OpCode.Move, Operands: [LocalVariable, var source] })
+                    return false;
+                if (source is not LocalVariable)
+                    return source is Immediate { Value: 1 };
+                value = source;
+            }
+
+            if (block.Predecessors is not [var predecessor])
+                return false;
+            block = predecessor;
+            before = block.Instructions.Count;
+        }
+
+        return false;
     }
 
     // True for instructions that only compute a value into a local (or do nothing). A store - any

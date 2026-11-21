@@ -188,4 +188,36 @@ public class GuardRemovalSafetyTests
         Assert.That(graph.Instructions.Contains(store), Is.EqualTo(!remove));
         Assert.That(graph.Instructions.Any(i => i.OpCode == OpCode.ConditionalJump), Is.EqualTo(!remove));
     }
+
+    [TestCase(1, true, true)]
+    [TestCase(7, true, false)]
+    [TestCase(1, false, false)]
+    public void TracesMetadataFlagValueLoadedBeforeGuard(long initializedValue, bool includeInitializer, bool remove)
+    {
+        var flag = Local("flag");
+        var value = Local("value");
+        var condition = Local("condition");
+        var merge = new Instruction(0, OpCode.Return);
+        var store = new Instruction(0, OpCode.Move, new MemoryOperand(null, null, 0x3000), value);
+        var initializer = new Instruction(0, OpCode.CallVoid,
+            Str("il2cpp_codegen_initialize_runtime_metadata"), Imm(0x5000));
+        var ordinaryCall = new Instruction(0, OpCode.CallVoid, Str("ordinary_call"));
+        var graph = Build([
+            new(0, OpCode.Move, value, Imm(initializedValue)),
+            ordinaryCall,
+            new(0, OpCode.Move, flag, new MemoryOperand(null, null, 0x3000)),
+            new(0, OpCode.CheckNotEqual, condition, flag, Imm(0)),
+            new(0, OpCode.ConditionalJump, merge, condition),
+            includeInitializer ? initializer : new Instruction(0, OpCode.Nop),
+            store,
+            new(0, OpCode.Jump, merge),
+            merge,
+        ]);
+
+        MetadataInitGuardRemover.Run(graph, 0xE0);
+
+        Assert.That(graph.Instructions.Contains(ordinaryCall), Is.True);
+        Assert.That(graph.Instructions.Contains(store), Is.EqualTo(!remove));
+        Assert.That(graph.Instructions.Any(i => i.OpCode == OpCode.ConditionalJump), Is.EqualTo(!remove));
+    }
 }
