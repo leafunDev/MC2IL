@@ -183,12 +183,25 @@ public static class EqualityBranchInverter
                     return takenJoins;
             }
 
-            // An if/else is normally printed in the order of its bodies. A void
-            // return at the end of a straight-line arm can disappear at the join too.
-            if (!takenJoins && !fallthroughJoins && ((!takenExits && !fallthroughExits)
-                    || (takenExits && IsVoidReturn(taken) && EndsInStraightVoidReturn(fallenThrough, branch))
-                    || (fallthroughExits && IsVoidReturn(fallenThrough) && EndsInStraightVoidReturn(taken, branch))))
-                return blockOrder[taken] > blockOrder[fallenThrough];
+            if (!takenJoins && !fallthroughJoins)
+            {
+                // ILSpy folds a bare void return and a straight-line body ending in
+                // ret into one if. Favor the body here, even when the bare return
+                // comes first in the native layout, to emit the operator that the
+                // visible condition needs.
+                if (takenExits != fallthroughExits)
+                {
+                    var returnArm = takenExits ? taken : fallenThrough;
+                    var body = takenExits ? fallenThrough : taken;
+                    if (IsVoidReturn(returnArm) && EndsInStraightVoidReturn(body, branch))
+                        return takenExits;
+                }
+                else if (!takenExits)
+                {
+                    // An if/else with two bodies is normally printed in layout order.
+                    return blockOrder[taken] > blockOrder[fallenThrough];
+                }
+            }
         }
 
         // Keep a direct guard exit when it has its own return or throw. When
