@@ -25,7 +25,7 @@ The example is illustrative, not output from a specific game. Actual recovery re
 
 - Read Unity game folders and Android APKs, locating the IL2CPP binary and metadata automatically.
 - Parse Unity IL2CPP metadata and native binaries across supported architectures.
-- Recover method bodies from 32-bit ARM Android libraries (`armeabi-v7a`). ARMv7 recovery is experimental and currently supports common scalar operations, branches, and calls.
+- Recover method bodies from 32-bit ARM Android libraries (`armeabi-v7a`). ARMv7 recovery is experimental and currently supports common scalar operations, branches, calls, and multiple-register stack transfers.
 - Produce managed DLLs with recovered method bodies, alongside stub DLLs and analysis dumps.
 - Run as a command-line tool on Windows, Linux, and macOS with .NET 10.
 

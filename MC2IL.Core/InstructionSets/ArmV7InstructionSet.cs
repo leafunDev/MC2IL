@@ -102,7 +102,7 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
         string.Join("\n", ArmV7Utils.Decode(context.AppContext, context.UnderlyingPointer, context.RawBytes)
             .Select(i => $"0x{i.Address:X} {i.Mnemonic} {i.Operand}"));
 
-    private sealed class Lifter(MethodAnalysisContext method, List<ArmInstruction> native)
+    internal sealed class Lifter(MethodAnalysisContext method, List<ArmInstruction> native)
     {
         private readonly List<Instruction> _result = [];
         private readonly Dictionary<long, Instruction> _labels = new();
@@ -226,6 +226,17 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                 case ArmInstructionId.ARM_INS_VSTR:
                     if (Dest() is { } data && ops.Length >= 2 && ops[1].Type == ArmOperandType.Memory
                         && LiftMemory(instruction, data, Read(1)))
+                        return;
+                    break;
+                case ArmInstructionId.ARM_INS_LDM:
+                case ArmInstructionId.ARM_INS_LDMIB:
+                case ArmInstructionId.ARM_INS_LDMDA:
+                case ArmInstructionId.ARM_INS_LDMDB:
+                case ArmInstructionId.ARM_INS_STM:
+                case ArmInstructionId.ARM_INS_STMIB:
+                case ArmInstructionId.ARM_INS_STMDA:
+                case ArmInstructionId.ARM_INS_STMDB:
+                    if (LiftBlockTransfer(instruction))
                         return;
                     break;
                 case ArmInstructionId.ARM_INS_CMP:
@@ -416,6 +427,63 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                 return;
             }
             Unsupported(instruction);
+        }
+
+        private bool LiftBlockTransfer(ArmInstruction instruction)
+        {
+            var details = instruction.Details;
+            var operands = details.Operands;
+            // A transfer involving PC or user-mode registers has semantics beyond a series of word moves.
+            if (details.IsUserMode || operands.Length < 2
+                || operands[0] is not { Type: ArmOperandType.Register, Register.Name: { } baseName }
+                || baseName is "pc" or "invalid" or "")
+                return false;
+
+            var id = instruction.Id;
+            var load = id is ArmInstructionId.ARM_INS_LDM or ArmInstructionId.ARM_INS_LDMIB
+                or ArmInstructionId.ARM_INS_LDMDA or ArmInstructionId.ARM_INS_LDMDB;
+            // Register-based transfers of packed value types need field recovery as well.
+            // Direct stack transfers already have distinct ISIL slots.
+            if (baseName != "sp")
+                return false;
+
+            var registers = new Register[operands.Length - 1];
+            for (var i = 0; i < registers.Length; i++)
+            {
+                if (operands[i + 1] is not { Type: ArmOperandType.Register, Register.Name: { } name }
+                    || name is "pc" or "sp" or "invalid" or ""
+                    || details.WriteBack && name == baseName)
+                    return false;
+                registers[i] = Reg(name);
+            }
+
+            const int wordSize = 4;
+            var byteCount = registers.Length * wordSize;
+            // The lowest-numbered register always transfers at the lowest address, even for DA and DB.
+            var firstOffset = id switch
+            {
+                ArmInstructionId.ARM_INS_LDMIB or ArmInstructionId.ARM_INS_STMIB => wordSize,
+                ArmInstructionId.ARM_INS_LDMDA or ArmInstructionId.ARM_INS_STMDA => wordSize - byteCount,
+                ArmInstructionId.ARM_INS_LDMDB or ArmInstructionId.ARM_INS_STMDB => -byteCount,
+                _ => 0
+            };
+
+            for (var i = 0; i < registers.Length; i++)
+            {
+                var offset = firstOffset + i * wordSize;
+                IOperand address = new StackOffset(offset);
+                var transfer = load ? Move(registers[i], address) : Add(OpCode.Move, address, registers[i]);
+                transfer.MemoryAccessSize = wordSize;
+            }
+
+            if (details.WriteBack)
+            {
+                var decrement = id is ArmInstructionId.ARM_INS_LDMDA or ArmInstructionId.ARM_INS_STMDA
+                    or ArmInstructionId.ARM_INS_LDMDB or ArmInstructionId.ARM_INS_STMDB;
+                var delta = decrement ? -byteCount : byteCount;
+                Add(OpCode.ShiftStack, new Immediate(delta));
+            }
+            return true;
         }
 
         private bool LiftMemory(ArmInstruction instruction, Register reg, IOperand? address)
