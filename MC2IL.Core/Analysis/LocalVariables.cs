@@ -263,8 +263,8 @@ public static class LocalVariables
         // Everything else is mutually enabling and so runs to a fixpoint: a typed receiver lets an
         // ambiguous call resolve, a resolved call types its return value and arguments, a typed base
         // lets a field offset resolve, a field load types its result, and any of those can be the
-        // receiver/base of the next step. Every pass is monotonic - it only resolves an operand or
-        // fills a previously-unknown type - so the loop converges.
+        // receiver/base of the next step. A resolved producer can also narrow a reference type
+        // previously inferred from one of its consumers.
         var changed = true;
         var loopCount = 0;
 
@@ -592,6 +592,23 @@ public static class LocalVariables
         return true;
     }
 
+    private static bool PropagateProducedType(LocalVariable local, TypeAnalysisContext? produced)
+    {
+        if (SetTypeIfUnknown(local, produced))
+            return true;
+
+        if (produced == null || local.Type is not { } inferred
+            || MetadataResolver.IsSameType(inferred, produced)
+            || !CanJoinReferenceTypes(produced) || !CanJoinReferenceTypes(inferred)
+            || !produced.IsAssignableTo(inferred))
+            return false;
+
+        // The producer determines the type; a use such as UnityEngine.Object.op_Equality
+        // only requires that the value be assignable to its parameter.
+        local.Type = produced;
+        return true;
+    }
+
     private static bool PropagateStaticFieldStorage(MethodAnalysisContext method, List<Instruction> instructions)
     {
         var staticFieldsOffset = method.AppContext.Binary.is32Bit ? StaticFieldsOffset32 : StaticFieldsOffset64;
@@ -872,12 +889,12 @@ public static class LocalVariables
 
         // Move local, local: copy a known type in whichever direction is missing it.
         if (destination is LocalVariable destLocal && source is LocalVariable sourceLocal)
-            return SetTypeIfUnknown(destLocal, sourceLocal.Type) || SetTypeIfUnknown(sourceLocal, destLocal.Type);
+            return PropagateProducedType(destLocal, sourceLocal.Type) || SetTypeIfUnknown(sourceLocal, destLocal.Type);
 
         // Move local, field: a field load types its result with the field's type. This is the edge
         // that lets the loaded value go on to be the base of a further field access.
         if (destination is LocalVariable loadDest && source is FieldReference loadField)
-            return SetTypeIfUnknown(loadDest, loadField.Field.FieldType);
+            return PropagateProducedType(loadDest, loadField.Field.FieldType);
 
         // Move field, local: a field store types the stored value with the field's type.
         if (destination is FieldReference storeField && source is LocalVariable storeSource)
@@ -1114,7 +1131,7 @@ public static class LocalVariables
                 var producedType = calledMethod.Name is ".ctor" or ".cctor" ? calledMethod.DeclaringType : calledMethod.ReturnType;
 
                 if (producedType != method.AppContext.SystemTypes.SystemVoidType)
-                    changed |= SetTypeIfUnknown(returnValue, producedType);
+                    changed |= PropagateProducedType(returnValue, producedType);
             }
 
 
