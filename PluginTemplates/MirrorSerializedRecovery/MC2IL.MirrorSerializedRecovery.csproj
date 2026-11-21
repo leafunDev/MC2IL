@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <AssemblyName>MC2IL.MirrorSerializedRecovery</AssemblyName>
+    <RootNamespace>MC2IL.MirrorSerializedRecovery</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\MC2IL.Core\MC2IL.Core.csproj" Private="false" />
+    <ProjectReference Include="..\..\MC2IL.ILanguageDecompiler\MC2IL.ILanguageDecompiler.csproj" Private="false" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.0.0" />
+  </ItemGroup>
+  <Target Name="DeployPluginToMC2IL" AfterTargets="Build">
+    <PropertyGroup>
+      <PluginDirectory>$(MSBuildProjectDirectory)\..\..\Plugins</PluginDirectory>
+    </PropertyGroup>
+    <ItemGroup>
+      <PluginDeployFiles Include="$(TargetDir)MC2IL.MirrorSerializedRecovery.dll;$(TargetDir)Microsoft.CodeAnalysis.CSharp.dll;$(TargetDir)Microsoft.CodeAnalysis.dll;$(TargetDir)Microsoft.Bcl.HashCode.dll;$(TargetDir)System.Buffers.dll;$(TargetDir)System.Collections.Immutable.dll;$(TargetDir)System.Memory.dll;$(TargetDir)System.Numerics.Vectors.dll;$(TargetDir)System.Reflection.Metadata.dll;$(TargetDir)System.Runtime.CompilerServices.Unsafe.dll;$(TargetDir)System.Text.Encoding.CodePages.dll;$(TargetDir)System.Threading.Tasks.Extensions.dll" />
+    </ItemGroup>
+    <MakeDir Directories="$(PluginDirectory)" />
+    <Copy SourceFiles="@(PluginDeployFiles)" DestinationFolder="$(PluginDirectory)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>
