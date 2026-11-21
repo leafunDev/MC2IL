@@ -511,6 +511,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         ConstantBranchFolder.Run(this);
         Arm64ClampRecovery.Run(this);
+        ConstantBranchFolder.MergeConstantReturnPaths(this);
 
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);
