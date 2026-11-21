@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using Gee.External.Capstone.Arm;
@@ -7,6 +8,14 @@ namespace MC2IL.Core.Il2CppApiFunctions;
 
 public class ArmV7KeyFunctionAddresses : BaseKeyFunctionAddresses
 {
+    private readonly ConcurrentDictionary<ulong, bool> _classInitThunks = new();
+
+    internal bool IsClassInitThunk(ulong address) => il2cpp_runtime_class_init_actual != 0
+        && _classInitThunks.GetOrAdd(address, IsClassInitBranch);
+
+    private bool IsClassInitBranch(ulong address) =>
+        FindFunctionThisIsAThunkOf(address) == il2cpp_runtime_class_init_actual;
+
     protected override ulong FindFirstCallTargetInMethod(ulong methodVa)
     {
         if (methodVa == 0)
@@ -33,7 +42,16 @@ public class ArmV7KeyFunctionAddresses : BaseKeyFunctionAddresses
         if (thunkPtr == 0)
             return 0;
         var body = ArmV7Utils.GetArmV7MethodBodyAtVirtualAddress(_appContext, thunkPtr, managed: false, count: 6);
-        if (body.FirstOrDefault() is { Id: ArmInstructionId.ARM_INS_B, Details.ConditionCode: ArmConditionCode.ARM_CC_AL } branch)
+        var branchIndex = 0;
+        // il2cpp_raise_exception sets Exception::Raise's optional second argument to null.
+        if (prioritiseCall && body.FirstOrDefault() is
+            { Id: ArmInstructionId.ARM_INS_MOV, Details: { ConditionCode: ArmConditionCode.ARM_CC_AL,
+                Operands: [{ Type: ArmOperandType.Register, Register.Name: "r1" },
+                    { Type: ArmOperandType.Immediate, Immediate: 0 }] } })
+            branchIndex = 1;
+
+        if (body.ElementAtOrDefault(branchIndex) is
+            { Id: ArmInstructionId.ARM_INS_B, Details.ConditionCode: ArmConditionCode.ARM_CC_AL } branch)
             return GetTarget(branch, thunkPtr);
         return 0;
     }

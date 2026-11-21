@@ -38,6 +38,8 @@ public static class MetadataInitGuardRemover
     {
         var cfg = method.ControlFlowGraph!;
         var supportsClassReloads = SupportsClassReloads(method);
+        var armV7ClassLayout = method.AppContext.InstructionSet is ArmV7InstructionSet
+            && method.AppContext.MetadataVersion == 24.5f;
         // These Il2CppClass offsets are only verified for the ARM64 metadata-v29 layout.
         // Keep class-init guards in unknown layouts instead of treating an unrelated byte as
         // the initialized flag. Metadata-init guards are independently recognized by their
@@ -49,8 +51,74 @@ public static class MetadataInitGuardRemover
             : Array.Empty<long>();
         if (supportsClassReloads)
             RemoveArm64ClassMetadataGuards(method, cfg);
-        Run(cfg, flagOffsets, keepBareCalls: supportsClassReloads, dominance: method.DominatorInfo,
+        if (armV7ClassLayout)
+            RemoveArmV7CctorGuards(cfg);
+        Run(cfg, flagOffsets, keepBareCalls: supportsClassReloads || armV7ClassLayout, dominance: method.DominatorInfo,
             allowStaticFieldReloads: supportsClassReloads && !method.AppContext.Binary.is32Bit);
+    }
+
+    private static void RemoveArmV7CctorGuards(ISILControlFlowGraph cfg)
+    {
+        const int hasCctorFlagOffset = 0xBB;
+        const int hasCctorMask = 2;
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        foreach (var instruction in cfg.Instructions)
+            if (instruction.Destination is LocalVariable local)
+                definitions[local] = instruction;
+
+        var discardedLoads = new HashSet<Instruction>();
+        foreach (var guard in cfg.Blocks.ToArray())
+        {
+            // ARMv7 24.5 calls ClassInit only when has_cctor is set and cctor_finished is zero.
+            if (guard.Successors.Count != 2 || guard.Instructions.LastOrDefault() is not
+                    { OpCode: OpCode.ConditionalJump, Operands: [Block merge, LocalVariable condition] }
+                || !guard.Successors.Contains(merge)
+                || !TryGetClassFlagTest(condition, definitions, hasCctorFlagOffset, hasCctorMask,
+                    out var flagLoad, out var klass, out var trueWhenSet)
+                || trueWhenSet || flagLoad.MemoryAccessSize != 1)
+                continue;
+
+            var finishedCheck = guard.Successors.First(successor => successor != merge);
+            if (finishedCheck.Predecessors is not [var predecessor] || predecessor != guard
+                || finishedCheck.Successors.Count != 2 || !finishedCheck.Successors.Contains(merge)
+                || finishedCheck.Instructions.LastOrDefault() is not
+                    { OpCode: OpCode.ConditionalJump, Operands: [Block ready, LocalVariable finished] } branch
+                || ready != merge
+                || !definitions.TryGetValue(finished, out var comparison)
+                || comparison is not { OpCode: OpCode.CheckNotEqual, Operands: [_, LocalVariable value, Immediate { Value: 0 }] }
+                || !definitions.TryGetValue(value, out var finishedLoad)
+                || finishedLoad is not { OpCode: OpCode.Move, MemoryAccessSize: 4, Operands: [_, MemoryOperand
+                    { Base: LocalVariable checkedClass, Index: null, Scale: 0, Addend: CctorFinishedOffset32 }] }
+                || !ReferenceEquals(klass, checkedClass)
+                || !finishedCheck.Instructions.All(instruction => instruction == branch || instruction == finishedLoad
+                    || IsSideEffectFree(instruction) && instruction is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand] }))
+                continue;
+
+            var slow = finishedCheck.Successors.First(successor => successor != merge);
+            if (!TryCollectRegion(cfg, finishedCheck, slow, merge, false, null, null, out var region)
+                || !region.SelectMany(block => block.Instructions).Any(i => InitializesClass(i, klass, definitions)))
+                continue;
+
+            region.Add(finishedCheck);
+            if (HasEscapingValues(cfg, region, merge))
+                continue;
+
+            Excise(cfg, guard, finishedCheck, merge, region);
+            discardedLoads.Add(flagLoad);
+            // The proven runtime guard can reload its class from a metadata slot. Keep the
+            // reload if any live operation still needs it, and never discard an object read here.
+            if (definitions.TryGetValue(klass, out var reload)
+                && reload is { OpCode: OpCode.Move, MemoryAccessSize: 4, Operands: [_, MemoryOperand
+                    { Base: LocalVariable slot, Index: null, Scale: 0, Addend: 0 }] }
+                && FollowCopies(slot, definitions) is LocalVariable slotSource
+                && definitions.TryGetValue(slotSource, out var slotLoad)
+                && slotLoad is { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext
+                    and not (RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext)] })
+                discardedLoads.Add(reload);
+        }
+
+        if (discardedLoads.Count != 0)
+            DeadCodeEliminator.Run(cfg, discardedLoads);
     }
 
     // The ARM64 metadata initialization slow path returns the same Il2CppClass*
@@ -68,7 +136,7 @@ public static class MetadataInitGuardRemover
             if (guard.Successors.Count != 2
                 || guard.Instructions.LastOrDefault() is not { OpCode: OpCode.ConditionalJump,
                     Operands: [Block onTrue, LocalVariable condition] }
-                || !TryGetArm64ClassFlag(condition, definitions, out var flagLoad, out var klass, out var trueWhenReady))
+                || !TryGetClassFlagTest(condition, definitions, 0x132, 1, out var flagLoad, out var klass, out var trueWhenReady))
                 continue;
 
             var onFalse = guard.Successors.FirstOrDefault(successor => successor != onTrue);
@@ -143,13 +211,13 @@ public static class MetadataInitGuardRemover
             DeadCodeEliminator.Run(cfg, discardedLoads);
     }
 
-    private static bool TryGetArm64ClassFlag(LocalVariable condition,
-        Dictionary<LocalVariable, Instruction> definitions,
-        out Instruction load, out LocalVariable klass, out bool trueWhenReady)
+    private static bool TryGetClassFlagTest(LocalVariable condition,
+        Dictionary<LocalVariable, Instruction> definitions, long flagOffset, long flagMask,
+        out Instruction load, out LocalVariable klass, out bool trueWhenSet)
     {
         load = null!;
         klass = null!;
-        trueWhenReady = false;
+        trueWhenSet = false;
 
         if (!definitions.TryGetValue(condition, out var test))
             return false;
@@ -160,16 +228,18 @@ public static class MetadataInitGuardRemover
         if (test!.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
             || test.Operands is not [_, LocalVariable masked, Immediate { Value: 0 }]
             || !definitions.TryGetValue(masked, out var mask)
-            || mask is not { OpCode: OpCode.And, Operands: [_, LocalVariable flag, Immediate { Value: 1 }] }
+            || mask is not { OpCode: OpCode.And, Operands: [_, LocalVariable flag, Immediate constant] }
+            || constant.Value != flagMask
             || FollowCopies(flag, definitions) is not LocalVariable flagSource
             || !definitions.TryGetValue(flagSource, out var candidate)
             || candidate is not { OpCode: OpCode.Move, MemoryAccessSize: 1 or 2, Operands: [_, MemoryOperand
-                { Base: LocalVariable classPointer, Index: null, Scale: 0, Addend: 0x132 }] })
+                { Base: LocalVariable classPointer, Index: null, Scale: 0, Addend: var offset }] }
+            || offset != flagOffset)
             return false;
 
         klass = classPointer;
         load = candidate;
-        trueWhenReady = (test.OpCode == OpCode.CheckNotEqual) != inverted;
+        trueWhenSet = (test.OpCode == OpCode.CheckNotEqual) != inverted;
         return true;
     }
 

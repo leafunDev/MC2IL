@@ -766,6 +766,13 @@ public static class MetadataResolver
             //Non-key function call. Try to find a single match
             if (!method.AppContext.MethodsByAddress.TryGetValue(target, out var targetMethods))
             {
+                if (keyFunctionAddresses is ArmV7KeyFunctionAddresses armV7 && armV7.IsClassInitThunk(target))
+                {
+                    HandleKeyFunction(method.AppContext, callInstruction,
+                        armV7.il2cpp_runtime_class_init_actual, keyFunctionAddresses);
+                    continue;
+                }
+
                 // Not a managed method at all. Exception-name strings are only a hint: native helpers
                 // can reference exception types without throwing them, so require either a proven
                 // exception-raiser call graph or a returned exception object that is actually thrown.
@@ -1277,8 +1284,9 @@ public static class MetadataResolver
         return changed;
     }
 
-    // 32-bit Il2CppClass::vtable offset. The 64-bit offset depends on metadata version.
-    private const long VTableOffset32 = 0xC0;
+    private static int GetVTableOffset(ApplicationAnalysisContext app) =>
+        !app.Binary.is32Bit ? Il2CppClassUsefulOffsets.GetVtableOffset(app.MetadataVersion, is32Bit: false)
+        : app.InstructionSet is ArmV7InstructionSet && app.MetadataVersion == 24.5f ? 0xBC : 0xC0;
 
     // Resolves virtual dispatch through <c>[klass + vtableOffset + slot * sizeof(VirtualInvokeData)]</c>
     // as long as the klass local's represented type is known.
@@ -1288,9 +1296,7 @@ public static class MetadataResolver
     internal static bool ResolveVirtualCalls(MethodAnalysisContext method, List<Instruction> instructions)
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
-        var vtableOffset = pointerSize == 8
-            ? Il2CppClassUsefulOffsets.GetVtableOffset(method.AppContext.MetadataVersion, is32Bit: false)
-            : VTableOffset32;
+        var vtableOffset = GetVTableOffset(method.AppContext);
         var invokeDataSize = 2L * pointerSize;
         var changed = false;
         var homeBlocks = new Dictionary<Instruction, Block>();
@@ -1617,9 +1623,7 @@ public static class MetadataResolver
             return null;
 
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
-        var vtableOffset = pointerSize == 8
-            ? Il2CppClassUsefulOffsets.GetVtableOffset(method.AppContext.MetadataVersion, is32Bit: false)
-            : VTableOffset32;
+        var vtableOffset = GetVTableOffset(method.AppContext);
         if (offset < vtableOffset)
             return null;
 

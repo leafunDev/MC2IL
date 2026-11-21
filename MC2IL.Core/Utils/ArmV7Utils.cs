@@ -49,7 +49,8 @@ public static class ArmV7Utils
         var binary = appContext.Binary;
         if (!binary.TryMapVirtualAddressToRaw(virtAddress & ~1UL, out var raw) || raw < 0 || raw >= binary.RawLength)
             return [];
-        var length = (int)Math.Min(binary.RawLength - raw, 4096);
+        var maxBytes = count > 0 ? Math.Min(4096, 4L * count) : 4096;
+        var length = (int)Math.Min(binary.RawLength - raw, maxBytes);
         var body = Decode(appContext, virtAddress, new BinarySlice(binary, (int)raw, length));
         var result = new List<ArmInstruction>();
         foreach (var instruction in body)

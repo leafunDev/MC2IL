@@ -35,6 +35,13 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
 
     public override (IReadOnlyList<ulong> DataReferences, IReadOnlyList<ulong> CallTargets)
         InspectPotentialThrowHelper(ApplicationAnalysisContext context, ulong address)
+        => InspectThrowHelper(context, address, straightLine: false);
+
+    internal static IReadOnlyList<ulong> GetStraightLineCallTargets(ApplicationAnalysisContext context, ulong address)
+        => InspectThrowHelper(context, address, straightLine: true).CallTargets;
+
+    private static (IReadOnlyList<ulong> DataReferences, IReadOnlyList<ulong> CallTargets)
+        InspectThrowHelper(ApplicationAnalysisContext context, ulong address, bool straightLine)
     {
         var data = new List<ulong>();
         var calls = new List<ulong>();
@@ -45,12 +52,23 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
             if (instruction.Id == ArmInstructionId.Invalid)
                 break;
             var operands = instruction.Details.Operands;
+            // A helper that can bypass a throw cannot be replaced with a terminator.
+            if (straightLine && (instruction.Details.ConditionCode is not (ArmConditionCode.ARM_CC_AL or ArmConditionCode.Invalid)
+                || instruction.Id is ArmInstructionId.ARM_INS_CBZ or ArmInstructionId.ARM_INS_CBNZ
+                    or ArmInstructionId.ARM_INS_BX or ArmInstructionId.ARM_INS_TBB or ArmInstructionId.ARM_INS_TBH
+                || operands.FirstOrDefault() is { Type: ArmOperandType.Register, Register.Name: "pc" }
+                || instruction.Mnemonic.StartsWith("ldm", StringComparison.Ordinal)
+                    && operands.Any(o => o is { Type: ArmOperandType.Register, Register.Name: "pc" })))
+                break;
+
             if (instruction.Id is ArmInstructionId.ARM_INS_BL or ArmInstructionId.ARM_INS_BLX or ArmInstructionId.ARM_INS_B
                 && operands.FirstOrDefault() is { Type: ArmOperandType.Immediate } target)
             {
                 var targetThumb = instruction.Id == ArmInstructionId.ARM_INS_BLX ? !thumb : thumb;
                 calls.Add((unchecked((uint)target.Immediate) & ~1U) | (targetThumb ? 1UL : 0));
             }
+            if (straightLine)
+                continue;
 
             var pc = unchecked((uint)((instruction.Address + (thumb ? 4 : 8)) & (thumb ? ~3L : ~0L)));
             if (operands.Length < 2 || operands[0].Type != ArmOperandType.Register)
@@ -177,7 +195,7 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                         if (dst.Name == "pc")
                         {
                             if (src is Register { Name: "lr" }) Return();
-                            else Add(OpCode.IndirectJump, src);
+                            else IndirectTailBranch(src);
                             return;
                         }
                         if (id == ArmInstructionId.ARM_INS_MOVT && src is Immediate upper)
@@ -250,7 +268,9 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                             Call((ulong)destination | (_thumb ? 1UL : 0));
                             Return();
                         }
-                        _constants.Clear();
+                        // Only a taken branch changes the instruction stream. Preserve values
+                        // on the straight-line fallthrough and reset them at branch targets.
+                        if (!conditional) _constants.Clear();
                         return;
                     }
                     break;
@@ -273,7 +293,7 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                     if (Read(0) is Register branch)
                     {
                         if (branch.Name == "lr") Return();
-                        else Add(OpCode.IndirectJump, branch);
+                        else IndirectTailBranch(branch);
                         _constants.Clear();
                         return;
                     }
@@ -532,6 +552,12 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
             if (callee?.IsVoid == true) call.ImplicitDefinition = Reg("r0");
             call.AddOperands(callee != null ? Convention.ResolveForCall(callee) : Convention.ResolveForUnmanaged(method.AppContext, address));
             InvalidateCall();
+        }
+
+        private void IndirectTailBranch(IOperand target)
+        {
+            Add(OpCode.IndirectJump, target, Reg("r0"))
+                .AddOperands(Convention.ResolveForUnmanaged(method.AppContext, 0));
         }
 
         private void InvalidateCall()

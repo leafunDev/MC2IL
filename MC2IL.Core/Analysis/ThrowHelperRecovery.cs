@@ -48,11 +48,17 @@ public static class ThrowHelperRecovery
         if (raise == 0)
             return false;
 
-        // grab the c++ exception raise method from the end of il2cpp::vm::Exception::Raise
-        var nativeThrow = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, raise).CallTargets.LastOrDefault();
-
-        // and then check if we're calling it
-        var result = nativeThrow != 0 && ReachesCall(appContext, address, nativeThrow, 0, []);
+        bool result;
+        if (appContext.InstructionSet is ArmV7InstructionSet)
+        {
+            result = ReachesCall(appContext, address, raise, 0, []);
+        }
+        else
+        {
+            // Some helpers go directly to the native throw routine instead of Exception::Raise.
+            var nativeThrow = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, raise).CallTargets.LastOrDefault();
+            result = nativeThrow != 0 && ReachesCall(appContext, address, nativeThrow, 0, []);
+        }
 
         appContext.ExceptionRaisersByAddress[address] = result;
         return result;
@@ -66,7 +72,9 @@ public static class ThrowHelperRecovery
         if (depth >= MaxRaiserDepth || !visited.Add(address))
             return false;
 
-        var (_, callTargets) = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, address);
+        var callTargets = appContext.InstructionSet is ArmV7InstructionSet
+            ? ArmV7InstructionSet.GetStraightLineCallTargets(appContext, address)
+            : appContext.InstructionSet.InspectPotentialThrowHelper(appContext, address).CallTargets;
 
         return callTargets.Any(target => ReachesCall(appContext, target, wanted, depth + 1, visited));
     }
