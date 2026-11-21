@@ -11,8 +11,9 @@ namespace MC2IL.Core.Analysis;
 /// <c>cmp</c>/<c>test</c> produces all of CF/OF/SF/ZF/PF plus scratch temporaries, but the branch
 /// that follows only consumes one of them.
 ///
-/// Uses a global count of reads, so a local with multiple definitions is eliminated only when
-/// none of its definitions are read anywhere. Instructions are turned into nops in place.
+/// Marks values reachable from observable instructions before pruning pure definitions. This
+/// removes dead phi/increment cycles as well as ordinary unused chains. Instructions are turned
+/// into nops in place.
 /// </summary>
 public static class DeadCodeEliminator
 {
@@ -23,56 +24,69 @@ public static class DeadCodeEliminator
     internal static void Run(ISILControlFlowGraph cfg, HashSet<Instruction>? discardableLoads,
         bool discardUnusedCallResults = false)
     {
-        var locals = new Dictionary<LocalVariable, LocalUsage>();
+        var removable = new HashSet<Instruction>();
+        var definitions = new Dictionary<LocalVariable, List<Instruction>>();
 
         foreach (var block in cfg.Blocks)
         {
             foreach (var instruction in block.Instructions)
             {
-                // Stores have a memory or field destination, so they never enter the index.
-                if ((IsRemovable(instruction) || discardableLoads?.Contains(instruction) == true)
-                    && instruction.Destination is LocalVariable destination)
+                if (!IsRemovable(instruction) && discardableLoads?.Contains(instruction) != true)
                 {
-                    locals.TryGetValue(destination, out var usage);
-                    if (usage.Definition == null)
-                        usage.Definition = instruction;
-                    else
-                        (usage.AdditionalDefinitions ??= []).Add(instruction);
-                    locals[destination] = usage;
+                    continue;
                 }
 
-                foreach (var used in UsedLocals(instruction))
+                removable.Add(instruction);
+                if (instruction.Destination is LocalVariable destination)
                 {
-                    locals.TryGetValue(used, out var usage);
-                    usage.Count++;
-                    locals[used] = usage;
+                    if (!definitions.TryGetValue(destination, out var writes))
+                        definitions[destination] = writes = [];
+                    writes.Add(instruction);
                 }
             }
         }
 
-        var pending = new Stack<LocalUsage>();
-        foreach (var usage in locals.Values)
-            if (usage.Definition != null && usage.Count == 0)
-                pending.Push(usage);
-
-        // Each removed instruction subtracts its own reads. When a count reaches zero, only
-        // that local's definitions need to be reconsidered.
-        while (pending.Count > 0)
+        var live = new HashSet<LocalVariable>();
+        var pending = new Stack<LocalVariable>();
+        foreach (var instruction in cfg.Instructions)
         {
-            var unused = pending.Pop();
-            RemoveDefinition(unused.Definition!);
-            if (unused.AdditionalDefinitions != null)
-                foreach (var definition in unused.AdditionalDefinitions)
-                    RemoveDefinition(definition);
+            if (removable.Contains(instruction))
+                continue;
+
+            foreach (var used in UsedLocals(instruction))
+                Keep(used);
         }
+
+        while (pending.Count != 0)
+        {
+            var local = pending.Pop();
+            if (!definitions.TryGetValue(local, out var writes))
+                continue;
+
+            foreach (var write in writes)
+                foreach (var used in UsedLocals(write))
+                    Keep(used);
+        }
+
+        foreach (var instruction in removable)
+            if (instruction.Destination is LocalVariable destination && !live.Contains(destination))
+            {
+                instruction.OpCode = OpCode.Nop;
+                instruction.SetOperands();
+            }
 
         if (discardUnusedCallResults)
         {
+            var usedLocals = new HashSet<LocalVariable>();
+            foreach (var instruction in cfg.Instructions)
+                foreach (var used in UsedLocals(instruction))
+                    usedLocals.Add(used);
+
             foreach (var block in cfg.Blocks)
             foreach (var instruction in block.Instructions)
             {
                 if (instruction is not { OpCode: OpCode.Call, Operands: [MethodAnalysisContext, LocalVariable result, ..] }
-                    || locals.TryGetValue(result, out var usage) && usage.Count != 0)
+                    || usedLocals.Contains(result))
                     continue;
 
                 // Preserve the call and its arguments. CallVoid tells IL generation to
@@ -82,27 +96,11 @@ public static class DeadCodeEliminator
             }
         }
 
-        void RemoveDefinition(Instruction instruction)
+        void Keep(LocalVariable local)
         {
-            foreach (var used in UsedLocals(instruction))
-            {
-                var usage = locals[used];
-                usage.Count--;
-                locals[used] = usage;
-                if (usage.Definition != null && usage.Count == 0)
-                    pending.Push(usage);
-            }
-
-            instruction.OpCode = OpCode.Nop;
-            instruction.SetOperands();
+            if (live.Add(local))
+                pending.Push(local);
         }
-    }
-
-    private struct LocalUsage
-    {
-        public int Count;
-        public Instruction? Definition;
-        public List<Instruction>? AdditionalDefinitions;
     }
 
     /// <summary>
