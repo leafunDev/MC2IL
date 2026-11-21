@@ -33,6 +33,22 @@ public class DllOutputTests
     }
 
     [Test]
+    public void DefaultOutputWritesMetadataCustomAttributesWithoutProcessingLayers()
+    {
+        var appContext = TestGameLoader.LoadSimple2022Game();
+        var assembly = new AsmResolverDllOutputFormatDefault().BuildAssemblies(appContext)
+            .Single(a => a.Name == "mscorlib");
+        using var stream = new MemoryStream();
+        assembly.WriteManifest(stream, new ManagedPEImageBuilder(ThrowErrorListener.Instance));
+        var module = ModuleDefinition.FromBytes(stream.ToArray());
+        var list = module.TopLevelTypes.Single(type => type.Namespace == "System.Collections.Generic" && type.Name == "List`1");
+        var display = list.CustomAttributes.Single(attribute =>
+            attribute.Constructor?.DeclaringType?.FullName == "System.Diagnostics.DebuggerDisplayAttribute");
+
+        Assert.That(display.Signature!.FixedArguments.Single().Element?.ToString(), Is.EqualTo("Count = {Count}"));
+    }
+
+    [Test]
     public void MscorlibIsItsOwnCorLib()
     {
         var appContext = TestGameLoader.LoadSimple2019Game();

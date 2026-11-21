@@ -228,6 +228,11 @@ public static class AsmResolverAssemblyPopulator
 
     private static void CopyCustomAttributes(HasCustomAttributes source, IList<CustomAttribute> destination)
     {
+        // Modern IL2CPP stores the complete attribute data in metadata. Recovered DLLs
+        // must include it even when no optional processing layers were requested.
+        if (source.CustomAttributes == null && source.AppContext.MetadataVersion >= 29)
+            source.AnalyzeCustomAttributeData();
+
         if (source.CustomAttributes == null)
             return;
 
@@ -266,10 +271,7 @@ public static class AsmResolverAssemblyPopulator
                     continue;
 
                 var managedType = type.GetExtraData<TypeDefinition>("AsmResolverType")!;
-                if (type.CustomAttributes == null)
-                    CopyIndexerDefaultMember(type, managedType);
-                else
-                    CopyCustomAttributes(type, managedType.CustomAttributes);
+                CopyCustomAttributes(type, managedType.CustomAttributes);
                 AddCompilerGeneratedMarkerIfNeeded(asmContext, type);
 
                 foreach (var method in type.Methods)
@@ -300,22 +302,6 @@ public static class AsmResolverAssemblyPopulator
             throw new($"Failed to populate custom attributes in {asmContext}", e);
         }
 #endif
-    }
-
-    private static void CopyIndexerDefaultMember(TypeAnalysisContext type, TypeDefinition managedType)
-    {
-        // The default DLL output does not run the attribute analysis processor. Since v29 the
-        // serialized attribute can be read directly; copy it so callers see obj[index].
-        if (type.AppContext.MetadataVersion < 29 || !managedType.Properties.Any(property =>
-                property.Signature is { HasThis: true, ParameterTypes.Count: > 0 }))
-            return;
-
-        type.AnalyzeCustomAttributeData();
-        var attribute = type.CustomAttributes?.FirstOrDefault(candidate =>
-            candidate.Constructor.DeclaringType?.FullName == "System.Reflection.DefaultMemberAttribute"
-            && candidate.IsSuitableForEmission);
-        if (attribute != null && ConvertCustomAttribute(attribute) is { } converted)
-            managedType.CustomAttributes.Add(converted);
     }
 
     private static void AddCompilerGeneratedMarkerIfNeeded(AssemblyAnalysisContext asmContext, TypeAnalysisContext typeContext)
