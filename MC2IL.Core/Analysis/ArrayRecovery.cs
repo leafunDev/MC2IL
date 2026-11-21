@@ -174,7 +174,7 @@ public static class ArrayRecovery
                     continue;
                 }
 
-                if (SplitArrayAddress(address, definitions, 0) is not { } split
+                if (SplitArrayAddress(address, definitions, pointerSize, 0) is not { } split
                     || ReferenceEquals(split.Array, address)
                     || split.Array.Type is not SzArrayTypeAnalysisContext { ElementType: var elementType }
                     || elementType is GenericParameterTypeAnalysisContext)
@@ -831,31 +831,33 @@ public static class ArrayRecovery
     }
 
     private static (LocalVariable Array, Affine Displacement)? SplitArrayAddress(
-        IOperand operand, Dictionary<LocalVariable, Instruction?> definitions, int depth)
+        IOperand operand, Dictionary<LocalVariable, Instruction?> definitions, int pointerSize, int depth)
     {
         if (depth > 8 || operand is not LocalVariable local)
             return null;
 
         definitions.TryGetValue(local, out var definition);
-        if (definition is { OpCode: OpCode.Add, OperandWidth: not 32, Operands: [_, var left, var right] })
+        if (definition is { OpCode: OpCode.Add, Operands: [_, var left, var right] }
+            && (pointerSize == 4 || definition.OperandWidth != 32))
             return ExtendAddress(left, right) ?? ExtendAddress(right, left);
         if (local.Type is SzArrayTypeAnalysisContext)
             return (local, new Affine(null, 0, 0));
-        return definition is { OpCode: OpCode.Move, OperandWidth: not 32, Operands: [_, LocalVariable source] }
-            ? SplitArrayAddress(source, definitions, depth + 1)
+        return definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] }
+            && (pointerSize == 4 || definition.OperandWidth != 32)
+            ? SplitArrayAddress(source, definitions, pointerSize, depth + 1)
             : null;
 
         (LocalVariable Array, Affine Displacement)? ExtendAddress(IOperand baseOperand, IOperand displacementOperand)
         {
-            if (SplitArrayAddress(baseOperand, definitions, depth + 1) is not { } arrayBase
-                || Sum(arrayBase.Displacement, ElementDisplacement(displacementOperand, definitions)) is not { } displacement)
+            if (SplitArrayAddress(baseOperand, definitions, pointerSize, depth + 1) is not { } arrayBase
+                || Sum(arrayBase.Displacement, ElementDisplacement(displacementOperand, definitions, pointerSize)) is not { } displacement)
                 return null;
 
             return (arrayBase.Array, displacement);
         }
     }
 
-    private static Affine? ElementDisplacement(IOperand operand, Dictionary<LocalVariable, Instruction?> definitions)
+    private static Affine? ElementDisplacement(IOperand operand, Dictionary<LocalVariable, Instruction?> definitions, int pointerSize)
     {
         if (operand is Immediate immediate)
             return new Affine(null, 0, immediate.Value);
@@ -864,8 +866,9 @@ public static class ArrayRecovery
 
         long multiplier = 1;
         if (definitions.TryGetValue(local, out var definition)
-            && definition is { OpCode: OpCode.ShiftLeft, OperandWidth: 64,
-                Operands: [_, LocalVariable unscaled, Immediate { Value: > 0 and < 32 } shift] })
+            && definition is { OpCode: OpCode.ShiftLeft,
+                Operands: [_, LocalVariable unscaled, Immediate { Value: > 0 and < 32 } shift] }
+            && (definition.OperandWidth == 64 || definition.OperandWidth == 32 && pointerSize == 4))
         {
             multiplier = 1L << (int)shift.Value;
             local = unscaled;

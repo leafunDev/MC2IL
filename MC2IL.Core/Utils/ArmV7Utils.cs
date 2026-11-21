@@ -1,5 +1,5 @@
+using System;
 using System.Collections.Generic;
-using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using Gee.External.Capstone;
 using Gee.External.Capstone.Arm;
@@ -9,85 +9,57 @@ namespace MC2IL.Core.Utils;
 
 public static class ArmV7Utils
 {
-    private static CapstoneArmDisassembler? _armDisassembler;
-
-    [MemberNotNull(nameof(_armDisassembler))]
-    private static void InitArmDecompilation()
-    {
-        var disassembler = CapstoneDisassembler.CreateArmDisassembler(ArmDisassembleMode.Arm);
-        disassembler.EnableInstructionDetails = true;
-        disassembler.EnableSkipDataMode = true;
-        disassembler.DisassembleSyntax = DisassembleSyntax.Intel;
-        _armDisassembler = disassembler;
-    }
-
     public static BinarySlice TryGetMethodBodyBytesFast(ApplicationAnalysisContext appContext, ulong virtAddress, bool isCAGen)
     {
         var binary = appContext.Binary;
-        var startOfNext = appContext.GetAddressOfNextFunctionStart(virtAddress);
-
-        var length = (startOfNext - virtAddress);
-        if (isCAGen && length > 50_000)
+        var start = virtAddress & ~1UL;
+        var end = appContext.GetAddressOfNextFunctionStart(virtAddress) & ~1UL;
+        if (end <= start || (isCAGen && end - start > 50_000)
+            || !binary.TryMapVirtualAddressToRaw(start, out var rawStart)
+            || !binary.TryMapVirtualAddressToRaw(end, out var rawEnd)
+            || rawStart < 0 || rawEnd <= rawStart || rawEnd > binary.RawLength
+            || (ulong)(rawEnd - rawStart) != end - start)
             return BinarySlice.Empty;
-
-        if (startOfNext <= 0)
-            //We have to fall through to default behavior for the last method because we cannot accurately pinpoint its end
-            return BinarySlice.Empty;
-
-        var rawStartOfNextMethod = binary.MapVirtualAddressToRaw(startOfNext);
-
-        var rawStart = binary.MapVirtualAddressToRaw(virtAddress);
-        if (rawStartOfNextMethod < rawStart)
-            rawStartOfNextMethod = binary.RawLength;
-
-        return new BinarySlice(binary, (int)rawStart, (int)(rawStartOfNextMethod - rawStart));
+        return new BinarySlice(binary, (int)rawStart, (int)(rawEnd - rawStart));
     }
 
-    public static List<ArmInstruction> GetArmV7MethodBodyAtVirtualAddress(ApplicationAnalysisContext appContext, ulong virtAddress, bool managed = true, int count = -1)
+    internal static List<ArmInstruction> Decode(ApplicationAnalysisContext app, ulong address, BinarySlice bytes)
     {
+        if (bytes.Length == 0)
+            return [];
+        var mode = (address & 1) == 0 ? ArmDisassembleMode.Arm : ArmDisassembleMode.Thumb;
+        if (app.Binary.IsBigEndian)
+            mode |= ArmDisassembleMode.BigEndian;
+        // Recovery is parallel; do not share Capstone's native handle between workers.
+        using var disassembler = CapstoneDisassembler.CreateArmDisassembler(mode);
+        disassembler.EnableInstructionDetails = true;
+        disassembler.EnableSkipDataMode = true;
+        return disassembler.Iterate(bytes.ToArray(), (long)(address & ~1UL)).ToList();
+    }
+
+    public static List<ArmInstruction> GetArmV7MethodBodyAtVirtualAddress(ApplicationAnalysisContext appContext,
+        ulong virtAddress, bool managed = true, int count = -1)
+    {
+        if (managed && TryGetMethodBodyBytesFast(appContext, virtAddress, false) is { Length: > 0 } slice)
+        {
+            var decoded = Decode(appContext, virtAddress, slice);
+            return count > 0 ? decoded.Take(count).ToList() : decoded;
+        }
+
         var binary = appContext.Binary;
-        if (_armDisassembler == null)
-            InitArmDecompilation();
-
-        //We can't use CppMethodBodyBytes to get the byte array, because ARMv7 doesn't have filler bytes like x86 does.
-        //So we can't work out the end of the method.
-        //But we can find the start of the next one! (If managed)
-        if (managed)
+        if (!binary.TryMapVirtualAddressToRaw(virtAddress & ~1UL, out var raw) || raw < 0 || raw >= binary.RawLength)
+            return [];
+        var length = (int)Math.Min(binary.RawLength - raw, 4096);
+        var body = Decode(appContext, virtAddress, new BinarySlice(binary, (int)raw, length));
+        var result = new List<ArmInstruction>();
+        foreach (var instruction in body)
         {
-            var startOfNext = appContext.GetAddressOfNextFunctionStart(virtAddress);
-
-            //We have to fall through to default behavior for the last method because we cannot accurately pinpoint its end
-            if (startOfNext > 0)
-            {
-                var rawStartOfNextMethod = binary.MapVirtualAddressToRaw(startOfNext);
-
-                var rawStart = binary.MapVirtualAddressToRaw(virtAddress);
-                if (rawStartOfNextMethod < rawStart)
-                    rawStartOfNextMethod = binary.RawLength;
-
-                var bytes = binary.GetRawBinaryContent()[(int)rawStart..(int)rawStartOfNextMethod];
-
-                var iter = _armDisassembler.Iterate(bytes.ToArray(), (long)virtAddress);
-                if (count > 0)
-                    iter = iter.Take(count);
-
-                return iter.ToList();
-            }
+            result.Add(instruction);
+            if (instruction.Mnemonic is "b" or "bx" or ".byte"
+                || instruction.Mnemonic == "pop" && instruction.Operand.Contains("pc")
+                || count > 0 && result.Count >= count)
+                break;
         }
-
-        //Unmanaged function, look for first b or bl
-        var pos = (int)binary.MapVirtualAddressToRaw(virtAddress);
-        var allBytes = binary.GetRawBinaryContent();
-        List<ArmInstruction> ret = [];
-
-        while (!ret.Any(i => i.Mnemonic is "b" or ".byte") && (count == -1 || ret.Count < count))
-        {
-            //All arm64 instructions are 4 bytes
-            ret.AddRange(_armDisassembler.Iterate(allBytes[pos..(pos + 4)].ToArray(), (long)virtAddress));
-            virtAddress += 4;
-            pos += 4;
-        }
-
-        return ret;
+        return result;
     }
 }

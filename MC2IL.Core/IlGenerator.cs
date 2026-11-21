@@ -8,6 +8,7 @@ using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using MC2IL.Core.Analysis;
 using MC2IL.Core.Graphs;
+using MC2IL.Core.InstructionSets;
 using MC2IL.Core.ISIL;
 using MC2IL.Core.Logging;
 using MC2IL.Core.Model.Contexts;
@@ -1836,7 +1837,11 @@ public static class IlGenerator
                     && (IsBoolean(leftOperand) || IsBoolean(rightOperand))
                     && IsBooleanOrBooleanConstant(leftOperand)
                     && IsBooleanOrBooleanConstant(rightOperand);
-                var apply32BitIntegerWidth = instruction.OperandWidth == 32 && !isBooleanLogic && !isFloatComparison;
+                var isManagedReferenceEquality = isReferenceEquality && context.AppContext.InstructionSet is ArmV7InstructionSet
+                    && (ReferenceComparisonType(leftOperand) != null || IsZeroConstant(leftOperand))
+                    && (ReferenceComparisonType(rightOperand) != null || IsZeroConstant(rightOperand));
+                var apply32BitIntegerWidth = instruction.OperandWidth == 32
+                    && !isBooleanLogic && !isFloatComparison && !isManagedReferenceEquality;
                 var comparisonType = isComparison
                     ? IntegerOperandType(OperandType(leftOperand) ?? OperandType(rightOperand))
                     : null;
