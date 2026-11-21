@@ -1379,6 +1379,9 @@ public static class IlGenerator
                                 instructions.Add(CilOpCodes.Conv_I4);
                                 break;
                             case NumericConversionKind.I64ExtendI32Signed:
+                                // ARM64 W registers share storage with X registers in ISIL.
+                                // Narrow first so stale upper bits cannot change the sign.
+                                instructions.Add(CilOpCodes.Conv_I4);
                                 instructions.Add(CilOpCodes.Conv_I8);
                                 break;
                             case NumericConversionKind.I64ExtendI32Unsigned:

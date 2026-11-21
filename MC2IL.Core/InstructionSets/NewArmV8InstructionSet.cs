@@ -562,11 +562,6 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
         {
             case Arm64Mnemonic.MOV:
             case Arm64Mnemonic.MOVZ:
-            case Arm64Mnemonic.SXTB:
-            case Arm64Mnemonic.SXTH:
-            case Arm64Mnemonic.SXTW:
-            case Arm64Mnemonic.UXTB:
-            case Arm64Mnemonic.UXTH:
                 if (instruction.Op0Kind == Arm64OperandKind.Register && IsReg31(instruction.Op0Reg))
                 {
                     Add(address, OpCode.Nop); // write to xzr, discard
@@ -574,6 +569,33 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                 }
 
                 Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                break;
+            case Arm64Mnemonic.SXTB:
+            case Arm64Mnemonic.SXTH:
+            case Arm64Mnemonic.SXTW:
+                {
+                    if (DiscardZeroRegisterDestination())
+                        break;
+
+                    // These aliases of SBFM extend the low source bits, even when the
+                    // normalized X register still carries unrelated bits above them.
+                    var wide = instruction.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X31;
+                    var kind = instruction.Mnemonic switch
+                    {
+                        Arm64Mnemonic.SXTB => wide ? NumericConversionKind.I64Extend8Signed : NumericConversionKind.I32Extend8Signed,
+                        Arm64Mnemonic.SXTH => wide ? NumericConversionKind.I64Extend16Signed : NumericConversionKind.I32Extend16Signed,
+                        _ => NumericConversionKind.I64ExtendI32Signed,
+                    };
+                    Add(address, OpCode.Convert, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), new NumericConversion(kind));
+                    break;
+                }
+            case Arm64Mnemonic.UXTB:
+            case Arm64Mnemonic.UXTH:
+                if (DiscardZeroRegisterDestination())
+                    break;
+
+                Add(address, OpCode.And, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1),
+                    Imm(instruction.Mnemonic == Arm64Mnemonic.UXTB ? 0xFF : 0xFFFF)).OperandWidth = 32;
                 break;
             case Arm64Mnemonic.FMOV:
                 if (DiscardZeroRegisterDestination())
