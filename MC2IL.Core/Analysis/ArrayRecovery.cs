@@ -159,9 +159,22 @@ public static class ArrayRecovery
                     continue;
                 }
 
-                if (!isMemoryMove
-                    || memory.Base is not LocalVariable address
-                    || SplitArrayAddress(address, definitions, 0) is not { } split
+                if (!isMemoryMove || memory.Base is not LocalVariable address)
+                    continue;
+
+                if (TryRecoverShiftedLoopArrayAccess(method, address, memory, instruction, cfg, instructions,
+                    definitions, ref dominators) is { } recoveredAccess)
+                {
+                    instruction.SetOperand(i, recoveredAccess);
+                    if (instruction.OpCode == OpCode.Move && i == 1
+                        && instruction.Destination is LocalVariable shiftedDestination)
+                        LocalVariables.PropagateProducedType(shiftedDestination, recoveredAccess.Array.Type is
+                            SzArrayTypeAnalysisContext shiftedArrayType ? shiftedArrayType.ElementType : null);
+                    changed = true;
+                    continue;
+                }
+
+                if (SplitArrayAddress(address, definitions, 0) is not { } split
                     || ReferenceEquals(split.Array, address)
                     || split.Array.Type is not SzArrayTypeAnalysisContext { ElementType: var elementType }
                     || elementType is GenericParameterTypeAnalysisContext)
@@ -214,6 +227,97 @@ public static class ArrayRecovery
         LocalVariables.ResolveTypesAndFields(method);
     }
 
+    private static ArrayAccess? TryRecoverShiftedLoopArrayAccess(MethodAnalysisContext method,
+        LocalVariable address, MemoryOperand memory, Instruction access, ISILControlFlowGraph cfg,
+        List<Instruction> instructions, Dictionary<LocalVariable, Instruction?> definitions,
+        ref DominatorInfo? dominators)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        if (memory.Index != null || memory.Scale != 0)
+            return null;
+
+        foreach (var (arrayOperand, displacementOperand) in definitions.TryGetValue(address, out var addressDefinition)
+            && addressDefinition is { OpCode: OpCode.Add, Operands: [_, var left, var right] }
+                ? new[] { (left, right), (right, left) }
+                : Array.Empty<(IOperand, IOperand)>())
+        {
+            if (arrayOperand is not LocalVariable array
+                || ResolveArrayType(array, definitions, [], 0) is not { } arrayType
+                || memory.Addend != ElementsOffset(pointerSize)
+                || displacementOperand is not LocalVariable scaledOffset
+                || !definitions.TryGetValue(scaledOffset, out var shift)
+                || shift is not { OpCode: OpCode.ShiftRight, OperandWidth: 64,
+                    Operands: [_, LocalVariable encodedCounter, Immediate { Value: > 0 and < 63 } shiftAmount] }
+                || !definitions.TryGetValue(encodedCounter, out var encodedPhi)
+                || encodedPhi is not { OpCode: OpCode.Phi, Operands.Count: 3 }
+                || cfg.FindBlockByInstruction(encodedPhi) is not { } loopHeader)
+                continue;
+
+            var stride = ElementSize(arrayType.ElementType, pointerSize);
+            if (stride <= 0)
+                continue;
+
+            var encodedSeed = encodedPhi.Operands[1];
+            var encodedNext = encodedPhi.Operands[2];
+            var encodedBackEdge = encodedSeed is Immediate { Value: 0 } ? encodedNext as LocalVariable
+                : encodedNext is Immediate { Value: 0 } ? encodedSeed as LocalVariable : null;
+            if (encodedBackEdge == null || !definitions.TryGetValue(encodedBackEdge, out var encodedIncrement)
+                || encodedIncrement is not { OpCode: OpCode.Add, Operands.Count: 3 }
+                || !IsScaledIncrement(encodedIncrement, encodedBackEdge, encodedCounter, stride, (int)shiftAmount.Value)
+                || cfg.FindBlockByInstruction(encodedIncrement) is not { } incrementBlock)
+                continue;
+
+            foreach (var entry in definitions)
+            {
+                var candidate = entry.Key;
+                var phi = entry.Value;
+                if (phi is not { OpCode: OpCode.Phi, Operands.Count: 3 }
+                    || candidate.Type?.FullName != "System.Int32"
+                    || cfg.FindBlockByInstruction(phi) != loopHeader)
+                    continue;
+
+                var seed = phi.Operands[1];
+                var next = phi.Operands[2];
+                var backEdge = seed is Immediate { Value: 0 } ? next as LocalVariable
+                    : next is Immediate { Value: 0 } ? seed as LocalVariable : null;
+                if (backEdge == null || !definitions.TryGetValue(backEdge, out var increment)
+                    || increment is not { OpCode: OpCode.Add, Operands.Count: 3 }
+                    || !IsIncrementOf(increment, candidate)
+                    || cfg.FindBlockByInstruction(increment) != incrementBlock
+                    || !IsCheckedArrayIndex(candidate, array, pointerSize, access, cfg, instructions,
+                        definitions, requireInt32: false, ref dominators, requireUnsigned: true))
+                    continue;
+
+                return new ArrayAccess(array, candidate);
+            }
+        }
+
+        return null;
+
+        static bool IsScaledIncrement(Instruction increment, LocalVariable destination, LocalVariable source,
+            long stride, int shift)
+        {
+            if (increment.Destination != destination || increment.Operands.Count != 3)
+                return false;
+
+            Immediate? step = null;
+            if (ReferenceEquals(increment.Operands[1], source)
+                && increment.Operands[2] is Immediate addRight)
+                step = addRight;
+            else if (ReferenceEquals(increment.Operands[2], source)
+                && increment.Operands[1] is Immediate addLeft)
+                step = addLeft;
+            try
+            {
+                return step?.Value == checked(stride * (1L << shift));
+            }
+            catch (OverflowException)
+            {
+                return false;
+            }
+        }
+    }
+
     private static void TypeBoundedLoopIndices(MethodAnalysisContext method, ISILControlFlowGraph cfg,
         Dictionary<LocalVariable, Instruction?> definitions, ref DominatorInfo? dominators)
     {
@@ -262,7 +366,9 @@ public static class ArrayRecovery
             // register: the back-edge increments only after i < array.Length. The
             // array check can be inside a loop whose exit tests a different bound.
             if (TryTypeIndex(firstInput, secondInput, firstPredecessor, secondPredecessor)
-                || TryTypeIndex(secondInput, firstInput, secondPredecessor, firstPredecessor))
+                || TryTypeIndex(secondInput, firstInput, secondPredecessor, firstPredecessor)
+                || HasPositiveCountBoundedIndex(index, firstInput, secondInput, header,
+                    cfg.Instructions, cfg, definitions, dominance))
                 index.Type = int32;
 
             bool TryTypeIndex(IOperand seed, IOperand backEdge, Block seedBlock, Block latch)
@@ -283,6 +389,107 @@ public static class ArrayRecovery
         }
     }
 
+    private static bool HasPositiveCountBoundedIndex(LocalVariable index, IOperand firstInput, IOperand secondInput,
+        Block header, List<Instruction> instructions, ISILControlFlowGraph cfg,
+        Dictionary<LocalVariable, Instruction?> definitions, DominatorInfo dominators)
+    {
+        var backEdge = firstInput is Immediate { Value: 0 } ? secondInput as LocalVariable
+            : secondInput is Immediate { Value: 0 } ? firstInput as LocalVariable : null;
+        if (backEdge == null || !definitions.TryGetValue(backEdge, out var increment)
+            || increment is not { OpCode: OpCode.Add, Operands.Count: 3 }
+            || !IsIncrementOf(increment, index)
+            || cfg.FindBlockByInstruction(increment) is not { } incrementBlock)
+            return false;
+
+        foreach (var branch in instructions)
+        {
+            if (branch is not { OpCode: OpCode.ConditionalJump, Operands: [Block taken, LocalVariable condition] }
+                || !TryComparison(condition, out var comparison)
+                || comparison is not { OpCode: OpCode.CheckNotEqual, Operands.Count: 3 })
+                continue;
+
+            var bound = ReferenceEquals(comparison.Operands[1], backEdge)
+                ? comparison.Operands[2] as LocalVariable
+                : ReferenceEquals(comparison.Operands[2], backEdge) ? comparison.Operands[1] as LocalVariable : null;
+            if (bound?.Type?.FullName != "System.Int32"
+                || cfg.FindBlockByInstruction(branch) is not { } loopCheck
+                || !IsBeforeCheck(increment, comparison, incrementBlock, loopCheck))
+                continue;
+
+            var exitBlock = loopCheck.Successors.FirstOrDefault(block => block != taken);
+            if (exitBlock == null || !CanReach(taken, incrementBlock) || CanReach(exitBlock, incrementBlock))
+                continue;
+
+            foreach (var precondition in instructions)
+            {
+                if (precondition is not { OpCode: OpCode.ConditionalJump,
+                        Operands: [Block preconditionTaken, LocalVariable preconditionCondition] }
+                    || !TryComparison(preconditionCondition, out var positivity)
+                    || positivity is not { Operands.Count: 3 })
+                    continue;
+
+                var hasPositiveBound = positivity.OpCode switch
+                {
+                    OpCode.CheckLess or OpCode.CheckLessUnsigned =>
+                        ReferenceEquals(positivity.Operands[1], bound)
+                        && positivity.Operands[2] is Immediate { Value: 1 },
+                    OpCode.CheckGreaterOrEqual or OpCode.CheckGreaterOrEqualUnsigned =>
+                        ReferenceEquals(positivity.Operands[1], bound)
+                        && positivity.Operands[2] is Immediate { Value: 1 },
+                    _ => false,
+                };
+                if (!hasPositiveBound || cfg.FindBlockByInstruction(precondition) is not { } preconditionBlock)
+                    continue;
+
+                var positiveBlock = positivity.OpCode is OpCode.CheckLess or OpCode.CheckLessUnsigned
+                    ? preconditionBlock.Successors.FirstOrDefault(block => block != preconditionTaken)
+                    : preconditionTaken;
+                var nonPositiveBlock = preconditionBlock.Successors.FirstOrDefault(block => block != positiveBlock);
+                if (positiveBlock?.Predecessors is not [var predecessor] || predecessor != preconditionBlock
+                    || nonPositiveBlock == null || CanReach(nonPositiveBlock, incrementBlock)
+                    || !dominators.Dominates(positiveBlock, header)
+                    || !dominators.Dominates(positiveBlock, incrementBlock))
+                    continue;
+
+                backEdge.Type = index.Type ?? bound.Type;
+                return true;
+            }
+        }
+
+        return false;
+
+        bool TryComparison(LocalVariable condition, out Instruction comparison)
+        {
+            comparison = null!;
+            return definitions.TryGetValue(condition, out var definition) && definition != null
+                && (comparison = definition) != null;
+        }
+
+        bool IsBeforeCheck(Instruction earlier, Instruction later, Block earlierBlock, Block laterBlock)
+        {
+            if (earlierBlock != laterBlock)
+                return dominators.Dominates(earlierBlock, laterBlock);
+            return earlierBlock.Instructions.IndexOf(earlier) < earlierBlock.Instructions.IndexOf(later);
+        }
+
+        bool CanReach(Block start, Block target)
+        {
+            var pending = new Stack<Block>();
+            var visited = new HashSet<Block>();
+            pending.Push(start);
+            while (pending.Count != 0)
+            {
+                var current = pending.Pop();
+                if (current == target)
+                    return true;
+                if (!visited.Add(current))
+                    continue;
+                foreach (var successor in current.Successors)
+                    pending.Push(successor);
+            }
+            return false;
+        }
+    }
     private static LocalVariable? FindEquivalentCheckedIndex(LocalVariable index, LocalVariable array, int pointerSize,
         Instruction access, ISILControlFlowGraph cfg, List<Instruction> instructions,
         Dictionary<LocalVariable, Instruction?> definitions, ref DominatorInfo? dominators)
@@ -308,7 +515,7 @@ public static class ArrayRecovery
             dominators ??= new DominatorInfo(cfg);
             if (dominators.Dominates(equal, accessBlock)
                 && IsCheckedArrayIndex(equivalent, array, pointerSize, access, cfg, instructions, definitions,
-                    requireInt32: true, ref dominators))
+                    requireInt32: equivalent.Type?.FullName != "System.Int32", ref dominators))
                 return equivalent;
         }
         return null;
@@ -507,7 +714,8 @@ public static class ArrayRecovery
 
     private static bool IsCheckedArrayIndex(LocalVariable candidate, LocalVariable array, int pointerSize,
         Instruction access, ISILControlFlowGraph cfg, List<Instruction> instructions,
-        Dictionary<LocalVariable, Instruction?> definitions, bool requireInt32, ref DominatorInfo? dominators)
+        Dictionary<LocalVariable, Instruction?> definitions, bool requireInt32, ref DominatorInfo? dominators,
+        bool requireUnsigned = false)
     {
         var accessBlock = cfg.FindBlockByInstruction(access);
         if (accessBlock == null)
@@ -538,6 +746,8 @@ public static class ArrayRecovery
             }
 
             if (comparison is not { Operands.Count: >= 3 }
+                || requireUnsigned && comparison.OpCode is not (OpCode.CheckGreaterUnsigned or OpCode.CheckLessUnsigned
+                    or OpCode.CheckGreaterOrEqualUnsigned or OpCode.CheckLessOrEqualUnsigned)
                 || requireInt32 && comparison.OperandWidth != 32
                 || !TryGetInRangeTruth(comparison, candidate, array, pointerSize, definitions, out var trueIsInRange))
                 continue;
