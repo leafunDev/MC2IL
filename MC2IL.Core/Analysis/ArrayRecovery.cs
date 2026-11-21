@@ -219,19 +219,19 @@ public static class ArrayRecovery
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
         var int32 = method.AppContext.SystemTypes.SystemInt32Type;
-        foreach (var header in cfg.Blocks)
+        foreach (var guard in cfg.Blocks)
         {
-            if (header.Predecessors is not [var firstPredecessor, var secondPredecessor]
-                || header.Successors is not [var firstSuccessor, var secondSuccessor]
-                || header.Instructions.LastOrDefault() is not
+            if (guard.Successors is not [var firstSuccessor, var secondSuccessor]
+                || guard.Instructions.LastOrDefault() is not
                     { OpCode: OpCode.ConditionalJump, Operands: [Block taken, LocalVariable condition] }
                 || taken != firstSuccessor && taken != secondSuccessor
                 || !definitions.TryGetValue(condition, out var comparison)
-                || comparison is not { OpCode: OpCode.CheckGreaterOrEqual or OpCode.CheckLess,
+                || comparison is not { OpCode: OpCode.CheckGreaterOrEqual or OpCode.CheckLess
+                    or OpCode.CheckGreaterOrEqualUnsigned or OpCode.CheckLessUnsigned,
                     Operands: [_, LocalVariable { Type: null } index, var length] }
                 || !definitions.TryGetValue(index, out var phi)
                 || phi is not { OpCode: OpCode.Phi, Operands: [_, var firstInput, var secondInput] }
-                || !header.Instructions.Contains(phi))
+                || cfg.FindBlockByInstruction(phi) is not { Predecessors: [var firstPredecessor, var secondPredecessor] } header)
                 continue;
 
             var array = length switch
@@ -250,14 +250,17 @@ public static class ArrayRecovery
             if (array == null || ResolveArrayType(array, definitions, [], 0) == null)
                 continue;
 
-            var inRange = comparison.OpCode == OpCode.CheckLess
+            var inRange = comparison.OpCode is OpCode.CheckLess or OpCode.CheckLessUnsigned
                 ? taken : taken == firstSuccessor ? secondSuccessor : firstSuccessor;
-            if (inRange.Predecessors is not [var previous] || previous != header)
+            if (inRange.Predecessors is not [var previous] || previous != guard)
                 continue;
             var dominance = dominators ??= new DominatorInfo(cfg);
+            if (!dominance.Dominates(header, guard))
+                continue;
 
             // The native counter remains in Int32 range even if it uses a 64-bit
-            // register: the back-edge increments only after i < array.Length.
+            // register: the back-edge increments only after i < array.Length. The
+            // array check can be inside a loop whose exit tests a different bound.
             if (TryTypeIndex(firstInput, secondInput, firstPredecessor, secondPredecessor)
                 || TryTypeIndex(secondInput, firstInput, secondPredecessor, firstPredecessor))
                 index.Type = int32;
@@ -269,8 +272,9 @@ public static class ArrayRecovery
                     || !definitions.TryGetValue(next, out var increment)
                     || increment is not { OpCode: OpCode.Add, Operands.Count: 3 }
                     || !IsIncrementOf(increment, index)
-                    || !latch.Instructions.Contains(increment)
-                    || dominance.Dominates(header, seedBlock) || !dominance.Dominates(inRange, latch))
+                    || cfg.FindBlockByInstruction(increment) is not { } incrementBlock
+                    || !dominance.Dominates(incrementBlock, latch)
+                    || dominance.Dominates(header, seedBlock) || !dominance.Dominates(inRange, incrementBlock))
                     return false;
 
                 next.Type = int32;

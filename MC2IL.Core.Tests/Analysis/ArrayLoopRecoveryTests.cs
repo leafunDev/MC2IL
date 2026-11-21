@@ -82,6 +82,59 @@ public class ArrayLoopRecoveryTests
         }
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public void UsesUnsignedBoundsCheckInsideLoopOnlyIfItGuardsIncrement(bool bypassCheck)
+    {
+        var app = MC2ILApi.CurrentAppContext!;
+        var types = app.SystemTypes;
+        var array = Local("array", new SzArrayTypeAnalysisContext(types.SystemStringType));
+        var method = new InjectedMethodAnalysisContext(types.SystemObjectType, "PostTestLoop", types.SystemVoidType,
+            MethodAttributes.Static, []);
+        var index = Local("index");
+        var nextIndex = Local("nextIndex");
+        var length = Local("length");
+        var tooLarge = Local("tooLarge", types.SystemBooleanType);
+        var repeat = Local("repeat", types.SystemBooleanType);
+        var offset = Local("offset", types.SystemInt64Type);
+        var address = Local("address");
+        var element = Local("element");
+        var pointerSize = app.Binary.PointerSizeBytes;
+        var exit = new Instruction(13, OpCode.Return);
+        var headerEntry = new Instruction(1, OpCode.CallVoid, Str("BeforeCheck"));
+        var increment = new Instruction(10, OpCode.Add, nextIndex, index, Imm(1)) { OperandWidth = 32 };
+        var load = new Instruction(8, OpCode.Move, element, new MemoryOperand(address, addend: 4 * pointerSize))
+            { MemoryAccessSize = pointerSize };
+        var cfg = new ISILControlFlowGraph([
+            new(0, OpCode.Jump, headerEntry),
+            headerEntry,
+            bypassCheck ? new(2, OpCode.ConditionalJump, increment, Local("skipLoad", types.SystemBooleanType))
+                : new(2, OpCode.ConditionalJump, exit, Local("earlyExit", types.SystemBooleanType)),
+            new(3, OpCode.Move, length, new ArrayLength(array)),
+            new(4, OpCode.CheckGreaterOrEqualUnsigned, tooLarge, index, length) { OperandWidth = 32 },
+            new(5, OpCode.ConditionalJump, exit, tooLarge),
+            new(6, OpCode.ShiftLeft, offset, index, Imm(pointerSize == 8 ? 3 : 2)) { OperandWidth = 64 },
+            new(7, OpCode.Add, address, array, offset),
+            load,
+            new(9, OpCode.CallVoid, Str("Consume"), element),
+            increment,
+            new(11, OpCode.CheckNotEqual, repeat, nextIndex, Local("count", types.SystemInt32Type)),
+            new(12, OpCode.ConditionalJump, headerEntry, repeat),
+            exit,
+        ]);
+        var header = cfg.FindBlockByInstruction(headerEntry)!;
+        var phi = new Instruction(-1, OpCode.Phi, index);
+        phi.AddOperands(header.Predecessors.Select(p => p.Instructions.Contains(increment) ? (IOperand)nextIndex : Imm(0)));
+        header.Instructions.Insert(0, phi);
+        method.ControlFlowGraph = cfg;
+
+        ArrayRecovery.RecoverSplitElementAccesses(method);
+
+        Assert.That(index.Type, Is.SameAs(bypassCheck ? null : types.SystemInt32Type));
+        Assert.That(nextIndex.Type, Is.SameAs(bypassCheck ? null : types.SystemInt32Type));
+        Assert.That(load.Operands[1], Is.TypeOf(bypassCheck ? typeof(MemoryOperand) : typeof(ArrayAccess)));
+    }
+
     private static LocalVariable Local(string name, TypeAnalysisContext? type = null) =>
         new(name, new Register(null, name), type);
 }
