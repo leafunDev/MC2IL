@@ -101,6 +101,18 @@ Both commands write only `strings.txt` in the output directory. A package or gam
 
 MC2IL can load third-party plugin DLLs from `Plugins` beside the executable or in the current directory. Use `--plugins-dir` to select another folder. Plugins can add processing layers and output formats through `MC2IL.Core`; see the [plugin guide](docs/PLUGINS.md) and the [Mirror serializer discovery template](PluginTemplates/MirrorSerializerDiscovery).
 
+### Mirror serialization recovery
+
+The [Mirror Serialized Recovery plugin](Plugins/MC2IL.MirrorSerializedRecovery.dll) exports C# scripts with Mirror-generated serialization and network dispatch members moved into partial sidecar files. The DLL is self-contained: copy this one file into `Plugins` beside `MC2IL.exe`, or pass its folder to `--plugins-dir`. No separate Roslyn DLLs are needed.
+
+Confirm that MC2IL loaded the plugin:
+
+    MC2IL.exe --plugins-dir "C:\MC2IL\Plugins" --list-output-formats
+
+Use its output format when decompiling:
+
+    MC2IL.exe --plugins-dir "C:\MC2IL\Plugins" --game-path "C:\Games\Oxide.apk" --output-as mirror-serialized-recovery --output-to "C:\Games\Oxide-clean"
+
 ## Project map
 
 | Project | Role |
