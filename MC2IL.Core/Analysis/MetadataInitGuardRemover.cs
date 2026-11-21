@@ -49,7 +49,7 @@ public static class MetadataInitGuardRemover
             : Array.Empty<long>();
         if (supportsClassReloads)
             RemoveArm64ClassMetadataGuards(method, cfg);
-        Run(cfg, flagOffsets, keepBareCalls: supportsClassReloads);
+        Run(cfg, flagOffsets, keepBareCalls: supportsClassReloads, dominance: method.DominatorInfo);
     }
 
     // The ARM64 metadata initialization slow path returns the same Il2CppClass*
@@ -301,12 +301,17 @@ public static class MetadataInitGuardRemover
         => Run(cfg, [initialisedFlagOffset]);
 
     private static void Run(ISILControlFlowGraph cfg, IReadOnlyCollection<long> initialisedFlagOffsets,
-        bool keepBareCalls = false)
+        bool keepBareCalls = false, DominatorInfo? dominance = null)
     {
         var definitions = new Dictionary<LocalVariable, Instruction>();
+        HashSet<LocalVariable>? redefined = null;
         foreach (var instruction in cfg.Instructions)
             if (instruction.Destination is LocalVariable destination)
+            {
+                if (definitions.ContainsKey(destination))
+                    (redefined ??= []).Add(destination);
                 definitions[destination] = instruction;
+            }
 
         var removedAny = false;
         var discardedGuardLoads = new HashSet<Instruction>();
@@ -316,7 +321,7 @@ public static class MetadataInitGuardRemover
         {
             var established = keepBareCalls && MatchCctorGuard(guard, definitions) is { } match
                 && match.Slow.Successors is [var continuation] && continuation == match.Fast ? match : null;
-            if (!TryRemoveGuard(cfg, guard, initialisedFlagOffsets, definitions, discardedGuardLoads))
+            if (!TryRemoveGuard(cfg, guard, initialisedFlagOffsets, definitions, discardedGuardLoads, IsInitializedFlagValue))
                 continue;
             removedAny = true;
             if (established is { } proof && guard.Successors is [var remaining] && remaining == proof.Fast
@@ -331,6 +336,30 @@ public static class MetadataInitGuardRemover
 
         if (removedAny)
             DeadCodeEliminator.Run(cfg, discardedGuardLoads);
+
+        bool IsInitializedFlagValue(Block block, int before, IOperand value)
+        {
+            // An SSA definition can dominate the store even if the intervening path contains
+            // joins or back-edges. Order still matters for copies in the same block.
+            for (var remaining = 16; value is LocalVariable local; remaining--)
+            {
+                if (remaining == 0 || redefined?.Contains(local) == true
+                    || !definitions.TryGetValue(local, out var definition)
+                    || definition is not { OpCode: OpCode.Move, Operands: [LocalVariable, var source] }
+                    || cfg.FindBlockByInstruction(definition) is not { } definitionBlock)
+                    return false;
+
+                var index = definitionBlock.Instructions.IndexOf(definition);
+                if (definitionBlock == block ? index >= before
+                    : !(dominance ??= new DominatorInfo(cfg)).Dominates(definitionBlock, block))
+                    return false;
+
+                block = definitionBlock;
+                before = index;
+                value = source;
+            }
+            return value is Immediate { Value: 1 };
+        }
     }
 
     private sealed record CctorGuard(TypeAnalysisContext Type, Instruction FlagLoad,
@@ -642,7 +671,7 @@ public static class MetadataInitGuardRemover
 
     private static bool TryRemoveGuard(ISILControlFlowGraph cfg, Block guard,
         IReadOnlyCollection<long> initialisedFlagOffsets, IReadOnlyDictionary<LocalVariable, Instruction> definitions,
-        HashSet<Instruction> discardedGuardLoads)
+        HashSet<Instruction> discardedGuardLoads, Func<Block, int, IOperand, bool> isInitializedFlagValue)
     {
         if (guard.BlockType != BlockType.TwoWay || guard.Successors.Count != 2
             || guard.Instructions.Count == 0 || guard.Instructions[^1].OpCode != OpCode.ConditionalJump)
@@ -660,10 +689,10 @@ public static class MetadataInitGuardRemover
 
         Block initEntry;
         HashSet<Block> region;
-        if (TryCollectRegion(cfg, guard, first, second, false, metadataFlagAddress, out region)
+        if (TryCollectRegion(cfg, guard, first, second, false, metadataFlagAddress, isInitializedFlagValue, out region)
             && IsRecognizedInitializationRegion(region, hasKnownClassInitFlag, metadataFlagAddress.HasValue))
             initEntry = first;
-        else if (TryCollectRegion(cfg, guard, second, first, false, metadataFlagAddress, out region)
+        else if (TryCollectRegion(cfg, guard, second, first, false, metadataFlagAddress, isInitializedFlagValue, out region)
             && IsRecognizedInitializationRegion(region, hasKnownClassInitFlag, metadataFlagAddress.HasValue))
             initEntry = second;
         else
@@ -766,9 +795,9 @@ public static class MetadataInitGuardRemover
     }
 
     private static bool TryExcise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge,
-        bool allowMetadataInitWithoutStore, out HashSet<Block> region, long? metadataFlagAddress = null)
+        bool allowMetadataInitWithoutStore, out HashSet<Block> region)
     {
-        if (!TryCollectRegion(cfg, guard, initEntry, merge, allowMetadataInitWithoutStore, metadataFlagAddress, out region))
+        if (!TryCollectRegion(cfg, guard, initEntry, merge, allowMetadataInitWithoutStore, null, null, out region))
             return false;
 
         Excise(cfg, guard, initEntry, merge, region);
@@ -776,7 +805,8 @@ public static class MetadataInitGuardRemover
     }
 
     private static bool TryCollectRegion(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge,
-        bool allowMetadataInitWithoutStore, long? metadataFlagAddress, out HashSet<Block> region)
+        bool allowMetadataInitWithoutStore, long? metadataFlagAddress, Func<Block, int, IOperand, bool>? isInitializedFlagValue,
+        out HashSet<Block> region)
     {
         region = [];
 
@@ -808,7 +838,8 @@ public static class MetadataInitGuardRemover
             if (!region.Add(block))
                 continue;
 
-            if (!ClassifyBlock(block, metadataFlagAddress, ref sawMetadataInit, ref sawClassInit, ref sawFlagStore))
+            if (!ClassifyBlock(block, metadataFlagAddress, isInitializedFlagValue,
+                    ref sawMetadataInit, ref sawClassInit, ref sawFlagStore))
                 return false;
 
             foreach (var successor in block.Successors)
@@ -918,7 +949,8 @@ public static class MetadataInitGuardRemover
     // call, the flag store, or otherwise side-effect-free (writes a local, not memory). A managed call
     // or any other store would have an effect we cannot silently drop, so it disqualifies the region.
     private static bool ClassifyBlock(Block block, long? metadataFlagAddress,
-        ref bool sawMetadataInit, ref bool sawClassInit, ref bool sawFlagStore)
+        Func<Block, int, IOperand, bool>? isInitializedFlagValue, ref bool sawMetadataInit, ref bool sawClassInit,
+        ref bool sawFlagStore)
     {
         for (var index = 0; index < block.Instructions.Count; index++)
         {
@@ -943,7 +975,7 @@ public static class MetadataInitGuardRemover
 
                 case OpCode.Move when instruction.Operands is [MemoryOperand { IsConstant: true } flag, var value]
                     && metadataFlagAddress == flag.Addend
-                    && IsInitializedFlagValue(block, index, value):
+                    && isInitializedFlagValue?.Invoke(block, index, value) == true:
                     sawFlagStore = true;
                     break;
 
@@ -955,38 +987,6 @@ public static class MetadataInitGuardRemover
         }
 
         return true;
-    }
-
-    private static bool IsInitializedFlagValue(Block block, int before, IOperand value)
-    {
-        if (value is not LocalVariable)
-            return value is Immediate { Value: 1 };
-
-        // A compiler can load the flag byte's value into a callee-saved register
-        // before the guard. Walk back through unique incoming edges, using only
-        // definitions that can reach the store on that path.
-        var visited = new HashSet<Block>();
-        for (var remaining = 16; remaining > 0 && visited.Add(block); remaining--)
-        {
-            for (var index = before - 1; index >= 0; index--)
-            {
-                var definition = block.Instructions[index];
-                if (!ReferenceEquals(definition.Destination, value))
-                    continue;
-                if (definition is not { OpCode: OpCode.Move, Operands: [LocalVariable, var source] })
-                    return false;
-                if (source is not LocalVariable)
-                    return source is Immediate { Value: 1 };
-                value = source;
-            }
-
-            if (block.Predecessors is not [var predecessor])
-                return false;
-            block = predecessor;
-            before = block.Instructions.Count;
-        }
-
-        return false;
     }
 
     // True for instructions that only compute a value into a local (or do nothing). A store - any

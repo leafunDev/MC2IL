@@ -220,4 +220,37 @@ public class GuardRemovalSafetyTests
         Assert.That(graph.Instructions.Contains(store), Is.EqualTo(!remove));
         Assert.That(graph.Instructions.Any(i => i.OpCode == OpCode.ConditionalJump), Is.EqualTo(!remove));
     }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public void RequiresMetadataFlagValueToDominateStoreAcrossControlFlowJoin(bool dominatesStore)
+    {
+        var flag = Local("flag");
+        var value = Local("value");
+        var condition = Local("condition");
+        var definition = new Instruction(0, OpCode.Move, value, Imm(1));
+        var merge = new Instruction(0, OpCode.Return);
+        var flagLoad = new Instruction(0, OpCode.Move, flag, new MemoryOperand(null, null, 0x3000));
+        var split = new Instruction(0, OpCode.ConditionalJump, flagLoad, Local("takeFastPath"));
+        var store = new Instruction(0, OpCode.Move, new MemoryOperand(null, null, 0x3000), value);
+        var ordinaryCall = new Instruction(0, OpCode.CallVoid, Str("ordinary_call"));
+        var graph = Build([
+            dominatesStore ? definition : split,
+            dominatesStore ? split : definition,
+            ordinaryCall,
+            flagLoad,
+            new(0, OpCode.CheckNotEqual, condition, flag, Imm(0)),
+            new(0, OpCode.ConditionalJump, merge, condition),
+            new(0, OpCode.CallVoid, Str("il2cpp_codegen_initialize_runtime_metadata"), Imm(0x5000)),
+            store,
+            new(0, OpCode.Jump, merge),
+            merge,
+        ]);
+
+        MetadataInitGuardRemover.Run(graph, 0xE0);
+
+        Assert.That(graph.Instructions.Contains(ordinaryCall), Is.True);
+        Assert.That(graph.Instructions.Contains(store), Is.EqualTo(!dominatesStore));
+        Assert.That(graph.Instructions.Count(i => i.OpCode == OpCode.ConditionalJump), Is.EqualTo(dominatesStore ? 1 : 2));
+    }
 }
