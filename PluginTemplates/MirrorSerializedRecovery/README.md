@@ -2,7 +2,9 @@
 
 This plugin exports game scripts to C# and moves Mirror Weaver support code out of gameplay scripts into CSharp/Assembly-CSharp/MirrorSerialization. The release is a single self-contained DLL; its Roslyn dependencies are embedded.
 
-The moved declarations remain members of the same types through partial classes. Their bodies, attributes, and registrations are retained so SyncVar replication and Command/RPC dispatch continue to work. The plugin does not remove SyncVar fields, serializers, readers/writers, command/RPC entry points, or generated handlers.
+The plugin keeps SyncVar fields and network attributes in gameplay scripts while moving Mirror-generated serializers, handlers, and registration members into partial sidecar files. The generated support members remain available under the same types.
+
+For a `[Command]`, `[ClientRpc]`, or `[TargetRpc]` method, the plugin restores the body from its unique `UserCode_<Method>` companion when their signatures match and the attributed method has the generated Mirror send-wrapper shape. It removes `//IL_*` diagnostics copied from the companion, fixes unambiguous Mirror-generated `(T)(&objectLocal)` calls to a matching method parameter, and drops `unsafe` when the restored body no longer needs pointers. The generated `UserCode_*` and `InvokeUserCode_*` support members remain in the sidecar; unmatched methods are left as decompiled. Restoration is limited to the recovered companion body; IL2CPP field-offset expressions that remain there still need method-body recovery from MC2IL.
 
 ## Build
 

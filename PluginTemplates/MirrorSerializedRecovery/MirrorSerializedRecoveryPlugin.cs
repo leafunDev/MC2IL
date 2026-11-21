@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using MC2IL.Core.Api;
 using MC2IL.Core.Attributes;
 using MC2IL.Core.Logging;
@@ -52,7 +53,7 @@ public sealed class MirrorSerializedRecoveryOutputFormat : MC2ILOutputFormat
 
             var result = MirrorSerializationSourceCleaner.CleanDirectory(generatedRoot);
             Logger.InfoNewline(
-                $"Parsed {result.FilesParsed} C# files; moved {result.MembersMoved} Mirror-generated members from {result.TypesMadePartial} types into {result.SidecarFiles} sidecar files. Restored {result.SyncVarAccessorsRewritten} SyncVar accessors from IL2CPP pointer offsets. {result.FilesSkipped} files were left untouched.",
+                $"Parsed {result.FilesParsed} C# files; moved {result.MembersMoved} Mirror-generated members from {result.TypesMadePartial} types into {result.SidecarFiles} sidecar files. Restored {result.NetworkMethodBodiesRestored} original Command/RPC method bodies and {result.NetworkArgumentsRestored} Mirror-generated pointer arguments. Restored {result.SyncVarAccessorsRewritten} SyncVar accessors from IL2CPP pointer offsets. {result.FilesSkipped} files were left untouched.",
                 "MirrorRecovery");
 
             var finalCSharpRoot = Path.Combine(outputRoot, "CSharp");
@@ -165,6 +166,8 @@ internal sealed class MirrorSerializationCleanupResult
     public int TypesMadePartial { get; set; }
     public int SidecarFiles { get; set; }
     public int SyncVarAccessorsRewritten { get; set; }
+    public int NetworkMethodBodiesRestored { get; set; }
+    public int NetworkArgumentsRestored { get; set; }
 }
 
 internal sealed class ParsedSourceFile
@@ -240,10 +243,14 @@ internal static class MirrorSerializationSourceCleaner
         var textChanges = new List<TextChange>();
         var sidecars = new List<(ClassDeclarationSyntax Type, List<MemberDeclarationSyntax> Members)>();
         var movedCount = 0;
+        var restoredNetworkBodyCount = 0;
 
         foreach (var type in parsedFile.Classes)
         {
             var networkType = IsNetworkBehaviour(type, classIndex, new HashSet<string>(StringComparer.Ordinal));
+            if (networkType)
+                restoredNetworkBodyCount += RestoreOriginalNetworkMethodBodies(type, parsedFile.Text, textChanges, result);
+
             var syncVarFields = GetSyncVarFieldTypes(type);
             var selectedMembers = type.Members
                 .Where(member => ShouldMove(member, networkType, syncVarFields))
@@ -288,7 +295,7 @@ internal static class MirrorSerializationSourceCleaner
             }
         }
 
-        if (sidecars.Count == 0)
+        if (textChanges.Count == 0)
             return;
 
         var orderedChanges = textChanges.OrderBy(change => change.Span.Start).ToArray();
@@ -306,6 +313,10 @@ internal static class MirrorSerializationSourceCleaner
         File.WriteAllText(parsedFile.Path, updatedSource.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
         result.TypesMadePartial += sidecars.Count;
         result.MembersMoved += movedCount;
+        result.NetworkMethodBodiesRestored += restoredNetworkBodyCount;
+
+        if (sidecars.Count == 0)
+            return;
 
         var assemblyDirectory = GetAssemblyDirectory(sourceRoot, parsedFile.Path);
         var sidecarDirectory = Path.Combine(assemblyDirectory, "MirrorSerialization");
@@ -325,6 +336,267 @@ internal static class MirrorSerializationSourceCleaner
             File.WriteAllText(Path.Combine(sidecarDirectory, fileName), sidecar, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
             result.SidecarFiles++;
         }
+    }
+
+    private static int RestoreOriginalNetworkMethodBodies(
+        ClassDeclarationSyntax type,
+        string sourceText,
+        List<TextChange> textChanges,
+        MirrorSerializationCleanupResult result)
+    {
+        var userCodeMethods = type.Members.OfType<MethodDeclarationSyntax>()
+            .Where(method => method.Identifier.ValueText.StartsWith("UserCode_", StringComparison.Ordinal)
+                && method.Body != null)
+            .GroupBy(method => method.Identifier.ValueText, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.ToArray(), StringComparer.Ordinal);
+
+        var restoredCount = 0;
+        foreach (var networkMethod in type.Members.OfType<MethodDeclarationSyntax>())
+        {
+            if (networkMethod.Body == null
+                || !HasNetworkSendAttribute(networkMethod)
+                || !IsGeneratedNetworkSendWrapper(networkMethod))
+                continue;
+
+            var userCodeName = "UserCode_" + networkMethod.Identifier.ValueText;
+            if (!userCodeMethods.TryGetValue(userCodeName, out var candidates))
+                continue;
+
+            var matchingMethods = candidates
+                .Where(candidate => HasSameMethodSignature(networkMethod, candidate))
+                .ToArray();
+            if (matchingMethods.Length != 1)
+                continue;
+
+            var originalBody = matchingMethods[0].Body!;
+            originalBody = RestoreGeneratedObjectArguments(type, networkMethod, originalBody, result);
+            var restoredBodyText = Regex.Replace(
+                originalBody.ToFullString(),
+                @"^[ \t]*//IL_[^\r\n]*(?:\r\n|\n|\r)",
+                string.Empty,
+                RegexOptions.Multiline);
+            restoredBodyText = Regex.Replace(restoredBodyText, @"(\r?\n)[ \t]*(?=\r?\n)", "$1");
+            textChanges.Add(new TextChange(networkMethod.Body.FullSpan, restoredBodyText));
+            if (!RequiresUnsafeContext(originalBody))
+            {
+                var unsafeModifier = networkMethod.Modifiers.FirstOrDefault(modifier => modifier.IsKind(SyntaxKind.UnsafeKeyword));
+                if (unsafeModifier != default)
+                {
+                    var removalStart = unsafeModifier.SpanStart;
+                    var removalEnd = unsafeModifier.Span.End;
+                    while (removalStart > networkMethod.SpanStart
+                        && sourceText[removalStart - 1] is ' ' or '\t')
+                        removalStart--;
+                    while (removalEnd < sourceText.Length
+                        && sourceText[removalEnd] is ' ' or '\t')
+                        removalEnd++;
+
+                    textChanges.Add(new TextChange(TextSpan.FromBounds(removalStart, removalEnd), " "));
+                }
+            }
+
+            restoredCount++;
+        }
+
+        return restoredCount;
+    }
+
+    private static BlockSyntax RestoreGeneratedObjectArguments(
+        ClassDeclarationSyntax type,
+        MethodDeclarationSyntax networkMethod,
+        BlockSyntax body,
+        MirrorSerializationCleanupResult result)
+    {
+        var restoredBody = body;
+        var restoredObjectLocalNames = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var invocation in body.DescendantNodes().OfType<InvocationExpressionSyntax>().ToArray())
+        {
+            var calledName = GetInvokedMethodName(invocation.Expression);
+            if (string.IsNullOrEmpty(calledName))
+                continue;
+
+            var targetMethods = type.Members.OfType<MethodDeclarationSyntax>()
+                .Where(method => method.Identifier.ValueText == calledName && HasNetworkSendAttribute(method))
+                .ToArray();
+            if (targetMethods.Length != 1 || targetMethods[0].ParameterList.Parameters.Count != 1
+                || invocation.ArgumentList.Arguments.Count != 1)
+                continue;
+
+            var targetType = NormalizeTypeName(targetMethods[0].ParameterList.Parameters[0].Type?.ToString() ?? string.Empty);
+            var argument = invocation.ArgumentList.Arguments[0];
+            if (NormalizeTypeName(GetCastType(argument.Expression)) != targetType
+                || !TryGetAddressedObjectLocal(argument.Expression, out var objectLocalName)
+                || !HasDefaultObjectLocal(body, objectLocalName))
+                continue;
+
+            var matchingParameters = networkMethod.ParameterList.Parameters
+                .Where(parameter => NormalizeTypeName(parameter.Type?.ToString() ?? string.Empty) == targetType)
+                .ToArray();
+            if (matchingParameters.Length != 1)
+                continue;
+
+            var restoredArgument = SyntaxFactory.Argument(SyntaxFactory.IdentifierName(matchingParameters[0].Identifier.ValueText))
+                .WithTriviaFrom(argument);
+            restoredBody = restoredBody.ReplaceNode(argument, restoredArgument);
+            restoredObjectLocalNames.Add(objectLocalName);
+            result.NetworkArgumentsRestored++;
+        }
+
+        foreach (var local in restoredBody.DescendantNodes().OfType<LocalDeclarationStatementSyntax>().ToArray())
+        {
+            var unusedVariables = local.Declaration.Variables
+                .Where(variable => restoredObjectLocalNames.Contains(variable.Identifier.ValueText)
+                    && IsDefaultObjectDeclaration(local.Declaration.Type, variable)
+                    && !restoredBody.DescendantNodes().OfType<IdentifierNameSyntax>()
+                        .Any(identifier => identifier.Identifier.ValueText == variable.Identifier.ValueText))
+                .ToArray();
+            if (unusedVariables.Length == 0)
+                continue;
+
+            if (unusedVariables.Length == local.Declaration.Variables.Count)
+            {
+                restoredBody = restoredBody.RemoveNode(local, SyntaxRemoveOptions.KeepExteriorTrivia) ?? restoredBody;
+                continue;
+            }
+
+            var updatedDeclaration = local.Declaration.RemoveNodes(unusedVariables, SyntaxRemoveOptions.KeepNoTrivia);
+            if (updatedDeclaration != null)
+                restoredBody = restoredBody.ReplaceNode(local, local.WithDeclaration(updatedDeclaration));
+        }
+
+        return restoredBody;
+    }
+
+    private static string GetInvokedMethodName(ExpressionSyntax expression)
+    {
+        return expression switch
+        {
+            IdentifierNameSyntax identifier => identifier.Identifier.ValueText,
+            GenericNameSyntax generic => generic.Identifier.ValueText,
+            MemberAccessExpressionSyntax member => member.Name.Identifier.ValueText,
+            _ => string.Empty
+        };
+    }
+
+    private static string GetCastType(ExpressionSyntax expression)
+    {
+        while (expression is ParenthesizedExpressionSyntax parenthesized)
+            expression = parenthesized.Expression;
+        return expression is CastExpressionSyntax cast ? cast.Type.ToString() : string.Empty;
+    }
+
+    private static bool TryGetAddressedObjectLocal(ExpressionSyntax expression, out string localName)
+    {
+        localName = string.Empty;
+        while (expression is ParenthesizedExpressionSyntax parenthesized)
+            expression = parenthesized.Expression;
+        if (expression is not CastExpressionSyntax cast)
+            return false;
+
+        ExpressionSyntax operand = cast.Expression;
+        while (operand is ParenthesizedExpressionSyntax inner)
+            operand = inner.Expression;
+        if (operand is not PrefixUnaryExpressionSyntax addressOf
+            || !addressOf.IsKind(SyntaxKind.AddressOfExpression)
+            || addressOf.Operand is not IdentifierNameSyntax identifier)
+            return false;
+
+        localName = identifier.Identifier.ValueText;
+        return true;
+    }
+
+    private static bool HasDefaultObjectLocal(BlockSyntax body, string name)
+    {
+        return body.DescendantNodes().OfType<LocalDeclarationStatementSyntax>()
+            .SelectMany(local => local.Declaration.Variables.Select(variable => (local.Declaration.Type, Variable: variable)))
+            .Any(item => item.Variable.Identifier.ValueText == name && IsDefaultObjectDeclaration(item.Type, item.Variable));
+    }
+
+    private static bool IsDefaultObjectDeclaration(TypeSyntax type, VariableDeclaratorSyntax variable)
+    {
+        if (NormalizeTypeName(type.ToString()) != "object" || variable.Initializer == null)
+            return false;
+
+        return variable.Initializer.Value.IsKind(SyntaxKind.DefaultLiteralExpression)
+            || variable.Initializer.Value is DefaultExpressionSyntax defaultExpression
+                && NormalizeTypeName(defaultExpression.Type.ToString()) == "object";
+    }
+
+    private static bool HasNetworkSendAttribute(MethodDeclarationSyntax method)
+    {
+        foreach (var attribute in method.AttributeLists.SelectMany(list => list.Attributes))
+        {
+            var name = attribute.Name.ToString();
+            var genericStart = name.IndexOf('<');
+            if (genericStart >= 0)
+                name = name.Substring(0, genericStart);
+            var lastDot = name.LastIndexOf('.');
+            if (lastDot >= 0)
+                name = name.Substring(lastDot + 1);
+            if (name.EndsWith("Attribute", StringComparison.Ordinal))
+                name = name.Substring(0, name.Length - "Attribute".Length);
+
+            if (name is "Command" or "ClientRpc" or "TargetRpc")
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsGeneratedNetworkSendWrapper(MethodDeclarationSyntax method)
+    {
+        var invocationNames = method.Body!.DescendantNodes().OfType<InvocationExpressionSyntax>()
+            .Select(invocation => invocation.Expression.ToString())
+            .ToArray();
+        return invocationNames.Any(name => name.EndsWith("NetworkWriterPool.GetWriter", StringComparison.Ordinal))
+            && invocationNames.Any(name => name.EndsWith("NetworkWriterPool.Recycle", StringComparison.Ordinal))
+            && invocationNames.Any(name => name.EndsWith("SendCommandInternal", StringComparison.Ordinal)
+                || name.EndsWith("SendRPCInternal", StringComparison.Ordinal)
+                || name.EndsWith("SendTargetRPCInternal", StringComparison.Ordinal));
+    }
+
+    private static bool HasSameMethodSignature(MethodDeclarationSyntax first, MethodDeclarationSyntax second)
+    {
+        if (!string.Equals(NormalizeTypeName(first.ReturnType.ToString()), NormalizeTypeName(second.ReturnType.ToString()), StringComparison.Ordinal)
+            || first.ParameterList.Parameters.Count != second.ParameterList.Parameters.Count)
+            return false;
+
+        for (var i = 0; i < first.ParameterList.Parameters.Count; i++)
+        {
+            var firstParameter = first.ParameterList.Parameters[i];
+            var secondParameter = second.ParameterList.Parameters[i];
+            if (!string.Equals(NormalizeTypeName(firstParameter.Type?.ToString() ?? string.Empty), NormalizeTypeName(secondParameter.Type?.ToString() ?? string.Empty), StringComparison.Ordinal)
+                || !string.Equals(GetParameterRefKind(firstParameter), GetParameterRefKind(secondParameter), StringComparison.Ordinal))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static string GetParameterRefKind(ParameterSyntax parameter)
+    {
+        foreach (var modifier in parameter.Modifiers)
+            if (modifier.IsKind(SyntaxKind.RefKeyword)
+                || modifier.IsKind(SyntaxKind.OutKeyword)
+                || modifier.IsKind(SyntaxKind.InKeyword))
+                return modifier.ValueText;
+
+        return string.Empty;
+    }
+
+    private static bool RequiresUnsafeContext(BlockSyntax body)
+    {
+        return body.DescendantNodesAndSelf().Any(node =>
+            node is PointerTypeSyntax
+            || node is FunctionPointerTypeSyntax
+            || node is FixedStatementSyntax
+            || node is SizeOfExpressionSyntax
+            || node is PrefixUnaryExpressionSyntax prefix
+                && (prefix.IsKind(SyntaxKind.AddressOfExpression) || prefix.IsKind(SyntaxKind.PointerIndirectionExpression))
+            || node is PostfixUnaryExpressionSyntax postfix
+                && postfix.IsKind(SyntaxKind.PointerIndirectionExpression)
+            || node is MemberAccessExpressionSyntax memberAccess
+                && memberAccess.IsKind(SyntaxKind.PointerMemberAccessExpression));
     }
 
     private static string GetAssemblyDirectory(string sourceRoot, string sourceFilePath)
