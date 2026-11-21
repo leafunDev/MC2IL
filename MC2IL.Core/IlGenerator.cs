@@ -1661,7 +1661,8 @@ public static class IlGenerator
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
-                        LoadOperand(instruction.Operands[thisParamIndex], method, locals, writeLine, targetMethod.DeclaringType);
+                        LoadOperand(instruction.Operands[thisParamIndex], method, locals, writeLine,
+                            targetMethod.DeclaringType, isReceiver: true);
                     else
                     {
                         instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Non static method called without 'this' param ({instruction})"));
@@ -2293,7 +2294,7 @@ public static class IlGenerator
 
     private static void LoadOperand(IOperand operand, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
-        TypeAnalysisContext? expectedType = null)
+        TypeAnalysisContext? expectedType = null, bool isReceiver = false)
     {
         var instructions = method.CilMethodBody!.Instructions;
 
@@ -2413,6 +2414,16 @@ public static class IlGenerator
                 break;
             case LocalVariable local:
                 LoadLocal(local, method, locals);
+                break;
+            case AddressOf { Target: LocalVariable addressed } when !isReceiver
+                && expectedType is { IsValueType: true } and not ByRefTypeAnalysisContext
+                && addressed.Type is { } addressedType
+                && MetadataResolver.IsSameType(addressedType, expectedType):
+                // ARM64 passes some IL2CPP value-type arguments through a temporary address
+                // even though their managed signature is by value. Load that typed temporary
+                // as the argument value; explicit ref/out parameters and value-type receivers
+                // keep the address path below.
+                LoadLocal(addressed, method, locals);
                 break;
             case ArrayLength arrayLength:
                 LoadLocal(arrayLength.Array, method, locals);

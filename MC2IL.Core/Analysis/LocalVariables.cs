@@ -572,9 +572,16 @@ public static class LocalVariables
                 if (parameterIndex > calledMethod.Parameters.Count - 1) // Probably MethodInfo*
                     continue;
 
-                if (instruction.Operands[i] is AddressOf { Target: LocalVariable referenced }
-                    && calledMethod.Parameters[parameterIndex].ParameterType is ByRefTypeAnalysisContext { ElementType: { } referencedType })
+                if (instruction.Operands[i] is not AddressOf { Target: LocalVariable referenced })
+                    continue;
+
+                var parameterType = calledMethod.Parameters[parameterIndex].ParameterType;
+                if (parameterType is ByRefTypeAnalysisContext { ElementType: { } referencedType })
                     changed |= SetTypeIfUnknown(referenced, referencedType);
+                else if (parameterType.IsValueType)
+                    // IL2CPP may pass a by-value struct through its address on ARM64. The
+                    // managed signature still defines the type of the temporary at the call.
+                    changed |= SetTypeIfUnknown(referenced, parameterType);
             }
         }
 
