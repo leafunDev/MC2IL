@@ -51,12 +51,90 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
 
         Register Reg(ArmRegister register) => new(null, register.ToString().ToUpperInvariant());
         Immediate Imm(long value) => new(value);
+        var flagN = new Register(null, "ARM_N");
+        var flagZ = new Register(null, "ARM_Z");
+        var flagC = new Register(null, "ARM_C");
+        var flagV = new Register(null, "ARM_V");
         IOperand ToOperand(ArmInstruction native, ArmOperand operand)
         {
             switch (operand.Type)
             {
                 case ArmOperandType.Register:
-                    return Reg(operand.Register);
+                {
+                    var source = Reg(operand.Register);
+                    var shift = operand.ShiftOperation;
+                    if (shift == ArmShiftOperation.Invalid)
+                        return source;
+
+                    var isRegisterShift = shift.ToString().EndsWith("_REG", System.StringComparison.Ordinal);
+                    IOperand amount = isRegisterShift ? Reg(operand.ShiftRegister) : Imm(operand.ShiftValue);
+                    var destination = new Register(null, $"ARM_SHIFTED_OPERAND_{addresses.Count:X}");
+                    switch (shift)
+                    {
+                        case ArmShiftOperation.ARM_SFT_LSL:
+                            if (!isRegisterShift && amount is Immediate { Value: >= 32 })
+                                Emit((ulong)native.Address, OpCode.Move, destination, Imm(0));
+                            else
+                                Emit((ulong)native.Address, OpCode.ShiftLeft, destination, source, amount);
+                            return destination;
+                        case ArmShiftOperation.ARM_SFT_LSL_REG:
+                            EmitVariableShift((ulong)native.Address, OpCode.ShiftLeft, destination, source, amount);
+                            return destination;
+                        case ArmShiftOperation.ARM_SFT_LSR:
+                        case ArmShiftOperation.ARM_SFT_ASR:
+                        {
+                            var isArithmetic = shift == ArmShiftOperation.ARM_SFT_ASR;
+                            if (!isRegisterShift && amount is Immediate { Value: >= 32 })
+                            {
+                                if (isArithmetic)
+                                    Emit((ulong)native.Address, OpCode.ShiftRight, destination, source, Imm(31));
+                                else
+                                    Emit((ulong)native.Address, OpCode.Move, destination, Imm(0));
+                            }
+                            else
+                                Emit((ulong)native.Address, isArithmetic ? OpCode.ShiftRight : OpCode.ShiftRightUnsigned,
+                                    destination, source, amount);
+                            return destination;
+                        }
+                        case ArmShiftOperation.ARM_SFT_LSR_REG:
+                            EmitVariableShift((ulong)native.Address, OpCode.ShiftRightUnsigned, destination, source, amount);
+                            return destination;
+                        case ArmShiftOperation.ARM_SFT_ASR_REG:
+                            EmitVariableShift((ulong)native.Address, OpCode.ShiftRight, destination, source, amount);
+                            return destination;
+                        case ArmShiftOperation.ARM_SFT_ROR:
+                        case ArmShiftOperation.ARM_SFT_ROR_REG:
+                        {
+                            if (isRegisterShift)
+                            {
+                                var normalizedAmount = new Register(null, $"ARM_ROR_AMOUNT_{addresses.Count:X}");
+                                Emit((ulong)native.Address, OpCode.And, normalizedAmount, amount, Imm(0xFF));
+                                amount = normalizedAmount;
+                            }
+                            var inverseAmount = new Register(null, "ARM_ROR_INVERSE");
+                            var upper = new Register(null, "ARM_ROR_UPPER");
+                            Emit((ulong)native.Address, OpCode.ShiftRightUnsigned, destination, source, amount);
+                            Emit((ulong)native.Address, OpCode.Subtract, inverseAmount, Imm(32), amount);
+                            Emit((ulong)native.Address, OpCode.ShiftLeft, upper, source, inverseAmount);
+                            Emit((ulong)native.Address, OpCode.Or, destination, destination, upper);
+                            return destination;
+                        }
+                        case ArmShiftOperation.ARM_SFT_RRX:
+                        case ArmShiftOperation.ARM_SFT_RRX_REG:
+                        {
+                            var shiftedCarry = new Register(null, "ARM_RRX_SHIFTED_CARRY");
+                            var shiftedSource = new Register(null, "ARM_RRX_SHIFTED_SOURCE");
+                            Emit((ulong)native.Address, OpCode.ShiftLeft, shiftedCarry, flagC, Imm(31));
+                            Emit((ulong)native.Address, OpCode.ShiftRightUnsigned, shiftedSource, source, Imm(1));
+                            Emit((ulong)native.Address, OpCode.Or, destination, shiftedCarry, shiftedSource);
+                            return destination;
+                        }
+                        default:
+                            Emit((ulong)native.Address, OpCode.NotImplemented,
+                                new StringLiteral($"Unsupported ARM operand shift {shift}: {native.Mnemonic} {native.Operand}"));
+                            return source;
+                    }
+                }
                 case ArmOperandType.Immediate:
                 case ArmOperandType.CImmediate:
                 case ArmOperandType.PImmediate:
@@ -70,32 +148,62 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                     var memory = operand.Memory;
                     var baseName = memory.Base.ToString().ToUpperInvariant();
                     var hasIndex = memory.Index.ToString().ToUpperInvariant() is not ("INVALID" or "INVALID_REG");
+                    var displacement = operand.IsSubtracted ? -memory.Displacement : memory.Displacement;
                     if (baseName == "SP" && !hasIndex)
-                        return new StackOffset(memory.Displacement);
+                        return new StackOffset(displacement);
                     if (baseName == "PC")
                     {
                         var pc = (ulong)native.Address + ((native.DisassembleMode == ArmDisassembleMode.Thumb) ? 4UL : 8UL);
                         if (native.DisassembleMode == ArmDisassembleMode.Thumb)
                             pc &= ~3UL;
-                        return new MemoryOperand(addend: (long)pc + memory.Displacement);
+                        return new MemoryOperand(addend: (long)pc + displacement);
                     }
 
                     IOperand? baseRegister = baseName is "INVALID" or "INVALID_REG" ? null : new Register(null, baseName);
-                    IOperand? indexRegister = !hasIndex
-                        ? null : Reg(memory.Index);
+                    IOperand? indexRegister = !hasIndex ? null : Reg(memory.Index);
+                    if (hasIndex && memory.LeftShit > 0)
+                    {
+                        var shiftedIndex = new Register(null, $"ARM_MEMORY_SHIFTED_INDEX_{addresses.Count:X}");
+                        Emit((ulong)native.Address, OpCode.ShiftLeft, shiftedIndex, indexRegister!, Imm(memory.LeftShit));
+                        indexRegister = shiftedIndex;
+                    }
                     return new MemoryOperand(baseRegister, indexRegister,
-                        operand.IsSubtracted ? -memory.Displacement : memory.Displacement,
-                        memory.Scale > 1 ? memory.Scale : 0);
+                        displacement,
+                        memory.LeftShit > 0 ? 0 : memory.Scale > 1 ? memory.Scale : 0);
                 }
                 default:
                     return new StringLiteral($"unsupported ARM operand {operand.Type}: {native.Mnemonic} {native.Operand}");
             }
         }
 
-        var flagN = new Register(null, "ARM_N");
-        var flagZ = new Register(null, "ARM_Z");
-        var flagC = new Register(null, "ARM_C");
-        var flagV = new Register(null, "ARM_V");
+        void EmitVariableShift(ulong address, OpCode shiftOpcode, IOperand destination, IOperand source, IOperand amount)
+        {
+            var normalizedAmount = new Register(null, $"ARM_SHIFT_AMOUNT_{instructions.Count:X}");
+            var isLarge = new Register(null, $"ARM_SHIFT_LARGE_{instructions.Count:X}");
+            var valid = new Register(null, $"ARM_SHIFT_VALID_{instructions.Count:X}");
+            var largeMask = new Register(null, $"ARM_SHIFT_LARGE_MASK_{instructions.Count:X}");
+            var validMask = new Register(null, $"ARM_SHIFT_VALID_MASK_{instructions.Count:X}");
+            Emit(address, OpCode.And, normalizedAmount, amount, Imm(0xFF));
+            Emit(address, OpCode.CheckGreaterOrEqualUnsigned, isLarge, normalizedAmount, Imm(32));
+            Emit(address, OpCode.Not, valid, isLarge);
+            Emit(address, OpCode.Subtract, validMask, Imm(0), valid);
+            Emit(address, OpCode.Subtract, largeMask, Imm(0), isLarge);
+            Emit(address, shiftOpcode, destination, source, normalizedAmount);
+
+            if (shiftOpcode is OpCode.ShiftLeft or OpCode.ShiftRightUnsigned)
+            {
+                Emit(address, OpCode.And, destination, destination, validMask);
+                return;
+            }
+
+            var normalResult = new Register(null, $"ARM_SHIFT_NORMAL_{instructions.Count:X}");
+            var signFill = new Register(null, $"ARM_SHIFT_SIGN_{instructions.Count:X}");
+            var largeResult = new Register(null, $"ARM_SHIFT_LARGE_RESULT_{instructions.Count:X}");
+            Emit(address, OpCode.And, normalResult, destination, validMask);
+            Emit(address, OpCode.ShiftRight, signFill, source, Imm(31));
+            Emit(address, OpCode.And, largeResult, signFill, largeMask);
+            Emit(address, OpCode.Or, destination, normalResult, largeResult);
+        }
 
         void EmitSubFlags(ulong address, IOperand left, IOperand right)
         {
@@ -128,6 +236,68 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
             Emit(address, OpCode.Not, invertedXor, xorLeftRight);
             Emit(address, OpCode.Xor, xorLeftResult, left, result);
             Emit(address, OpCode.And, overflowBits, invertedXor, xorLeftResult);
+            Emit(address, OpCode.CheckLess, flagV, overflowBits, Imm(0));
+        }
+
+        void EmitExtendedArithmetic(ulong address, string mnemonic, IOperand destination, IOperand left, IOperand right)
+        {
+            var isSubtract = mnemonic.StartsWith("sbc", System.StringComparison.Ordinal);
+            var setsFlags = mnemonic.EndsWith("s", System.StringComparison.Ordinal);
+            var first = new Register(null, "ARM_EXTENDED_FIRST_RESULT");
+            var result = new Register(null, "ARM_EXTENDED_RESULT");
+            if (isSubtract)
+            {
+                var borrowIn = new Register(null, "ARM_EXTENDED_BORROW_IN");
+                var firstBorrow = new Register(null, "ARM_EXTENDED_FIRST_BORROW");
+                var zeroFirst = new Register(null, "ARM_EXTENDED_ZERO_FIRST");
+                var extraBorrow = new Register(null, "ARM_EXTENDED_EXTRA_BORROW");
+                var borrow = new Register(null, "ARM_EXTENDED_BORROW");
+                var carryOut = new Register(null, "ARM_EXTENDED_CARRY_OUT");
+                Emit(address, OpCode.Not, borrowIn, flagC);
+                Emit(address, OpCode.Subtract, first, left, right);
+                Emit(address, OpCode.Subtract, result, first, borrowIn);
+                Emit(address, OpCode.CheckLessUnsigned, firstBorrow, left, right);
+                Emit(address, OpCode.CheckEqual, zeroFirst, first, Imm(0));
+                Emit(address, OpCode.And, extraBorrow, borrowIn, zeroFirst);
+                Emit(address, OpCode.Or, borrow, firstBorrow, extraBorrow);
+                Emit(address, OpCode.Not, carryOut, borrow);
+                if (setsFlags)
+                    Emit(address, OpCode.Move, flagC, carryOut);
+            }
+            else
+            {
+                var firstCarry = new Register(null, "ARM_EXTENDED_FIRST_CARRY");
+                var secondCarry = new Register(null, "ARM_EXTENDED_SECOND_CARRY");
+                var carryOut = new Register(null, "ARM_EXTENDED_CARRY_OUT");
+                Emit(address, OpCode.Add, first, left, right);
+                Emit(address, OpCode.Add, result, first, flagC);
+                Emit(address, OpCode.CheckLessUnsigned, firstCarry, first, left);
+                Emit(address, OpCode.CheckLessUnsigned, secondCarry, result, first);
+                Emit(address, OpCode.Or, carryOut, firstCarry, secondCarry);
+                if (setsFlags)
+                    Emit(address, OpCode.Move, flagC, carryOut);
+            }
+
+            Emit(address, OpCode.Move, destination, result);
+            if (!setsFlags)
+                return;
+
+            Emit(address, OpCode.CheckLess, flagN, result, Imm(0));
+            Emit(address, OpCode.CheckEqual, flagZ, result, Imm(0));
+            var xorLeftRight = new Register(null, "ARM_EXTENDED_XOR0");
+            var xorLeftResult = new Register(null, "ARM_EXTENDED_XOR1");
+            var overflowBits = new Register(null, "ARM_EXTENDED_OVERFLOW");
+            Emit(address, OpCode.Xor, xorLeftRight, left, right);
+            Emit(address, OpCode.Xor, xorLeftResult, left, result);
+            if (!isSubtract)
+            {
+                var sameSign = new Register(null, "ARM_EXTENDED_SAME_SIGN");
+                Emit(address, OpCode.Not, sameSign, xorLeftRight);
+                Emit(address, OpCode.And, overflowBits, sameSign, xorLeftResult);
+            }
+            // Subtraction overflows when the operands have different signs and the result changes sign.
+            if (isSubtract)
+                Emit(address, OpCode.And, overflowBits, xorLeftRight, xorLeftResult);
             Emit(address, OpCode.CheckLess, flagV, overflowBits, Imm(0));
         }
 
@@ -350,12 +520,20 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                 continue;
             }
 
-            if ((mnemonic is "add" or "adds" or "sub" or "subs" or "rsb" or "mul" or "and" or "ands" or "orr" or "orrs" or "eor" or "eors" or "bic")
+            if ((mnemonic is "add" or "adds" or "adc" or "adcs" or "sub" or "subs" or "sbc" or "sbcs"
+                or "rsb" or "rsbs" or "mul" or "and" or "ands" or "orr" or "orrs" or "eor" or "eors" or "bic")
                 && operands.Length is 2 or 3)
             {
                 var destination = ToOperand(native, operands[0]);
                 var left = operands.Length == 2 ? destination : ToOperand(native, operands[1]);
                 var right = ToOperand(native, operands[^1]);
+                if ((mnemonic is "adc" or "adcs" or "sbc" or "sbcs")
+                    && destination is Register)
+                {
+                    EmitExtendedArithmetic(address, mnemonic, destination, left, right);
+                    continue;
+                }
+
                 if (destination is Register { Name: "SP" } && left is Register { Name: "SP" }
                     && right is Immediate stackAmount && (mnemonic is "add" or "adds" or "sub" or "subs"))
                 {
@@ -368,7 +546,7 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                 {
                     "add" or "adds" => OpCode.Add,
                     "sub" or "subs" => OpCode.Subtract,
-                    "rsb" => OpCode.Subtract,
+                    "rsb" or "rsbs" => OpCode.Subtract,
                     "mul" => OpCode.Multiply,
                     "and" or "ands" => OpCode.And,
                     "orr" or "orrs" => OpCode.Or,
@@ -376,7 +554,7 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                     "bic" => OpCode.And,
                     _ => OpCode.NotImplemented
                 };
-                if (mnemonic == "rsb")
+                if (mnemonic is "rsb" or "rsbs")
                     Emit(address, opcode, destination, right, left);
                 else if (mnemonic == "bic")
                 {
@@ -389,11 +567,29 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
 
                 if (mnemonic == "adds") EmitAddFlags(address, left, right);
                 else if (mnemonic == "subs") EmitSubFlags(address, left, right);
+                else if (mnemonic == "rsbs") EmitSubFlags(address, right, left);
                 else if (mnemonic is "ands" or "orrs" or "eors")
                 {
                     Emit(address, OpCode.CheckLess, flagN, destination, Imm(0));
                     Emit(address, OpCode.CheckEqual, flagZ, destination, Imm(0));
                 }
+                continue;
+            }
+
+            if ((mnemonic is "uxtb" or "uxth" or "sxtb" or "sxth") && operands.Length >= 2)
+            {
+                var destination = ToOperand(native, operands[0]);
+                var source = ToOperand(native, operands[1]);
+                var isSigned = mnemonic.StartsWith("s", System.StringComparison.Ordinal);
+                var shift = mnemonic.EndsWith("b", System.StringComparison.Ordinal) ? 24 : 16;
+                if (isSigned)
+                {
+                    var shifted = new Register(null, "ARM_SIGN_EXTEND_SHIFTED");
+                    Emit(address, OpCode.ShiftLeft, shifted, source, Imm(shift));
+                    Emit(address, OpCode.ShiftRight, destination, shifted, Imm(shift));
+                }
+                else
+                    Emit(address, OpCode.And, destination, source, Imm(shift == 24 ? 0xFF : 0xFFFF));
                 continue;
             }
 
@@ -445,6 +641,50 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                 continue;
             }
 
+            if (mnemonic is "ldrd" or "strd")
+            {
+                var memoryIndex = System.Array.FindIndex(operands, operand => operand.Type == ArmOperandType.Memory);
+                var valueRegisters = operands.Take(memoryIndex < 0 ? 0 : memoryIndex)
+                    .Where(operand => operand.Type == ArmOperandType.Register)
+                    .Take(2)
+                    .ToArray();
+                if (memoryIndex < 0 || valueRegisters.Length != 2)
+                {
+                    Emit(address, OpCode.NotImplemented,
+                        new StringLiteral($"Unsupported ARM doubleword transfer: {native.Mnemonic} {native.Operand}"));
+                    continue;
+                }
+
+                var memory = ToOperand(native, operands[memoryIndex]);
+                IOperand OffsetByFour(IOperand operand)
+                {
+                    if (operand is StackOffset stack)
+                        return new StackOffset(stack.Offset + 4);
+                    if (operand is MemoryOperand indirect)
+                    {
+                        indirect.Addend += 4;
+                        return indirect;
+                    }
+                    if (operand is Immediate absolute)
+                        return Imm(absolute.Value + 4);
+                    return new StringLiteral($"unsupported ARM LDRD/STRD address: {operand}");
+                }
+
+                var isLoad = mnemonic == "ldrd";
+                var firstRegister = ToOperand(native, valueRegisters[0]);
+                var secondRegister = ToOperand(native, valueRegisters[1]);
+                var firstTransfer = isLoad
+                    ? Emit(address, OpCode.Move, firstRegister, memory)
+                    : Emit(address, OpCode.Move, memory, firstRegister);
+                firstTransfer.MemoryAccessSize = 4;
+                var secondMemory = OffsetByFour(memory);
+                var secondTransfer = isLoad
+                    ? Emit(address, OpCode.Move, secondRegister, secondMemory)
+                    : Emit(address, OpCode.Move, secondMemory, secondRegister);
+                secondTransfer.MemoryAccessSize = 4;
+                continue;
+            }
+
             if ((mnemonic is "mov" or "movs" or "movw" or "movt" or "mvn" or "vmov") && operands.Length >= 2)
             {
                 var destination = ToOperand(native, operands[0]);
@@ -475,15 +715,53 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                 continue;
             }
 
-            if ((mnemonic is "lsl" or "lsls" or "lsr" or "lsrs" or "asr" or "asrs" or "ror") && operands.Length >= 2)
+            if ((mnemonic is "lsl" or "lsls" or "lsr" or "lsrs" or "asr" or "asrs" or "ror" or "rors") && operands.Length >= 2)
             {
-                var opcode = mnemonic.StartsWith("lsl") ? OpCode.ShiftLeft
-                    : mnemonic.StartsWith("lsr") ? OpCode.ShiftRightUnsigned
-                    : mnemonic.StartsWith("asr") ? OpCode.ShiftRight : OpCode.ShiftRight;
                 var destination = ToOperand(native, operands[0]);
                 var source = operands.Length == 2 ? destination : ToOperand(native, operands[1]);
                 var amount = ToOperand(native, operands[^1]);
-                Emit(address, opcode, destination, source, amount);
+                if (mnemonic is "ror" or "rors")
+                {
+                    if (amount is Register)
+                    {
+                        var normalizedAmount = new Register(null, $"ARM_ROR_AMOUNT_{addresses.Count:X}");
+                        Emit(address, OpCode.And, normalizedAmount, amount, Imm(0xFF));
+                        amount = normalizedAmount;
+                    }
+                    if (amount is Immediate { Value: 0 })
+                    {
+                        var shiftedCarry = new Register(null, "ARM_RRX_SHIFTED_CARRY");
+                        var shiftedSource = new Register(null, "ARM_RRX_SHIFTED_SOURCE");
+                        Emit(address, OpCode.ShiftLeft, shiftedCarry, flagC, Imm(31));
+                        Emit(address, OpCode.ShiftRightUnsigned, shiftedSource, source, Imm(1));
+                        Emit(address, OpCode.Or, destination, shiftedCarry, shiftedSource);
+                    }
+                    else
+                    {
+                        var inverseAmount = new Register(null, "ARM_ROR_INVERSE");
+                        var upper = new Register(null, "ARM_ROR_UPPER");
+                        Emit(address, OpCode.ShiftRightUnsigned, destination, source, amount);
+                        Emit(address, OpCode.Subtract, inverseAmount, Imm(32), amount);
+                        Emit(address, OpCode.ShiftLeft, upper, source, inverseAmount);
+                        Emit(address, OpCode.Or, destination, destination, upper);
+                    }
+                }
+                else
+                {
+                    var opcode = mnemonic.StartsWith("lsl") ? OpCode.ShiftLeft
+                        : mnemonic.StartsWith("lsr") ? OpCode.ShiftRightUnsigned : OpCode.ShiftRight;
+                    if (amount is Register)
+                        EmitVariableShift(address, opcode, destination, source, amount);
+                    else if (amount is Immediate { Value: >= 32 })
+                    {
+                        if (opcode == OpCode.ShiftRight)
+                            Emit(address, OpCode.ShiftRight, destination, source, Imm(31));
+                        else
+                            Emit(address, OpCode.Move, destination, Imm(0));
+                    }
+                    else
+                        Emit(address, opcode, destination, source, amount);
+                }
                 continue;
             }
 
@@ -533,10 +811,13 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                 var right = ToOperand(native, operands[1]);
                 Emit(address, OpCode.CheckLess, flagN, left, right, precision);
                 Emit(address, OpCode.CheckEqual, flagZ, left, right, precision);
-                Emit(address, OpCode.CheckGreaterOrEqual, flagC, left, right, precision);
-                // ISIL does not yet carry the VFP unordered flag. Clear it rather than accidentally
-                // reusing an integer overflow value from an earlier instruction.
-                Emit(address, OpCode.Move, flagV, Imm(0));
+                // VFP unordered comparisons set C and V as well as clearing N and Z.
+                Emit(address, OpCode.CheckGreaterOrEqualUnsigned, flagC, left, right, precision);
+                var unorderedLeft = new Register(null, "ARM_VFP_UNORDERED_LEFT");
+                var unorderedRight = new Register(null, "ARM_VFP_UNORDERED_RIGHT");
+                Emit(address, OpCode.CheckNotEqual, unorderedLeft, left, left, precision);
+                Emit(address, OpCode.CheckNotEqual, unorderedRight, right, right, precision);
+                Emit(address, OpCode.Or, flagV, unorderedLeft, unorderedRight);
                 continue;
             }
 
@@ -661,10 +942,12 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
 
     private static bool IsKnownArmMnemonic(string mnemonic)
         => mnemonic is "b" or "bl" or "blx" or "bx" or "cbz" or "cbnz" or "cmp" or "cmn" or "tst" or "teq"
-            or "add" or "adds" or "sub" or "subs" or "rsb" or "mul" or "and" or "ands" or "orr" or "orrs" or "eor" or "eors"
+            or "add" or "adds" or "adc" or "adcs" or "sub" or "subs" or "sbc" or "sbcs" or "rsb" or "rsbs"
+            or "mul" or "and" or "ands" or "orr" or "orrs" or "eor" or "eors"
             or "bic" or "mov" or "movs" or "movw" or "movt" or "mvn" or "ldr" or "ldrb" or "ldrh" or "ldrsb"
             or "ldrsh" or "ldrd" or "str" or "strb" or "strh" or "strd" or "push" or "pop" or "stmdb" or "ldmia" or "adr"
-            or "lsl" or "lsls" or "lsr" or "lsrs" or "asr" or "asrs" or "ror" or "nop"
+            or "lsl" or "lsls" or "lsr" or "lsrs" or "asr" or "asrs" or "ror" or "rors"
+            or "uxtb" or "uxth" or "sxtb" or "sxth" or "nop"
             or "vadd" or "vsub" or "vmul" or "vdiv" or "vneg" or "vabs" or "vsqrt" or "vmov" or "vldr" or "vstr" or "vcmp" or "vcmpe" or "vcvt" or "vcvtr" or "vmrs";
 
     private static MethodAnalysisContext? FindFloatMathMethod(ApplicationAnalysisContext context, string typeName, string methodName)
