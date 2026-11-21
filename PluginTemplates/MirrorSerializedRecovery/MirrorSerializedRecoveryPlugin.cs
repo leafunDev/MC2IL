@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Text.RegularExpressions;
 using MC2IL.Core.Api;
 using MC2IL.Core.Attributes;
 using MC2IL.Core.Logging;
@@ -53,7 +52,7 @@ public sealed class MirrorSerializedRecoveryOutputFormat : MC2ILOutputFormat
 
             var result = MirrorSerializationSourceCleaner.CleanDirectory(generatedRoot);
             Logger.InfoNewline(
-                $"Parsed {result.FilesParsed} C# files; moved {result.MembersMoved} Mirror-generated members from {result.TypesMadePartial} types into {result.SidecarFiles} sidecar files. Restored {result.NetworkMethodBodiesRestored} original Command/RPC method bodies and {result.NetworkArgumentsRestored} Mirror-generated pointer arguments. Restored {result.SyncVarAccessorsRewritten} SyncVar accessors from IL2CPP pointer offsets. {result.FilesSkipped} files were left untouched.",
+                $"Parsed {result.FilesParsed} C# files; moved {result.MembersMoved} Mirror-generated members from {result.TypesMadePartial} types into {result.SidecarFiles} sidecar files. Restored {result.NetworkArgumentsRestored} serialized method arguments; rebuilt {result.NetworkDispatchHandlersRebuilt} generated dispatch handlers with {result.NetworkDispatchArgumentsRestored} deserialized arguments. Restored {result.SyncVarAccessorsRewritten} SyncVar accessors from IL2CPP pointer offsets. {result.FilesSkipped} files were left untouched.",
                 "MirrorRecovery");
 
             var finalCSharpRoot = Path.Combine(outputRoot, "CSharp");
@@ -166,8 +165,9 @@ internal sealed class MirrorSerializationCleanupResult
     public int TypesMadePartial { get; set; }
     public int SidecarFiles { get; set; }
     public int SyncVarAccessorsRewritten { get; set; }
-    public int NetworkMethodBodiesRestored { get; set; }
     public int NetworkArgumentsRestored { get; set; }
+    public int NetworkDispatchArgumentsRestored { get; set; }
+    public int NetworkDispatchHandlersRebuilt { get; set; }
 }
 
 internal sealed class ParsedSourceFile
@@ -243,13 +243,30 @@ internal static class MirrorSerializationSourceCleaner
         var textChanges = new List<TextChange>();
         var sidecars = new List<(ClassDeclarationSyntax Type, List<MemberDeclarationSyntax> Members)>();
         var movedCount = 0;
-        var restoredNetworkBodyCount = 0;
 
         foreach (var type in parsedFile.Classes)
         {
             var networkType = IsNetworkBehaviour(type, classIndex, new HashSet<string>(StringComparer.Ordinal));
             if (networkType)
-                restoredNetworkBodyCount += RestoreOriginalNetworkMethodBodies(type, parsedFile.Text, textChanges, result);
+            {
+                foreach (var networkMethod in type.Members.OfType<MethodDeclarationSyntax>())
+                {
+                    if (networkMethod.Body == null
+                        || !HasNetworkSendAttribute(networkMethod)
+                        || !IsGeneratedNetworkSendWrapper(networkMethod))
+                        continue;
+
+                    var updatedBody = RestoreGeneratedObjectArguments(
+                        type,
+                        networkMethod,
+                        networkMethod.Body,
+                        result,
+                        restoreSerializationWriterArguments: true);
+                    if (!ReferenceEquals(updatedBody, networkMethod.Body)
+                        && updatedBody.ToFullString() != networkMethod.Body.ToFullString())
+                        textChanges.Add(new TextChange(networkMethod.Body.FullSpan, updatedBody.ToFullString()));
+                }
+            }
 
             var syncVarFields = GetSyncVarFieldTypes(type);
             var selectedMembers = type.Members
@@ -274,6 +291,26 @@ internal static class MirrorSerializationSourceCleaner
                 {
                     movedMembers.Add(rewrittenProperty);
                     result.SyncVarAccessorsRewritten++;
+                }
+                else if (networkType && member is MethodDeclarationSyntax method
+                    && method.Body != null
+                    && method.Identifier.ValueText.StartsWith("InvokeUserCode_", StringComparison.Ordinal))
+                {
+                    movedMembers.Add(RestoreNetworkDispatchArguments(type, method, result));
+                }
+                else if (networkType && member is MethodDeclarationSyntax userCodeMethod
+                    && userCodeMethod.Body != null
+                    && userCodeMethod.Identifier.ValueText.StartsWith("UserCode_", StringComparison.Ordinal))
+                {
+                    var updatedBody = RestoreGeneratedObjectArguments(
+                        type,
+                        userCodeMethod,
+                        userCodeMethod.Body,
+                        result,
+                        restoreSerializationWriterArguments: false);
+                    movedMembers.Add(ReferenceEquals(updatedBody, userCodeMethod.Body)
+                        ? userCodeMethod
+                        : userCodeMethod.WithBody(updatedBody));
                 }
                 else
                 {
@@ -313,7 +350,6 @@ internal static class MirrorSerializationSourceCleaner
         File.WriteAllText(parsedFile.Path, updatedSource.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
         result.TypesMadePartial += sidecars.Count;
         result.MembersMoved += movedCount;
-        result.NetworkMethodBodiesRestored += restoredNetworkBodyCount;
 
         if (sidecars.Count == 0)
             return;
@@ -338,74 +374,12 @@ internal static class MirrorSerializationSourceCleaner
         }
     }
 
-    private static int RestoreOriginalNetworkMethodBodies(
-        ClassDeclarationSyntax type,
-        string sourceText,
-        List<TextChange> textChanges,
-        MirrorSerializationCleanupResult result)
-    {
-        var userCodeMethods = type.Members.OfType<MethodDeclarationSyntax>()
-            .Where(method => method.Identifier.ValueText.StartsWith("UserCode_", StringComparison.Ordinal)
-                && method.Body != null)
-            .GroupBy(method => method.Identifier.ValueText, StringComparer.Ordinal)
-            .ToDictionary(group => group.Key, group => group.ToArray(), StringComparer.Ordinal);
-
-        var restoredCount = 0;
-        foreach (var networkMethod in type.Members.OfType<MethodDeclarationSyntax>())
-        {
-            if (networkMethod.Body == null
-                || !HasNetworkSendAttribute(networkMethod)
-                || !IsGeneratedNetworkSendWrapper(networkMethod))
-                continue;
-
-            var userCodeName = "UserCode_" + networkMethod.Identifier.ValueText;
-            if (!userCodeMethods.TryGetValue(userCodeName, out var candidates))
-                continue;
-
-            var matchingMethods = candidates
-                .Where(candidate => HasSameMethodSignature(networkMethod, candidate))
-                .ToArray();
-            if (matchingMethods.Length != 1)
-                continue;
-
-            var originalBody = matchingMethods[0].Body!;
-            originalBody = RestoreGeneratedObjectArguments(type, networkMethod, originalBody, result);
-            var restoredBodyText = Regex.Replace(
-                originalBody.ToFullString(),
-                @"^[ \t]*//IL_[^\r\n]*(?:\r\n|\n|\r)",
-                string.Empty,
-                RegexOptions.Multiline);
-            restoredBodyText = Regex.Replace(restoredBodyText, @"(\r?\n)[ \t]*(?=\r?\n)", "$1");
-            textChanges.Add(new TextChange(networkMethod.Body.FullSpan, restoredBodyText));
-            if (!RequiresUnsafeContext(originalBody))
-            {
-                var unsafeModifier = networkMethod.Modifiers.FirstOrDefault(modifier => modifier.IsKind(SyntaxKind.UnsafeKeyword));
-                if (unsafeModifier != default)
-                {
-                    var removalStart = unsafeModifier.SpanStart;
-                    var removalEnd = unsafeModifier.Span.End;
-                    while (removalStart > networkMethod.SpanStart
-                        && sourceText[removalStart - 1] is ' ' or '\t')
-                        removalStart--;
-                    while (removalEnd < sourceText.Length
-                        && sourceText[removalEnd] is ' ' or '\t')
-                        removalEnd++;
-
-                    textChanges.Add(new TextChange(TextSpan.FromBounds(removalStart, removalEnd), " "));
-                }
-            }
-
-            restoredCount++;
-        }
-
-        return restoredCount;
-    }
-
     private static BlockSyntax RestoreGeneratedObjectArguments(
         ClassDeclarationSyntax type,
         MethodDeclarationSyntax networkMethod,
         BlockSyntax body,
-        MirrorSerializationCleanupResult result)
+        MirrorSerializationCleanupResult result,
+        bool restoreSerializationWriterArguments)
     {
         var restoredBody = body;
         var restoredObjectLocalNames = new HashSet<string>(StringComparer.Ordinal);
@@ -415,16 +389,30 @@ internal static class MirrorSerializationSourceCleaner
             if (string.IsNullOrEmpty(calledName))
                 continue;
 
-            var targetMethods = type.Members.OfType<MethodDeclarationSyntax>()
-                .Where(method => method.Identifier.ValueText == calledName && HasNetworkSendAttribute(method))
-                .ToArray();
-            if (targetMethods.Length != 1 || targetMethods[0].ParameterList.Parameters.Count != 1
-                || invocation.ArgumentList.Arguments.Count != 1)
-                continue;
+            ArgumentSyntax argument;
+            string targetType;
+            if (restoreSerializationWriterArguments
+                && calledName.StartsWith("_Write_", StringComparison.Ordinal)
+                && invocation.ArgumentList.Arguments.Count == 2)
+            {
+                argument = invocation.ArgumentList.Arguments[1];
+                targetType = NormalizeTypeName(GetCastType(argument.Expression));
+            }
+            else
+            {
+                var targetMethods = type.Members.OfType<MethodDeclarationSyntax>()
+                    .Where(method => method.Identifier.ValueText == calledName && HasNetworkSendAttribute(method))
+                    .ToArray();
+                if (targetMethods.Length != 1 || targetMethods[0].ParameterList.Parameters.Count != 1
+                    || invocation.ArgumentList.Arguments.Count != 1)
+                    continue;
 
-            var targetType = NormalizeTypeName(targetMethods[0].ParameterList.Parameters[0].Type?.ToString() ?? string.Empty);
-            var argument = invocation.ArgumentList.Arguments[0];
-            if (NormalizeTypeName(GetCastType(argument.Expression)) != targetType
+                targetType = NormalizeTypeName(targetMethods[0].ParameterList.Parameters[0].Type?.ToString() ?? string.Empty);
+                argument = invocation.ArgumentList.Arguments[0];
+            }
+
+            if (string.IsNullOrEmpty(targetType)
+                || NormalizeTypeName(GetCastType(argument.Expression)) != targetType
                 || !TryGetAddressedObjectLocal(argument.Expression, out var objectLocalName)
                 || !HasDefaultObjectLocal(body, objectLocalName))
                 continue;
@@ -442,12 +430,18 @@ internal static class MirrorSerializationSourceCleaner
             result.NetworkArgumentsRestored++;
         }
 
-        foreach (var local in restoredBody.DescendantNodes().OfType<LocalDeclarationStatementSyntax>().ToArray())
+        return RemoveRecoveredObjectLocals(restoredBody, restoredObjectLocalNames);
+    }
+
+    private static BlockSyntax RemoveRecoveredObjectLocals(BlockSyntax body, HashSet<string> recoveredNames)
+    {
+        var updatedBody = body;
+        foreach (var local in updatedBody.DescendantNodes().OfType<LocalDeclarationStatementSyntax>().ToArray())
         {
             var unusedVariables = local.Declaration.Variables
-                .Where(variable => restoredObjectLocalNames.Contains(variable.Identifier.ValueText)
+                .Where(variable => recoveredNames.Contains(variable.Identifier.ValueText)
                     && IsDefaultObjectDeclaration(local.Declaration.Type, variable)
-                    && !restoredBody.DescendantNodes().OfType<IdentifierNameSyntax>()
+                    && !updatedBody.DescendantNodes().OfType<IdentifierNameSyntax>()
                         .Any(identifier => identifier.Identifier.ValueText == variable.Identifier.ValueText))
                 .ToArray();
             if (unusedVariables.Length == 0)
@@ -455,16 +449,506 @@ internal static class MirrorSerializationSourceCleaner
 
             if (unusedVariables.Length == local.Declaration.Variables.Count)
             {
-                restoredBody = restoredBody.RemoveNode(local, SyntaxRemoveOptions.KeepExteriorTrivia) ?? restoredBody;
+                updatedBody = updatedBody.RemoveNode(local, SyntaxRemoveOptions.KeepExteriorTrivia) ?? updatedBody;
                 continue;
             }
 
             var updatedDeclaration = local.Declaration.RemoveNodes(unusedVariables, SyntaxRemoveOptions.KeepNoTrivia);
             if (updatedDeclaration != null)
-                restoredBody = restoredBody.ReplaceNode(local, local.WithDeclaration(updatedDeclaration));
+                updatedBody = updatedBody.ReplaceNode(local, local.WithDeclaration(updatedDeclaration));
         }
 
-        return restoredBody;
+        return updatedBody;
+    }
+
+    private static MethodDeclarationSyntax RestoreNetworkDispatchArguments(
+        ClassDeclarationSyntax type,
+        MethodDeclarationSyntax dispatchMethod,
+        MirrorSerializationCleanupResult result)
+    {
+        const string invokePrefix = "InvokeUserCode_";
+        var dispatchName = dispatchMethod.Identifier.ValueText;
+        if (!dispatchName.StartsWith(invokePrefix, StringComparison.Ordinal))
+            return dispatchMethod;
+
+        var userCodeName = "UserCode_" + dispatchName.Substring(invokePrefix.Length);
+        var userCodeMethods = type.Members.OfType<MethodDeclarationSyntax>()
+            .Where(method => method.Identifier.ValueText == userCodeName && method.Body != null)
+            .ToArray();
+        if (userCodeMethods.Length != 1)
+            return dispatchMethod;
+
+        var userCode = userCodeMethods[0];
+        var userCodeCalls = dispatchMethod.Body!.DescendantNodes().OfType<InvocationExpressionSyntax>()
+            .Where(invocation => GetInvokedMethodName(invocation.Expression) == userCodeName)
+            .ToArray();
+        if (userCodeCalls.Length > 1
+            || userCodeCalls.Length == 1
+                && userCodeCalls[0].ArgumentList.Arguments.Count != userCode.ParameterList.Parameters.Count)
+            return dispatchMethod;
+
+        var readerParameters = dispatchMethod.ParameterList.Parameters
+            .Where(parameter => GetSimpleTypeName(parameter.Type) == "NetworkReader")
+            .ToArray();
+        if (readerParameters.Length != 1)
+            return dispatchMethod;
+
+        var senderParameters = dispatchMethod.ParameterList.Parameters
+            .Where(parameter => GetSimpleTypeName(parameter.Type) == "NetworkConnectionToClient")
+            .ToArray();
+        var serializedParameterIndexes = new List<int>();
+        for (var i = 0; i < userCode.ParameterList.Parameters.Count; i++)
+        {
+            var parameter = userCode.ParameterList.Parameters[i];
+            if (parameter.Modifiers.Any(modifier => modifier.IsKind(SyntaxKind.RefKeyword)
+                || modifier.IsKind(SyntaxKind.OutKeyword)
+                || modifier.IsKind(SyntaxKind.InKeyword)))
+                return dispatchMethod;
+
+            if (GetSimpleTypeName(parameter.Type) == "NetworkConnectionToClient")
+            {
+                if (senderParameters.Length != 1
+                    || userCodeCalls.Length == 1
+                        && (userCodeCalls[0].ArgumentList.Arguments[i].Expression is not IdentifierNameSyntax senderArgument
+                            || senderArgument.Identifier.ValueText != senderParameters[0].Identifier.ValueText))
+                    return dispatchMethod;
+                continue;
+            }
+
+            serializedParameterIndexes.Add(i);
+        }
+
+        var readerName = readerParameters[0].Identifier.ValueText;
+        var readInvocations = dispatchMethod.Body.DescendantNodes().OfType<InvocationExpressionSyntax>()
+            .Where(invocation => IsNetworkReaderReadInvocation(invocation, readerName))
+            .OrderBy(invocation => invocation.SpanStart)
+            .ToArray();
+        if (readInvocations.Length != serializedParameterIndexes.Count)
+            return dispatchMethod;
+
+        var readStatements = dispatchMethod.Body.DescendantNodes().OfType<ExpressionStatementSyntax>()
+            .Where(statement => statement.Expression is InvocationExpressionSyntax invocation
+                && GetInvokedMethodName(invocation.Expression).StartsWith("_Read_", StringComparison.Ordinal)
+                && IsNetworkReaderReadInvocation(invocation, readerName))
+            .OrderBy(statement => statement.SpanStart)
+            .ToArray();
+        var rebuiltMethod = RebuildNetworkDispatchCall(
+            type,
+            dispatchMethod,
+            userCodeName,
+            userCode,
+            userCodeCalls,
+            serializedParameterIndexes,
+            readInvocations,
+            result);
+        if (!ReferenceEquals(rebuiltMethod, dispatchMethod))
+            return rebuiltMethod;
+
+        return RestoreDispatchArgumentsOnly(
+            dispatchMethod,
+            userCode,
+            userCodeCalls,
+            serializedParameterIndexes,
+            readStatements,
+            result);
+    }
+
+    private static MethodDeclarationSyntax RestoreDispatchArgumentsOnly(
+        MethodDeclarationSyntax dispatchMethod,
+        MethodDeclarationSyntax userCode,
+        InvocationExpressionSyntax[] userCodeCalls,
+        List<int> serializedParameterIndexes,
+        ExpressionStatementSyntax[] readStatements,
+        MirrorSerializationCleanupResult result)
+    {
+        if (userCodeCalls.Length != 1 || readStatements.Length != serializedParameterIndexes.Count)
+            return dispatchMethod;
+
+        var usedNames = new HashSet<string>(dispatchMethod.Body!.DescendantNodes().OfType<VariableDeclaratorSyntax>()
+            .Select(variable => variable.Identifier.ValueText), StringComparer.Ordinal);
+        foreach (var parameter in dispatchMethod.ParameterList.Parameters)
+            usedNames.Add(parameter.Identifier.ValueText);
+
+        var replacements = new Dictionary<SyntaxNode, SyntaxNode>();
+        var recoveredObjectNames = new HashSet<string>(StringComparer.Ordinal);
+        for (var ordinal = 0; ordinal < serializedParameterIndexes.Count; ordinal++)
+        {
+            var parameterIndex = serializedParameterIndexes[ordinal];
+            var userParameter = userCode.ParameterList.Parameters[parameterIndex];
+            var callArgument = userCodeCalls[0].ArgumentList.Arguments[parameterIndex];
+            var expectedType = NormalizeTypeName(userParameter.Type?.ToString() ?? string.Empty);
+            if (NormalizeTypeName(GetCastType(callArgument.Expression)) != expectedType
+                || !TryGetAddressedObjectLocal(callArgument.Expression, out var objectLocalName)
+                || !HasDefaultObjectLocal(dispatchMethod.Body, objectLocalName)
+                || readStatements[ordinal].Expression is not InvocationExpressionSyntax readInvocation)
+                return dispatchMethod;
+
+            var localName = "__mc2ilMirrorArg" + ordinal;
+            var suffix = 0;
+            while (!usedNames.Add(localName))
+                localName = "__mc2ilMirrorArg" + ordinal + "_" + (++suffix);
+
+            var local = SyntaxFactory.LocalDeclarationStatement(
+                    SyntaxFactory.VariableDeclaration(
+                        userParameter.Type!.WithoutTrivia(),
+                        SyntaxFactory.SingletonSeparatedList(
+                            SyntaxFactory.VariableDeclarator(localName)
+                                .WithInitializer(SyntaxFactory.EqualsValueClause(readInvocation.WithoutTrivia())))))
+                .WithTriviaFrom(readStatements[ordinal]);
+            replacements[readStatements[ordinal]] = local;
+            replacements[callArgument] = callArgument.WithExpression(
+                SyntaxFactory.IdentifierName(localName).WithTriviaFrom(callArgument.Expression));
+            recoveredObjectNames.Add(objectLocalName);
+        }
+
+        if (replacements.Count == 0)
+            return dispatchMethod;
+
+        var updatedBody = dispatchMethod.Body!.ReplaceNodes(
+            replacements.Keys,
+            (original, _) => replacements[original]);
+        updatedBody = RemoveRecoveredObjectLocals(updatedBody, recoveredObjectNames);
+        result.NetworkDispatchArgumentsRestored += serializedParameterIndexes.Count;
+        return dispatchMethod.WithBody(updatedBody);
+    }
+
+    private static MethodDeclarationSyntax RebuildNetworkDispatchCall(
+        ClassDeclarationSyntax type,
+        MethodDeclarationSyntax dispatchMethod,
+        string userCodeName,
+        MethodDeclarationSyntax userCode,
+        InvocationExpressionSyntax[] userCodeCalls,
+        List<int> serializedParameterIndexes,
+        InvocationExpressionSyntax[] readInvocations,
+        MirrorSerializationCleanupResult result)
+    {
+        // Rebuild only Mirror's unambiguous generated shape: one active-state guard,
+        // one inactive-side error log, a matching attributed send wrapper, and one
+        // reader call for every serialized parameter.
+        if (dispatchMethod.Body == null || dispatchMethod.Body.Statements.Count == 0)
+            return dispatchMethod;
+
+        var wrapperName = dispatchMethod.Identifier.ValueText.Substring("InvokeUserCode_".Length);
+        var wrappers = type.Members.OfType<MethodDeclarationSyntax>()
+            .Where(method => method.Identifier.ValueText == wrapperName
+                && method.Body != null
+                && HasNetworkSendAttribute(method)
+                && IsGeneratedNetworkSendWrapper(method))
+            .ToArray();
+        if (wrappers.Length != 1)
+            return dispatchMethod;
+
+        var wrapper = wrappers[0];
+        var networkAttribute = GetNetworkSendAttributeName(wrapper);
+        // TargetRpc has version-specific target-connection handling. Keep it unchanged
+        // until its generated signature can be proven from the input.
+        if (networkAttribute is not ("Command" or "ClientRpc" or "TargetRpc")
+            || !IsVoidType(userCode.ReturnType)
+            || !IsVoidType(wrapper.ReturnType)
+            || wrapper.ParameterList.Parameters.Count != userCode.ParameterList.Parameters.Count)
+            return dispatchMethod;
+
+        for (var i = 0; i < wrapper.ParameterList.Parameters.Count; i++)
+        {
+            var wrapperParameter = wrapper.ParameterList.Parameters[i];
+            var userParameter = userCode.ParameterList.Parameters[i];
+            if (NormalizeTypeName(wrapperParameter.Type?.ToString() ?? string.Empty)
+                    != NormalizeTypeName(userParameter.Type?.ToString() ?? string.Empty)
+                || GetParameterRefKind(wrapperParameter) != GetParameterRefKind(userParameter))
+                return dispatchMethod;
+        }
+
+        var parameters = dispatchMethod.ParameterList.Parameters;
+        if (parameters.Count is not (2 or 3)
+            || GetSimpleTypeName(parameters[0].Type) != "NetworkBehaviour"
+            || GetSimpleTypeName(parameters[1].Type) != "NetworkReader"
+            || parameters.Count == 3
+                && GetSimpleTypeName(parameters[2].Type) != "NetworkConnectionToClient")
+            return dispatchMethod;
+
+        var receiverName = parameters[0].Identifier.ValueText;
+        var readerName = parameters[1].Identifier.ValueText;
+        var senderName = parameters.Count == 3 ? parameters[2].Identifier.ValueText : null;
+        var expectedActiveType = networkAttribute == "Command" ? "NetworkServer" : "NetworkClient";
+        var activeGuards = dispatchMethod.Body.Statements.OfType<IfStatementSyntax>()
+            .Where(guard => IsExpectedNetworkActiveCondition(
+                guard.Condition,
+                dispatchMethod.Body,
+                expectedActiveType,
+                out _))
+            .ToArray();
+        if (activeGuards.Length != 1
+            || activeGuards[0].Statement is not BlockSyntax generatedBlock)
+            return dispatchMethod;
+        var activeGuard = activeGuards[0];
+        var activeGuardIndex = dispatchMethod.Body.Statements.IndexOf(activeGuard);
+        if (!IsExpectedNetworkActiveCondition(
+                activeGuard.Condition,
+                dispatchMethod.Body,
+                expectedActiveType,
+                out var activeLocal))
+            return dispatchMethod;
+
+        var prefixStatements = new List<StatementSyntax>();
+        if (activeLocal != null)
+        {
+            if (activeGuardIndex != 1 || !ReferenceEquals(dispatchMethod.Body.Statements[0], activeLocal))
+                return dispatchMethod;
+            prefixStatements.Add(activeLocal);
+        }
+        else if (activeGuardIndex != 0)
+        {
+            return dispatchMethod;
+        }
+
+        var expectedError = networkAttribute switch
+        {
+            "Command" => "Command " + wrapperName + " called on client.",
+            "TargetRpc" => "TargetRPC " + wrapperName + " called on server.",
+            _ => "RPC " + wrapperName + " called on server."
+        };
+        var inactiveLogs = dispatchMethod.Body.DescendantNodes().OfType<ExpressionStatementSyntax>()
+            .Where(statement => IsExpectedInactiveNetworkLog(statement, expectedError))
+            .ToArray();
+        if (inactiveLogs.Length != 1 || generatedBlock.Span.Contains(inactiveLogs[0].Span))
+            return dispatchMethod;
+        var inactiveLog = inactiveLogs[0];
+
+        foreach (var statement in dispatchMethod.Body.Statements)
+        {
+            if (ReferenceEquals(statement, activeGuard)
+                || ReferenceEquals(statement, activeLocal)
+                || ReferenceEquals(statement, inactiveLog))
+                continue;
+
+            if (statement is ReturnStatementSyntax
+                || statement is GotoStatementSyntax gotoStatement
+                    && gotoStatement.Expression is IdentifierNameSyntax label
+                    && label.Identifier.ValueText.StartsWith("IL_", StringComparison.Ordinal)
+                || IsNullReferenceThrowLabel(statement))
+                continue;
+
+            return dispatchMethod;
+        }
+
+        var inlinedUserCodeCalls = userCode.Body!.DescendantNodes().OfType<InvocationExpressionSyntax>()
+            .Select(invocation => GetInvokedMethodName(invocation.Expression))
+            .GroupBy(name => name, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
+        var observedInlinedCalls = new Dictionary<string, int>(StringComparer.Ordinal);
+        var dispatchInvocations = generatedBlock.DescendantNodes().OfType<InvocationExpressionSyntax>()
+            .ToArray();
+        foreach (var invocation in dispatchInvocations)
+        {
+            var invokedName = GetInvokedMethodName(invocation.Expression);
+            if (IsNetworkReaderReadInvocation(invocation, readerName)
+                || invokedName == "GetTypeFromHandle"
+                || invokedName == userCodeName)
+                continue;
+
+            observedInlinedCalls.TryGetValue(invokedName, out var observedCount);
+            inlinedUserCodeCalls.TryGetValue(invokedName, out var userCodeCount);
+            if (observedCount >= userCodeCount)
+                return dispatchMethod;
+            observedInlinedCalls[invokedName] = observedCount + 1;
+        }
+
+        if (generatedBlock.DescendantNodes().OfType<TypeOfExpressionSyntax>()
+                .All(expression => GetSimpleTypeName(expression.Type) != type.Identifier.ValueText)
+            || generatedBlock.DescendantNodes().OfType<IdentifierNameSyntax>()
+                .All(identifier => identifier.Identifier.ValueText != receiverName))
+            return dispatchMethod;
+
+        if (readInvocations.Length != serializedParameterIndexes.Count
+            || readInvocations.Any(invocation => !generatedBlock.Span.Contains(invocation.Span)))
+            return dispatchMethod;
+
+        var localNames = new HashSet<string>(parameters.Select(parameter => parameter.Identifier.ValueText), StringComparer.Ordinal);
+        foreach (var variable in dispatchMethod.Body.DescendantNodes().OfType<VariableDeclaratorSyntax>())
+            localNames.Add(variable.Identifier.ValueText);
+
+        var recoveredStatements = new List<StatementSyntax>();
+        var localsByParameter = new Dictionary<int, string>();
+        for (var ordinal = 0; ordinal < serializedParameterIndexes.Count; ordinal++)
+        {
+            var parameterIndex = serializedParameterIndexes[ordinal];
+            var userParameter = userCode.ParameterList.Parameters[parameterIndex];
+            if (userParameter.Type == null
+                || !IsNetworkReaderReadInvocation(readInvocations[ordinal], readerName))
+                return dispatchMethod;
+
+            var localName = "__mc2ilMirrorArg" + ordinal;
+            var suffix = 0;
+            while (!localNames.Add(localName))
+                localName = "__mc2ilMirrorArg" + ordinal + "_" + (++suffix);
+
+            var local = SyntaxFactory.LocalDeclarationStatement(
+                SyntaxFactory.VariableDeclaration(
+                    userParameter.Type.WithoutTrivia(),
+                    SyntaxFactory.SingletonSeparatedList(
+                        SyntaxFactory.VariableDeclarator(localName)
+                                .WithInitializer(SyntaxFactory.EqualsValueClause(readInvocations[ordinal].WithoutTrivia())))));
+            recoveredStatements.Add(local.WithTriviaFrom(readInvocations[ordinal]));
+            localsByParameter.Add(parameterIndex, localName);
+        }
+
+        var nullCheck = SyntaxFactory.IfStatement(
+            SyntaxFactory.BinaryExpression(
+                SyntaxKind.EqualsExpression,
+                SyntaxFactory.ParenthesizedExpression(
+                    SyntaxFactory.CastExpression(
+                        SyntaxFactory.PredefinedType(SyntaxFactory.Token(SyntaxKind.ObjectKeyword)),
+                        SyntaxFactory.IdentifierName(receiverName))),
+                SyntaxFactory.LiteralExpression(SyntaxKind.NullLiteralExpression)),
+            SyntaxFactory.Block(
+                SyntaxFactory.ThrowStatement(
+                    SyntaxFactory.ObjectCreationExpression(SyntaxFactory.IdentifierName("NullReferenceException"))
+                        .WithArgumentList(SyntaxFactory.ArgumentList()))));
+        recoveredStatements.Add(nullCheck);
+
+        var selfType = SyntaxFactory.ParseTypeName(
+            type.Identifier.ToString() + (type.TypeParameterList?.ToString() ?? string.Empty));
+        var userCodeArguments = new List<ArgumentSyntax>();
+        for (var i = 0; i < userCode.ParameterList.Parameters.Count; i++)
+        {
+            var parameter = userCode.ParameterList.Parameters[i];
+            var argumentName = GetSimpleTypeName(parameter.Type) == "NetworkConnectionToClient"
+                ? senderName
+                : localsByParameter.TryGetValue(i, out var localName) ? localName : null;
+            if (argumentName == null)
+                return dispatchMethod;
+
+            userCodeArguments.Add(SyntaxFactory.Argument(SyntaxFactory.IdentifierName(argumentName)));
+        }
+
+        var userCodeCall = SyntaxFactory.InvocationExpression(
+            SyntaxFactory.MemberAccessExpression(
+                SyntaxKind.SimpleMemberAccessExpression,
+                SyntaxFactory.ParenthesizedExpression(
+                    SyntaxFactory.CastExpression(selfType, SyntaxFactory.IdentifierName(receiverName))),
+                SyntaxFactory.IdentifierName(userCodeName)),
+            SyntaxFactory.ArgumentList(SyntaxFactory.SeparatedList(userCodeArguments)));
+        recoveredStatements.Add(SyntaxFactory.ExpressionStatement(userCodeCall));
+        recoveredStatements.Add(SyntaxFactory.ReturnStatement());
+
+        var rebuiltGuard = SyntaxFactory.IfStatement(
+                activeGuard.Condition.WithoutTrivia(),
+                SyntaxFactory.Block(recoveredStatements).WithTriviaFrom(generatedBlock))
+            .WithElse(SyntaxFactory.ElseClause(SyntaxFactory.Block(inactiveLog)));
+        prefixStatements.Add(rebuiltGuard.WithTriviaFrom(activeGuard));
+        var rebuiltBody = SyntaxFactory.Block(SyntaxFactory.List(prefixStatements))
+            .WithTriviaFrom(dispatchMethod.Body);
+        result.NetworkDispatchArgumentsRestored += serializedParameterIndexes.Count;
+        result.NetworkDispatchHandlersRebuilt++;
+        return dispatchMethod.WithBody(rebuiltBody);
+    }
+
+    private static bool IsVoidType(TypeSyntax type)
+    {
+        return type is PredefinedTypeSyntax predefinedType
+            && predefinedType.Keyword.IsKind(SyntaxKind.VoidKeyword);
+    }
+
+    private static bool IsExpectedNetworkActiveCondition(
+        ExpressionSyntax condition,
+        BlockSyntax methodBody,
+        string expectedActiveType,
+        out LocalDeclarationStatementSyntax? activeLocal)
+    {
+        activeLocal = null;
+        while (condition is ParenthesizedExpressionSyntax parenthesized)
+            condition = parenthesized.Expression;
+
+        if (IsNetworkActiveMember(condition, expectedActiveType))
+            return true;
+
+        if (condition is not IdentifierNameSyntax identifier)
+            return false;
+
+        var matchingLocals = methodBody.Statements.OfType<LocalDeclarationStatementSyntax>()
+            .Where(local => NormalizeTypeName(local.Declaration.Type.ToString()) == "bool"
+                && local.Declaration.Variables.Count == 1
+                && local.Declaration.Variables[0].Identifier.ValueText == identifier.Identifier.ValueText
+                && local.Declaration.Variables[0].Initializer != null
+                && IsNetworkActiveMember(local.Declaration.Variables[0].Initializer!.Value, expectedActiveType))
+            .ToArray();
+        if (matchingLocals.Length != 1)
+            return false;
+
+        activeLocal = matchingLocals[0];
+        return true;
+    }
+
+    private static bool IsNetworkActiveMember(ExpressionSyntax expression, string expectedActiveType)
+    {
+        while (expression is ParenthesizedExpressionSyntax parenthesized)
+            expression = parenthesized.Expression;
+
+        return expression is MemberAccessExpressionSyntax memberAccess
+            && memberAccess.Name.Identifier.ValueText == "active"
+            && memberAccess.Expression is IdentifierNameSyntax typeName
+            && typeName.Identifier.ValueText == expectedActiveType;
+    }
+
+    private static bool IsNullReferenceThrowLabel(StatementSyntax statement)
+    {
+        if (statement is not LabeledStatementSyntax label)
+            return false;
+
+        StatementSyntax body = label.Statement;
+        if (body is BlockSyntax block)
+        {
+            if (block.Statements.Count != 1)
+                return false;
+            body = block.Statements[0];
+        }
+
+        return body is ThrowStatementSyntax throwStatement
+            && throwStatement.Expression is ObjectCreationExpressionSyntax creation
+            && GetSimpleTypeName(creation.Type) == "NullReferenceException";
+    }
+
+    private static bool IsNetworkReaderReadInvocation(InvocationExpressionSyntax invocation, string readerName)
+    {
+        var methodName = GetInvokedMethodName(invocation.Expression);
+        if (methodName.StartsWith("_Read_", StringComparison.Ordinal))
+            return invocation.ArgumentList.Arguments.Count == 1
+                && invocation.ArgumentList.Arguments[0].Expression is IdentifierNameSyntax readerArgument
+                && readerArgument.Identifier.ValueText == readerName;
+
+        return methodName.StartsWith("Read", StringComparison.Ordinal)
+            && invocation.ArgumentList.Arguments.Count == 0
+            && invocation.Expression is MemberAccessExpressionSyntax memberAccess
+            && memberAccess.Expression is IdentifierNameSyntax target
+            && target.Identifier.ValueText == readerName;
+    }
+
+    private static bool IsExpectedInactiveNetworkLog(StatementSyntax statement, string expectedMessage)
+    {
+        if (statement is BlockSyntax block)
+            return block.Statements.Count == 1
+                && IsExpectedInactiveNetworkLog(block.Statements[0], expectedMessage);
+
+        if (statement is not ExpressionStatementSyntax expressionStatement
+            || expressionStatement.Expression is not InvocationExpressionSyntax invocation
+            || GetInvokedMethodName(invocation.Expression) != "LogError"
+            || invocation.ArgumentList.Arguments.Count != 1
+            || invocation.ArgumentList.Arguments[0].Expression is not LiteralExpressionSyntax literal
+            || !literal.IsKind(SyntaxKind.StringLiteralExpression))
+            return false;
+
+        return literal.Token.ValueText == expectedMessage;
+    }
+
+    private static string GetParameterRefKind(ParameterSyntax parameter)
+    {
+        foreach (var modifier in parameter.Modifiers)
+            if (modifier.IsKind(SyntaxKind.RefKeyword)
+                || modifier.IsKind(SyntaxKind.OutKeyword)
+                || modifier.IsKind(SyntaxKind.InKeyword))
+                return modifier.ValueText;
+
+        return string.Empty;
     }
 
     private static string GetInvokedMethodName(ExpressionSyntax expression)
@@ -524,6 +1008,11 @@ internal static class MirrorSerializationSourceCleaner
 
     private static bool HasNetworkSendAttribute(MethodDeclarationSyntax method)
     {
+        return GetNetworkSendAttributeName(method) != string.Empty;
+    }
+
+    private static string GetNetworkSendAttributeName(MethodDeclarationSyntax method)
+    {
         foreach (var attribute in method.AttributeLists.SelectMany(list => list.Attributes))
         {
             var name = attribute.Name.ToString();
@@ -537,10 +1026,10 @@ internal static class MirrorSerializationSourceCleaner
                 name = name.Substring(0, name.Length - "Attribute".Length);
 
             if (name is "Command" or "ClientRpc" or "TargetRpc")
-                return true;
+                return name;
         }
 
-        return false;
+        return string.Empty;
     }
 
     private static bool IsGeneratedNetworkSendWrapper(MethodDeclarationSyntax method)
@@ -553,50 +1042,6 @@ internal static class MirrorSerializationSourceCleaner
             && invocationNames.Any(name => name.EndsWith("SendCommandInternal", StringComparison.Ordinal)
                 || name.EndsWith("SendRPCInternal", StringComparison.Ordinal)
                 || name.EndsWith("SendTargetRPCInternal", StringComparison.Ordinal));
-    }
-
-    private static bool HasSameMethodSignature(MethodDeclarationSyntax first, MethodDeclarationSyntax second)
-    {
-        if (!string.Equals(NormalizeTypeName(first.ReturnType.ToString()), NormalizeTypeName(second.ReturnType.ToString()), StringComparison.Ordinal)
-            || first.ParameterList.Parameters.Count != second.ParameterList.Parameters.Count)
-            return false;
-
-        for (var i = 0; i < first.ParameterList.Parameters.Count; i++)
-        {
-            var firstParameter = first.ParameterList.Parameters[i];
-            var secondParameter = second.ParameterList.Parameters[i];
-            if (!string.Equals(NormalizeTypeName(firstParameter.Type?.ToString() ?? string.Empty), NormalizeTypeName(secondParameter.Type?.ToString() ?? string.Empty), StringComparison.Ordinal)
-                || !string.Equals(GetParameterRefKind(firstParameter), GetParameterRefKind(secondParameter), StringComparison.Ordinal))
-                return false;
-        }
-
-        return true;
-    }
-
-    private static string GetParameterRefKind(ParameterSyntax parameter)
-    {
-        foreach (var modifier in parameter.Modifiers)
-            if (modifier.IsKind(SyntaxKind.RefKeyword)
-                || modifier.IsKind(SyntaxKind.OutKeyword)
-                || modifier.IsKind(SyntaxKind.InKeyword))
-                return modifier.ValueText;
-
-        return string.Empty;
-    }
-
-    private static bool RequiresUnsafeContext(BlockSyntax body)
-    {
-        return body.DescendantNodesAndSelf().Any(node =>
-            node is PointerTypeSyntax
-            || node is FunctionPointerTypeSyntax
-            || node is FixedStatementSyntax
-            || node is SizeOfExpressionSyntax
-            || node is PrefixUnaryExpressionSyntax prefix
-                && (prefix.IsKind(SyntaxKind.AddressOfExpression) || prefix.IsKind(SyntaxKind.PointerIndirectionExpression))
-            || node is PostfixUnaryExpressionSyntax postfix
-                && postfix.IsKind(SyntaxKind.PointerIndirectionExpression)
-            || node is MemberAccessExpressionSyntax memberAccess
-                && memberAccess.IsKind(SyntaxKind.PointerMemberAccessExpression));
     }
 
     private static string GetAssemblyDirectory(string sourceRoot, string sourceFilePath)
