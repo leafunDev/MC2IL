@@ -367,6 +367,7 @@ public static class MetadataResolver
 
         // An ELF GOT load returns the address of the metadata slot. Resolve its second load
         // before the absolute-load pass, while the original slot address is still available.
+        // This gives MethodInfo::klass the loaded MethodInfo, rather than the address of its slot.
         var instructions = method.ControlFlowGraph!.Instructions;
         var slots = new Dictionary<LocalVariable, ulong>();
         foreach (var instruction in instructions)
@@ -391,6 +392,11 @@ public static class MetadataResolver
                 instruction.SetOperand(1, new StringLiteral(usage.AsLiteral()));
             else if (usage is { Type: MetadataUsageType.TypeInfo or MetadataUsageType.Type, IsValid: true })
                 instruction.SetOperand(1, method.AppContext.ResolveIl2CppType(usage.AsType()));
+            else if (usage is { Type: MetadataUsageType.MethodDef or MetadataUsageType.MethodRef }
+                && IsValidMetadataUsage(libContext, usage)
+                && instruction.MemoryAccessSize == binary.PointerSizeBytes
+                && method.AppContext.ResolveContextForMethod(usage) is { DeclaringType: { } declaringType } target)
+                instruction.SetOperand(1, new RuntimeMethodInfoAnalysisContext(target, declaringType.DeclaringAssembly));
         }
 
         bool IsReadablePointer(ulong address) => address % (ulong)binary.PointerSizeBytes == 0
