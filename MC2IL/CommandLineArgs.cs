@@ -18,6 +18,9 @@ public class CommandLineArgs
     [Option("exe-name", HelpText = "Specify an override for the unity executable name in case the auto-detection doesn't work.")]
     public string? ExeName { get; set; }
 
+    [Option("android-abi", HelpText = "Select the native IL2CPP binary in an APK, XAPK or APKM: armeabi-v7a, arm64-v8a, x86 or x86_64.")]
+    public string? AndroidAbi { get; set; }
+
     //Force options
 
     [Option("force-binary-path", HelpText = "Force the path to the il2cpp binary. Don't use unless you know what you're doing, and use in conjunction with the other force options.")]

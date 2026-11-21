@@ -27,7 +27,7 @@ internal static class Program
 
     public static readonly string MC2ILVersionString = typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion;
 
-    private static void ResolvePathsFromCommandLine(string? gamePath, string? inputExeName, ref MC2ILRuntimeArgs args)
+    private static void ResolvePathsFromCommandLine(string? gamePath, string? inputExeName, string? androidAbi, ref MC2ILRuntimeArgs args)
     {
         if (gamePath is null or { Length: 0 })
             throw new SoftException("No force options provided, and no game path was provided either. Please provide a game path or use the --force- options.");
@@ -41,9 +41,9 @@ internal static class Program
         else if (Directory.Exists(gamePath))
             HandleWindowsGamePath(gamePath, inputExeName, ref args);
         else if (File.Exists(gamePath) && Path.GetExtension(gamePath).ToLowerInvariant() == ".apk")
-            HandleSingleApk(gamePath, ref args);
+            HandleSingleApk(gamePath, androidAbi, ref args);
         else if (File.Exists(gamePath) && Path.GetExtension(gamePath).ToLowerInvariant() is ".xapk" or ".apkm")
-            HandleXapk(gamePath, ref args);
+            HandleXapk(gamePath, androidAbi, ref args);
         else if (File.Exists(gamePath) && Path.GetExtension(gamePath).ToLowerInvariant() is ".ipa" or ".tipa")
             HandleIpa(gamePath, ref args);
         else
@@ -262,7 +262,7 @@ internal static class Program
         args.Valid = true;
     }
 
-    private static void HandleSingleApk(string gamePath, ref MC2ILRuntimeArgs args)
+    private static void HandleSingleApk(string gamePath, string? androidAbi, ref MC2ILRuntimeArgs args)
     {
         //APK
         //Metadata: assets/bin/Data/Managed/Metadata
@@ -276,16 +276,16 @@ internal static class Program
         using var zipArchive = new ZipArchive(stream);
 
         var globalMetadata = zipArchive.Entries.FirstOrDefault(e => e.FullName.EndsWith("assets/bin/Data/Managed/Metadata/global-metadata.dat"));
-        var binary = zipArchive.Entries.FirstOrDefault(e => e.FullName.EndsWith("lib/x86_64/libil2cpp.so"));
-        binary ??= zipArchive.Entries.FirstOrDefault(e => e.FullName.EndsWith("lib/x86/libil2cpp.so"));
-        binary ??= zipArchive.Entries.FirstOrDefault(e => e.FullName.EndsWith("lib/arm64-v8a/libil2cpp.so"));
-        binary ??= zipArchive.Entries.FirstOrDefault(e => e.FullName.EndsWith("lib/armeabi-v7a/libil2cpp.so"));
+        var abiPreference = androidAbi != null ? new[] { androidAbi } : new[] { "arm64-v8a", "x86_64", "x86", "armeabi-v7a" };
+        var binary = abiPreference.Select(abi => FindAndroidBinary(zipArchive, abi)).FirstOrDefault(entry => entry != null);
 
         var globalgamemanagers = zipArchive.Entries.FirstOrDefault(e => e.FullName.EndsWith("assets/bin/Data/globalgamemanagers"));
         var dataUnity3d = zipArchive.Entries.FirstOrDefault(e => e.FullName.EndsWith("assets/bin/Data/data.unity3d"));
 
         if (binary == null)
-            throw new SoftException("Could not find libil2cpp.so inside the apk.");
+            throw new SoftException(androidAbi == null
+                ? "Could not find libil2cpp.so inside the APK."
+                : $"APK does not contain lib/{androidAbi}/libil2cpp.so.");
         if (globalMetadata == null)
             throw new SoftException("Could not find global-metadata.dat inside the apk");
         if (globalgamemanagers == null && dataUnity3d == null)
@@ -328,7 +328,14 @@ internal static class Program
         args.Valid = true;
     }
 
-    private static void HandleXapk(string gamePath, ref MC2ILRuntimeArgs args)
+    private static ZipArchiveEntry? FindAndroidBinary(ZipArchive archive, string abi)
+    {
+        var libraryPath = $"lib/{abi}/libil2cpp.so";
+        return archive.GetEntry(libraryPath) ?? archive.Entries.FirstOrDefault(entry =>
+            entry.FullName.EndsWith("/" + libraryPath, StringComparison.Ordinal));
+    }
+
+    private static void HandleXapk(string gamePath, string? androidAbi, ref MC2ILRuntimeArgs args)
     {
         //XAPK file
         //Contains two APKs - one starting with `config.` and one with the package name
@@ -343,12 +350,21 @@ internal static class Program
         using var xapkZip = new ZipArchive(xapkStream);
 
         ZipArchiveEntry? configApk = null;
-        var configApks = xapkZip.Entries.Where(e => e.FullName.Contains("config.") && e.FullName.EndsWith(".apk")).ToList();
+        var configApks = xapkZip.Entries.Where(e => e.Name.IndexOf("config.", StringComparison.OrdinalIgnoreCase) >= 0 && e.Name.EndsWith(".apk", StringComparison.OrdinalIgnoreCase)).ToList();
 
-        var instructionSetPreference = new[] { "arm64_v8a", "arm64", "armeabi_v7a", "arm" };
+        var instructionSetPreference = androidAbi switch
+        {
+            "arm64-v8a" => new[] { "arm64_v8a", "arm64-v8a", "arm64" },
+            "armeabi-v7a" => new[] { "armeabi_v7a", "armeabi-v7a", "arm" },
+            "x86_64" => new[] { "x86_64" },
+            "x86" => new[] { "x86" },
+            _ => new[] { "arm64_v8a", "arm64-v8a", "arm64", "armeabi_v7a", "armeabi-v7a", "arm" }
+        };
         foreach (var instructionSet in instructionSetPreference)
         {
-            configApk = configApks.FirstOrDefault(e => e.FullName.Contains(instructionSet));
+            configApk = configApks.FirstOrDefault(e => androidAbi == null
+                ? e.FullName.Contains(instructionSet)
+                : e.Name.EndsWith($"config.{instructionSet}.apk", StringComparison.OrdinalIgnoreCase));
             if (configApk != null)
                 break;
         }
@@ -360,20 +376,26 @@ internal static class Program
         Logger.InfoNewline($"Identified APKs inside XAPK - config: {configApk?.FullName}, mainPackage: {mainApk?.FullName}", "XAPK");
 
         if (configApk == null)
-            throw new SoftException("Could not find a config apk inside the XAPK");
+            throw new SoftException(androidAbi == null
+                ? "Could not find a config APK inside the split package."
+                : $"Could not find an ABI split for {androidAbi} inside the package.");
         if (mainApk == null)
             throw new SoftException("Could not find a main apk inside the XAPK");
 
         using var configZip = new ZipArchive(configApk.Open());
         using var mainZip = new ZipArchive(mainApk.Open());
-        var binary = configZip.Entries.FirstOrDefault(e => e.FullName.EndsWith("libil2cpp.so"));
+        var binary = androidAbi == null
+            ? configZip.Entries.FirstOrDefault(e => e.FullName.EndsWith("libil2cpp.so"))
+            : FindAndroidBinary(configZip, androidAbi);
         var globalMetadata = mainZip.Entries.FirstOrDefault(e => e.FullName.EndsWith("global-metadata.dat"));
 
         var globalgamemanagers = mainZip.Entries.FirstOrDefault(e => e.FullName.EndsWith("globalgamemanagers"));
         var dataUnity3d = mainZip.Entries.FirstOrDefault(e => e.FullName.EndsWith("data.unity3d"));
 
         if (binary == null)
-            throw new SoftException("Could not find libil2cpp.so inside the config APK");
+            throw new SoftException(androidAbi == null
+                ? "Could not find libil2cpp.so inside the config APK."
+                : $"ABI split does not contain lib/{androidAbi}/libil2cpp.so.");
         if (globalMetadata == null)
             throw new SoftException("Could not find global-metadata.dat inside the main APK");
         if (globalgamemanagers == null && dataUnity3d == null)
@@ -526,6 +548,16 @@ internal static class Program
         if (!options.AreForceOptionsValid)
             throw new SoftException("Invalid force option configuration");
 
+        var androidAbi = options.AndroidAbi?.Trim().ToLowerInvariant();
+        if (androidAbi != null)
+        {
+            if (androidAbi is not ("armeabi-v7a" or "arm64-v8a" or "x86" or "x86_64"))
+                throw new SoftException("--android-abi must be armeabi-v7a, arm64-v8a, x86 or x86_64.");
+            if (options.ForcedBinaryPath != null || options.GamePath == null || !File.Exists(options.GamePath)
+                || Path.GetExtension(options.GamePath).ToLowerInvariant() is not (".apk" or ".xapk" or ".apkm"))
+                throw new SoftException("--android-abi requires an APK, XAPK or APKM supplied as --game-path.");
+        }
+
         if (options.ListAssemblies && (options.OutputFormatIds.Any() || options.CSharpAssemblies != null || options.RecoverySelectors.Any()))
             throw new SoftException("--list-assemblies lists assemblies without exporting. Run it without --output-as, --csharp-assemblies or --recover-only.");
 
@@ -565,7 +597,7 @@ internal static class Program
                 result.Valid = true;
             }
             else
-                ResolvePathsFromCommandLine(options.GamePath, options.ExeName, ref result);
+                ResolvePathsFromCommandLine(options.GamePath, options.ExeName, androidAbi, ref result);
         }
         else
         {
