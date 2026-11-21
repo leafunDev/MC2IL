@@ -49,7 +49,8 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
             return emitted;
         }
 
-        Register Reg(ArmRegister register) => new(null, register.ToString().ToUpperInvariant());
+        Register Reg(ArmRegister? register) => new(null, register?.ToString()?.ToUpperInvariant() ?? "INVALID_REG");
+        static string RegisterName(ArmRegister? register) => register?.ToString()?.ToUpperInvariant() ?? "INVALID";
         Immediate Imm(long value) => new(value);
         var flagN = new Register(null, "ARM_N");
         var flagZ = new Register(null, "ARM_Z");
@@ -145,9 +146,16 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                         : new DoubleLiteral(operand.FloatingPoint);
                 case ArmOperandType.Memory:
                 {
-                    var memory = operand.Memory;
-                    var baseName = memory.Base.ToString().ToUpperInvariant();
-                    var hasIndex = memory.Index.ToString().ToUpperInvariant() is not ("INVALID" or "INVALID_REG");
+                    if (operand.Memory is not { } memory)
+                    {
+                        Emit((ulong)native.Address, OpCode.NotImplemented,
+                            new StringLiteral($"ARM memory operand has no Capstone details: {native.Mnemonic} {native.Operand}"));
+                        return Imm(0);
+                    }
+
+                    var baseName = RegisterName(memory.Base);
+                    var indexName = RegisterName(memory.Index);
+                    var hasIndex = indexName is not ("INVALID" or "INVALID_REG");
                     var displacement = operand.IsSubtracted ? -memory.Displacement : memory.Displacement;
                     if (baseName == "SP" && !hasIndex)
                         return new StackOffset(displacement);
