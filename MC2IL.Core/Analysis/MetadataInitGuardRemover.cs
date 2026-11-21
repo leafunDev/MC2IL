@@ -49,7 +49,8 @@ public static class MetadataInitGuardRemover
             : Array.Empty<long>();
         if (supportsClassReloads)
             RemoveArm64ClassMetadataGuards(method, cfg);
-        Run(cfg, flagOffsets, keepBareCalls: supportsClassReloads, dominance: method.DominatorInfo);
+        Run(cfg, flagOffsets, keepBareCalls: supportsClassReloads, dominance: method.DominatorInfo,
+            allowStaticFieldReloads: supportsClassReloads && !method.AppContext.Binary.is32Bit);
     }
 
     // The ARM64 metadata initialization slow path returns the same Il2CppClass*
@@ -300,8 +301,8 @@ public static class MetadataInitGuardRemover
     public static void Run(ISILControlFlowGraph cfg, long initialisedFlagOffset)
         => Run(cfg, [initialisedFlagOffset]);
 
-    private static void Run(ISILControlFlowGraph cfg, IReadOnlyCollection<long> initialisedFlagOffsets,
-        bool keepBareCalls = false, DominatorInfo? dominance = null)
+    internal static void Run(ISILControlFlowGraph cfg, IReadOnlyCollection<long> initialisedFlagOffsets,
+        bool keepBareCalls = false, DominatorInfo? dominance = null, bool allowStaticFieldReloads = false)
     {
         var definitions = new Dictionary<LocalVariable, Instruction>();
         HashSet<LocalVariable>? redefined = null;
@@ -321,7 +322,8 @@ public static class MetadataInitGuardRemover
         {
             var established = keepBareCalls && MatchCctorGuard(guard, definitions) is { } match
                 && match.Slow.Successors is [var continuation] && continuation == match.Fast ? match : null;
-            if (!TryRemoveGuard(cfg, guard, initialisedFlagOffsets, definitions, discardedGuardLoads, IsInitializedFlagValue))
+            if (!TryRemoveGuard(cfg, guard, initialisedFlagOffsets, definitions, discardedGuardLoads,
+                    IsInitializedFlagValue, allowStaticFieldReloads))
                 continue;
             removedAny = true;
             if (established is { } proof && guard.Successors is [var remaining] && remaining == proof.Fast
@@ -671,7 +673,8 @@ public static class MetadataInitGuardRemover
 
     private static bool TryRemoveGuard(ISILControlFlowGraph cfg, Block guard,
         IReadOnlyCollection<long> initialisedFlagOffsets, IReadOnlyDictionary<LocalVariable, Instruction> definitions,
-        HashSet<Instruction> discardedGuardLoads, Func<Block, int, IOperand, bool> isInitializedFlagValue)
+        HashSet<Instruction> discardedGuardLoads, Func<Block, int, IOperand, bool> isInitializedFlagValue,
+        bool allowStaticFieldReloads)
     {
         if (guard.BlockType != BlockType.TwoWay || guard.Successors.Count != 2
             || guard.Instructions.Count == 0 || guard.Instructions[^1].OpCode != OpCode.ConditionalJump)
@@ -689,10 +692,12 @@ public static class MetadataInitGuardRemover
 
         Block initEntry;
         HashSet<Block> region;
-        if (TryCollectRegion(cfg, guard, first, second, false, metadataFlagAddress, isInitializedFlagValue, out region)
+        if (TryCollectRegion(cfg, guard, first, second, false, metadataFlagAddress, isInitializedFlagValue,
+                out region, allowStaticFieldReloads)
             && IsRecognizedInitializationRegion(region, hasKnownClassInitFlag, metadataFlagAddress.HasValue))
             initEntry = first;
-        else if (TryCollectRegion(cfg, guard, second, first, false, metadataFlagAddress, isInitializedFlagValue, out region)
+        else if (TryCollectRegion(cfg, guard, second, first, false, metadataFlagAddress, isInitializedFlagValue,
+                     out region, allowStaticFieldReloads)
             && IsRecognizedInitializationRegion(region, hasKnownClassInitFlag, metadataFlagAddress.HasValue))
             initEntry = second;
         else
@@ -806,7 +811,7 @@ public static class MetadataInitGuardRemover
 
     private static bool TryCollectRegion(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge,
         bool allowMetadataInitWithoutStore, long? metadataFlagAddress, Func<Block, int, IOperand, bool>? isInitializedFlagValue,
-        out HashSet<Block> region)
+        out HashSet<Block> region, bool allowStaticFieldReloads = false)
     {
         region = [];
 
@@ -858,10 +863,13 @@ public static class MetadataInitGuardRemover
                 return false;
         }
 
-        return HasOnlyRuntimeMemoryReads(cfg, region) && !HasEscapingValues(cfg, region, merge);
+        return HasOnlyRuntimeMemoryReads(cfg, region, guard, merge,
+                allowStaticFieldReloads && metadataFlagAddress.HasValue && sawMetadataInit && sawFlagStore && !sawClassInit)
+            && !HasEscapingValues(cfg, region, merge);
     }
 
-    private static bool HasOnlyRuntimeMemoryReads(ISILControlFlowGraph cfg, HashSet<Block> region)
+    private static bool HasOnlyRuntimeMemoryReads(ISILControlFlowGraph cfg, HashSet<Block> region,
+        Block guard, Block merge, bool allowStaticFieldReloads)
     {
         var dynamicLoads = region.SelectMany(block => block.Instructions).Where(instruction => instruction is
             { OpCode: OpCode.Move, Operands: [LocalVariable, MemoryOperand { IsConstant: false }] }).ToList();
@@ -885,7 +893,8 @@ public static class MetadataInitGuardRemover
                 runtimeLoads.UnionWith(path);
         }
 
-        return dynamicLoads.All(runtimeLoads.Contains);
+        return dynamicLoads.All(instruction => runtimeLoads.Contains(instruction)
+            || allowStaticFieldReloads && IsEquivalentStaticFieldReload(instruction, guard, merge, region, definitions));
 
         // Accept bounded copies and +0 indirections rooted in an absolute metadata slot. A
         // random object-field read in the same region must retain its possible null exception.
@@ -905,6 +914,58 @@ public static class MetadataInitGuardRemover
                 MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable pointer }
                     => TraceMetadataSlot(pointer, path, visited, depth + 1),
                 _ => false,
+            };
+        }
+    }
+
+    private static bool IsEquivalentStaticFieldReload(Instruction reload, Block guard, Block merge,
+        HashSet<Block> region, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var fastIndex = merge.Predecessors.IndexOf(guard) + 1;
+        if (fastIndex == 0 || reload.Destination is not LocalVariable local
+            || StaticFieldOwner(reload) is not { } owner)
+            return false;
+
+        // Only discard a reload if the surviving edge already supplies the same
+        // class's storage to the merge. An arbitrary object read can still throw.
+        var replaced = false;
+        foreach (var phi in merge.Instructions)
+        {
+            if (phi.OpCode != OpCode.Phi || phi.Operands.Count != merge.Predecessors.Count + 1)
+                continue;
+            var usesReload = false;
+            for (var i = 1; i < phi.Operands.Count; i++)
+                if (region.Contains(merge.Predecessors[i - 1])
+                    && ReferenceEquals(FollowCopies(phi.Operands[i], definitions), local))
+                    usesReload = true;
+            if (!usesReload)
+                continue;
+
+            if (FollowCopies(phi.Operands[fastIndex], definitions) is not LocalVariable fastValue
+                || !definitions.TryGetValue(fastValue, out var fastLoad)
+                || StaticFieldOwner(fastLoad) is not { } fastOwner
+                || !MetadataResolver.IsSameType(owner, fastOwner))
+                return false;
+
+            replaced = true;
+        }
+        return replaced;
+
+        TypeAnalysisContext? StaticFieldOwner(Instruction load)
+        {
+            if (load is not { OpCode: OpCode.Move, MemoryAccessSize: 8, Operands: [LocalVariable,
+                    MemoryOperand { Base: LocalVariable klass, Index: null, Scale: 0,
+                        Addend: LocalVariables.StaticFieldsOffset64 }] }
+                || FollowCopies(klass, definitions) is not LocalVariable originalClass
+                || !definitions.TryGetValue(originalClass, out var classLoad)
+                || classLoad is not { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext type] })
+                return null;
+
+            return type switch
+            {
+                RuntimeClassTypeAnalysisContext runtime => runtime.RepresentedType,
+                RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext => null,
+                _ => type,
             };
         }
     }

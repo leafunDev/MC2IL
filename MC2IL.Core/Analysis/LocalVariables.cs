@@ -11,7 +11,7 @@ public static class LocalVariables
 {
     public static int MaxTypePropagationLoopCount = 5000;
 
-    private const long StaticFieldsOffset64 = 0xB8;
+    internal const long StaticFieldsOffset64 = 0xB8;
     private const long StaticFieldsOffset32 = 0x5C;
 
     public static void CreateAll(MethodAnalysisContext method)

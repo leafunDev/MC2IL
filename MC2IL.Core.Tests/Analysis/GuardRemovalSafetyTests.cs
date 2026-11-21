@@ -253,4 +253,57 @@ public class GuardRemovalSafetyTests
         Assert.That(graph.Instructions.Contains(store), Is.EqualTo(!dominatesStore));
         Assert.That(graph.Instructions.Count(i => i.OpCode == OpCode.ConditionalJump), Is.EqualTo(dominatesStore ? 1 : 2));
     }
+
+    [TestCase(true, true, false, true)]
+    [TestCase(true, false, false, false)]
+    [TestCase(false, true, false, false)]
+    [TestCase(true, true, true, false)]
+    public void RemovesMetadataGuardOnlyForMatchingStaticFieldReload(bool verifiedLayout, bool sameOwner,
+        bool conflictingMerge, bool remove)
+    {
+        MC2ILApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var types = MC2ILApi.CurrentAppContext!.SystemTypes;
+        var flag = Local("flag");
+        var fastClass = Local("fastClass");
+        var slowClass = Local("slowClass");
+        var fastStorage = Local("fastStorage");
+        var slowStorage = Local("slowStorage");
+        var storage = Local("storage");
+        var condition = Local("condition");
+        var merge = new Instruction(0, OpCode.Return, storage);
+        var branch = new Instruction(0, OpCode.ConditionalJump, merge, condition);
+        const long flagAddress = 0x3000;
+        var reload = new Instruction(0, OpCode.Move, slowStorage, new MemoryOperand(slowClass, addend: 0xB8))
+            { MemoryAccessSize = 8 };
+        var graph = Build([
+            new(0, OpCode.Move, fastClass, types.SystemObjectType),
+            new(0, OpCode.Move, fastStorage, new MemoryOperand(fastClass, addend: 0xB8)) { MemoryAccessSize = 8 },
+            new(0, OpCode.Move, flag, new MemoryOperand(null, addend: flagAddress)) { MemoryAccessSize = 1 },
+            new(0, OpCode.CheckNotEqual, condition, flag, Imm(0)),
+            branch,
+            new(0, OpCode.CallVoid, Str("il2cpp_codegen_initialize_runtime_metadata"), Imm(0x5000)),
+            new(0, OpCode.Move, new MemoryOperand(null, addend: flagAddress), Imm(1)) { MemoryAccessSize = 1 },
+            new(0, OpCode.Move, slowClass, sameOwner ? types.SystemObjectType : types.SystemStringType),
+            reload,
+            new(0, OpCode.Jump, merge),
+            merge,
+        ]);
+        var join = graph.FindBlockByInstruction(merge)!;
+        var phi = new Instruction(-1, OpCode.Phi, storage);
+        phi.AddOperands(join.Predecessors.Select(p => p.Instructions.Contains(branch) ? fastStorage : slowStorage));
+        join.Instructions.Insert(0, phi);
+        if (conflictingMerge)
+        {
+            var other = new Instruction(-1, OpCode.Phi, Local("otherStorage"));
+            other.AddOperands(join.Predecessors.Select(p => p.Instructions.Contains(branch) ? (IOperand)Imm(0) : slowStorage));
+            join.Instructions.Insert(1, other);
+        }
+
+        MetadataInitGuardRemover.Run(graph, [0xE0], allowStaticFieldReloads: verifiedLayout);
+
+        Assert.That(graph.Instructions.Contains(reload), Is.EqualTo(!remove));
+        Assert.That(branch.OpCode, Is.EqualTo(remove ? OpCode.Jump : OpCode.ConditionalJump));
+        Assert.That(phi.Operands.Count, Is.EqualTo(remove ? 2 : 3));
+    }
 }
