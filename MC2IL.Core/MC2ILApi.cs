@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using AssetRipper.Primitives;
 using MC2IL.Core.Exceptions;
@@ -22,9 +23,18 @@ public static class MC2ILApi
     internal static bool LowMemoryMode => RuntimeOptions?.LowMemoryMode ?? false;
 
     [RequiresUnreferencedCode("Plugins are loaded dynamically.")]
-    public static void Init(string pluginsDir = "Plugins")
+    public static void Init(string? pluginsDir = null)
     {
-        MC2ILPluginManager.LoadFromDirectory(Path.Combine(Environment.CurrentDirectory, pluginsDir));
+        var pluginDirectories = pluginsDir == null
+            ? new[]
+            {
+                Path.Combine(AppContext.BaseDirectory, "Plugins"),
+                Path.Combine(Environment.CurrentDirectory, "Plugins")
+            }
+            : [Path.GetFullPath(pluginsDir)];
+
+        foreach (var directory in pluginDirectories.Distinct(StringComparer.OrdinalIgnoreCase))
+            MC2ILPluginManager.LoadFromDirectory(directory);
         MC2ILPluginManager.InitAll();
     }
 

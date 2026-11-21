@@ -9,6 +9,9 @@ namespace MC2IL;
 [SuppressMessage("ReSharper", "UnusedAutoPropertyAccessor.Global")]
 public class CommandLineArgs
 {
+    [Option("plugins-dir", HelpText = "Directory containing trusted MC2IL plugin DLLs. Defaults to Plugins beside MC2IL and in the current directory.")]
+    public string? PluginsDirectory { get; set; }
+
     [Option("game-path", HelpText = "Specify path to the game folder (containing the exe)")]
     public string? GamePath { get; set; } = null!; //Suppressed because it's set by CommandLineParser.
 

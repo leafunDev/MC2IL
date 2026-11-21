@@ -21,6 +21,8 @@ ApplicationAnalysisContext context = MC2ILApi.CurrentAppContext;
 
 For in-memory inputs, use the overload that accepts the binary and metadata byte arrays. `MC2ILApi.DetermineUnityVersion` can help identify the Unity version from a game executable and data directory.
 
+To write an installable plugin DLL, see the [plugin development guide](../docs/PLUGINS.md) and its [Mirror serializer discovery template](../PluginTemplates/MirrorSerializerDiscovery). Plugins reference `MC2IL.Core`, register a class with `RegisterMC2ILPluginAttribute`, and can add processing layers or output formats from `OnLoad`.
+
 The core project builds with the solution from the repository root:
 
 ```sh

@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <AssemblyName>MC2IL.MirrorSerializerDiscovery</AssemblyName>
+    <RootNamespace>MC2IL.MirrorSerializerDiscovery</RootNamespace>
+  </PropertyGroup>
+
+  <!-- Use the repository project when this template is built from a source checkout. -->
+  <ItemGroup Condition="Exists('../../MC2IL.Core/MC2IL.Core.csproj')">
+    <ProjectReference Include="../../MC2IL.Core/MC2IL.Core.csproj" Private="false" />
+  </ItemGroup>
+
+  <!-- When copied out of the repository, use the published MC2IL.Core SDK package. -->
+  <ItemGroup Condition="!Exists('../../MC2IL.Core/MC2IL.Core.csproj')">
+    <PackageReference Include="MC2IL.Core" Version="1.0.0" />
+  </ItemGroup>
+</Project>

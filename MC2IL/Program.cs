@@ -503,7 +503,7 @@ internal static class Program
         ConsoleLogger.ShowVerbose = options.Verbose;
 
 #pragma warning disable IL2026 // RequiresUnreferencedCode
-        MC2ILApi.Init();
+        MC2ILApi.Init(options.PluginsDirectory);
 #pragma warning restore IL2026
         OutputFormatRegistry.Register<CSharpOutputFormat>();
 

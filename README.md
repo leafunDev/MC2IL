@@ -97,6 +97,10 @@ Both commands write only `strings.txt` in the output directory. A package or gam
 | wasm_name_section | WebAssembly name section |
 | dummydll | Legacy-compatible dummy DLL output |
 
+## Plugins
+
+MC2IL can load third-party plugin DLLs from `Plugins` beside the executable or in the current directory. Use `--plugins-dir` to select another folder. Plugins can add processing layers and output formats through `MC2IL.Core`; see the [plugin guide](docs/PLUGINS.md) and the [Mirror serializer discovery template](PluginTemplates/MirrorSerializerDiscovery).
+
 ## Project map
 
 | Project | Role |
@@ -105,7 +109,7 @@ Both commands write only `strings.txt` in the output directory. A package or gam
 | MC2IL.Core | Analysis pipeline, method recovery, and output formats |
 | MC2IL.ILanguageDecompiler | C# source export from recovered IL using ILSpy |
 | LibMC2IL | IL2CPP metadata and native-binary parsing |
-| Plugins/* | Optional processors, loaders, and output plugins |
+| PluginTemplates/* | Starter projects for third-party plugins |
 | WasmDisassembler | WebAssembly instruction decoding |
 | StableNameDotNet | Stable naming helpers for obfuscated types |
 

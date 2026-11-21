@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using LibMC2IL.BinaryStructures;
 using LibMC2IL;
 
 namespace MC2IL.Core.Api;
@@ -29,6 +30,18 @@ public abstract class MC2ILPlugin
 
     public abstract void OnLoad();
 
+    /// <summary>Register a processing layer that can be selected with <c>--use-processor</c>.</summary>
+    protected void RegisterProcessingLayer<T>() where T : MC2ILProcessingLayer, new() =>
+        ProcessingLayerRegistry.Register<T>();
+
+    /// <summary>Register a custom output format that can be selected with <c>--output-as</c>.</summary>
+    protected void RegisterOutputFormat<T>() where T : MC2ILOutputFormat, new() =>
+        OutputFormatRegistry.Register<T>();
+
+    /// <summary>Register an instruction-set handler for an IL2CPP binary architecture.</summary>
+    protected void RegisterInstructionSet<T>(InstructionSetId forId) where T : MC2ILInstructionSet, new() =>
+        InstructionSetRegistry.RegisterInstructionSet<T>(forId);
+
     protected void RegisterBinaryFormat<T>(string name, Func<byte[], bool> isValid, Func<MemoryStream, T> factory) where T : Il2CppBinary =>
         LibMC2ILBinaryRegistry.Register(name, Name, isValid, factory);
 
@@ -51,10 +64,17 @@ public abstract class MC2ILPlugin
 
     internal void CallOnFinish()
     {
-        //Clean up temporary files
+        // Clean up temporary files without preventing the plugin's shutdown callback.
         foreach (var file in temporaryFilePaths)
         {
-            File.Delete(file);
+            try
+            {
+                File.Delete(file);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                Logger.WarnNewline($"Could not remove temporary file {file}: {e.Message}");
+            }
         }
 
         OnFinish();
