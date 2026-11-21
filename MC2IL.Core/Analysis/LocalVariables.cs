@@ -592,7 +592,7 @@ public static class LocalVariables
         return true;
     }
 
-    private static bool PropagateProducedType(LocalVariable local, TypeAnalysisContext? produced)
+    internal static bool PropagateProducedType(LocalVariable local, TypeAnalysisContext? produced)
     {
         if (SetTypeIfUnknown(local, produced))
             return true;

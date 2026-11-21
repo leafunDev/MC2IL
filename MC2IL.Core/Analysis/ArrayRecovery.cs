@@ -42,6 +42,8 @@ public static class ArrayRecovery
         DominatorInfo? dominators = null;
         var changed = false;
 
+        TypeBoundedLoopIndices(method, cfg, definitions, ref dominators);
+
         foreach (var instruction in instructions)
         {
             var isMemoryMove = instruction is { OpCode: OpCode.Move, MemoryAccessSize: > 0, Operands.Count: 2 };
@@ -72,15 +74,15 @@ public static class ArrayRecovery
                     instruction.SetOperand(i, new ArrayAccess(directArray, checkedIndex));
                     if (instruction.OpCode == OpCode.Move && i == 1
                         && instruction.Destination is LocalVariable directDestination)
-                        directDestination.Type ??= directArrayType.ElementType;
+                        LocalVariables.PropagateProducedType(directDestination, directArrayType.ElementType);
                     changed = true;
                     continue;
                 }
 
                 if (!isMemoryMove
                     || memory.Base is not LocalVariable address
-                    || address.Type is SzArrayTypeAnalysisContext
                     || SplitArrayAddress(address, definitions, 0) is not { } split
+                    || ReferenceEquals(split.Array, address)
                     || split.Array.Type is not SzArrayTypeAnalysisContext { ElementType: var elementType }
                     || elementType is GenericParameterTypeAnalysisContext)
                     continue;
@@ -118,13 +120,82 @@ public static class ArrayRecovery
                 instruction.SetOperand(i, new ArrayAccess(split.Array, elementIndex));
                 if (instruction.OpCode == OpCode.Move && i == 1
                     && instruction.Destination is LocalVariable destination)
-                    destination.Type ??= elementType;
+                    LocalVariables.PropagateProducedType(destination, elementType);
                 changed = true;
             }
         }
 
-        if (changed)
-            DeadCodeEliminator.Run(cfg);
+        if (!changed)
+            return;
+
+        DeadCodeEliminator.Run(cfg);
+        // Element types can be the missing input for field and virtual-call resolution.
+        LocalVariables.ResolveTypesAndFields(method);
+    }
+
+    private static void TypeBoundedLoopIndices(MethodAnalysisContext method, ISILControlFlowGraph cfg,
+        Dictionary<LocalVariable, Instruction?> definitions, ref DominatorInfo? dominators)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var int32 = method.AppContext.SystemTypes.SystemInt32Type;
+        foreach (var header in cfg.Blocks)
+        {
+            if (header.Predecessors is not [var firstPredecessor, var secondPredecessor]
+                || header.Successors is not [var firstSuccessor, var secondSuccessor]
+                || header.Instructions.LastOrDefault() is not
+                    { OpCode: OpCode.ConditionalJump, Operands: [Block taken, LocalVariable condition] }
+                || taken != firstSuccessor && taken != secondSuccessor
+                || !definitions.TryGetValue(condition, out var comparison)
+                || comparison is not { OpCode: OpCode.CheckGreaterOrEqual or OpCode.CheckLess,
+                    Operands: [_, LocalVariable { Type: null } index, var length] }
+                || !definitions.TryGetValue(index, out var phi)
+                || phi is not { OpCode: OpCode.Phi, Operands: [_, var firstInput, var secondInput] }
+                || !header.Instructions.Contains(phi))
+                continue;
+
+            var array = length switch
+            {
+                ArrayLength direct => direct.Array,
+                LocalVariable local when definitions.TryGetValue(local, out var load) => load switch
+                {
+                    { OpCode: OpCode.Move, Operands: [_, ArrayLength arrayLength] } => arrayLength.Array,
+                    { OpCode: OpCode.Move, MemoryAccessSize: 4, Operands: [_, MemoryOperand
+                        { Base: LocalVariable arrayBase, Index: null, Scale: 0 } memory] }
+                        when memory.Addend == LengthOffset(pointerSize) => arrayBase,
+                    _ => null,
+                },
+                _ => null,
+            };
+            if (array == null || ResolveArrayType(array, definitions, [], 0) == null)
+                continue;
+
+            var inRange = comparison.OpCode == OpCode.CheckLess
+                ? taken : taken == firstSuccessor ? secondSuccessor : firstSuccessor;
+            if (inRange.Predecessors is not [var previous] || previous != header)
+                continue;
+            var dominance = dominators ??= new DominatorInfo(cfg);
+
+            // The native counter remains in Int32 range even if it uses a 64-bit
+            // register: the back-edge increments only after i < array.Length.
+            if (TryTypeIndex(firstInput, secondInput, firstPredecessor, secondPredecessor)
+                || TryTypeIndex(secondInput, firstInput, secondPredecessor, firstPredecessor))
+                index.Type = int32;
+
+            bool TryTypeIndex(IOperand seed, IOperand backEdge, Block seedBlock, Block latch)
+            {
+                if (seed is not Immediate { Value: >= 0 and <= int.MaxValue }
+                    || backEdge is not LocalVariable next || next.Type != null && next.Type != int32
+                    || !definitions.TryGetValue(next, out var increment)
+                    || increment is not { OpCode: OpCode.Add, Operands.Count: 3 }
+                    || !IsIncrementOf(increment, index)
+                    || !latch.Instructions.Contains(increment)
+                    || dominance.Dominates(header, seedBlock) || !dominance.Dominates(inRange, latch))
+                    return false;
+
+                next.Type = int32;
+                return true;
+            }
+        }
     }
 
     private static IOperand? TryRecoverBiasedArrayIndex(MemoryOperand memory, LocalVariable array,
@@ -438,19 +509,14 @@ public static class ArrayRecovery
         if (depth > 8 || operand is not LocalVariable local)
             return null;
 
+        definitions.TryGetValue(local, out var definition);
+        if (definition is { OpCode: OpCode.Add, OperandWidth: not 32, Operands: [_, var left, var right] })
+            return ExtendAddress(left, right) ?? ExtendAddress(right, left);
         if (local.Type is SzArrayTypeAnalysisContext)
             return (local, new Affine(null, 0, 0));
-
-        if (!definitions.TryGetValue(local, out var definition) || definition?.OperandWidth == 32)
-            return null;
-
-        if (definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
-            return SplitArrayAddress(source, definitions, depth + 1);
-
-        if (definition is not { OpCode: OpCode.Add, Operands: [_, var left, var right] })
-            return null;
-
-        return ExtendAddress(left, right) ?? ExtendAddress(right, left);
+        return definition is { OpCode: OpCode.Move, OperandWidth: not 32, Operands: [_, LocalVariable source] }
+            ? SplitArrayAddress(source, definitions, depth + 1)
+            : null;
 
         (LocalVariable Array, Affine Displacement)? ExtendAddress(IOperand baseOperand, IOperand displacementOperand)
         {
