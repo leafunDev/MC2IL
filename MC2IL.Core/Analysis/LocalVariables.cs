@@ -144,10 +144,9 @@ public static class LocalVariables
 
         method.ParameterLocals = paramLocals;
 
-        // the hidden return buffer takes the first argument register. we type it as the return
-        // type so stores into it resolve to fields
-        if (method.AppContext.Binary.PointerSizeBytes == 8
-            && method.AppContext.InstructionSet.CallingConventionResolver?.HiddenReturnBufferRegister(method) is { } bufferRegister
+        // The hidden return buffer is not a managed parameter. Type its address register as the
+        // return value so architecture-specific aggregate recovery can resolve stores through it.
+        if (method.AppContext.InstructionSet.CallingConventionResolver?.HiddenReturnBufferRegister(method) is { } bufferRegister
             && method.Locals.FirstOrDefault(l => l.Register.Number == bufferRegister.Number && l.Register.Version == -1) is { } bufferLocal)
         {
             bufferLocal.Name = "returnBuffer";

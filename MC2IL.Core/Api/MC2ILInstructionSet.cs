@@ -26,6 +26,13 @@ public abstract class MC2ILInstructionSet
     public virtual ulong GetPointerForMethod(MethodAnalysisContext context) => context.UnderlyingPointer;
 
     /// <summary>
+    /// Normalizes an instruction address for mapping and address-based method lookup. Architectures
+    /// that encode execution state in a pointer (such as the Thumb bit on ARM32) can override this.
+    /// The original pointer remains available on the method context for selecting decode mode.
+    /// </summary>
+    public virtual ulong NormalizeCodeAddress(ulong address) => address;
+
+    /// <summary>
     /// Returns the ISIL representation of the given method. You should convert all native machine code instructions to their equivalent
     /// ISIL form, and then return the resulting instruction list. From there, a control flow graph will be built and the method will be
     /// analyzed.

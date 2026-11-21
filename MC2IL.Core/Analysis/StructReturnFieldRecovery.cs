@@ -14,11 +14,12 @@ internal static class StructReturnFieldRecovery
     {
         var returnType = method.ReturnType;
         if (!returnType.IsValueType || (returnType.Attributes & TypeAttributes.LayoutMask) == TypeAttributes.ExplicitLayout
-            || method.AppContext.InstructionSet.CallingConventionResolver is not Arm64CallingConventionResolver convention
+            || method.AppContext.InstructionSet.CallingConventionResolver is not { } convention
             || convention.HiddenReturnBufferRegister(method) is not { } buffer)
             return;
 
         var graph = method.ControlFlowGraph!;
+        ResolveReturnBufferFields(method, returnType, buffer, graph.Instructions);
         if (graph.ExitBlock.Predecessors is not [var terminal])
             return;
         var operations = terminal.Instructions.Where(instruction => instruction.OpCode != OpCode.Nop).ToArray();
@@ -90,6 +91,46 @@ internal static class StructReturnFieldRecovery
             // value immediately after its producer, with no change to call order.
             definition.SetOperand(definition.DestinationOperandIndex, field);
             Remove(store);
+        }
+    }
+
+    private static void ResolveReturnBufferFields(MethodAnalysisContext method, TypeAnalysisContext returnType,
+        Register bufferRegister, IEnumerable<Instruction> instructions)
+    {
+        var bufferLocal = method.Locals.FirstOrDefault(local => local.Register.Version == -1
+            && local.Register.Number == bufferRegister.Number);
+        if (bufferLocal == null || bufferLocal.Type != returnType)
+            return;
+
+        foreach (var instruction in instructions)
+        {
+            if (instruction.OpCode != OpCode.Move || instruction.MemoryAccessSize is not { } accessSize)
+                continue;
+
+            for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+            {
+                if (instruction.Operands[operandIndex] is not MemoryOperand
+                    {
+                        Base: LocalVariable baseLocal,
+                        Index: null,
+                        Scale: 0,
+                        Addend: >= 0
+                    } memory
+                    || baseLocal.Register.Number != bufferRegister.Number
+                    || baseLocal.Type != returnType
+                    || memory.Addend > int.MaxValue)
+                    continue;
+
+                var offset = (int)memory.Addend;
+                var matchingFields = returnType.Fields.Where(field => !field.IsStatic
+                    && field.Offset == offset
+                    && TypeSizes.UnboxedSize(field.FieldType, method.AppContext.Binary.PointerSizeBytes) == accessSize)
+                    .ToArray();
+                if (matchingFields is not [var field])
+                    continue;
+
+                instruction.SetOperand(operandIndex, new FieldReference(field, bufferLocal, offset));
+            }
         }
     }
 

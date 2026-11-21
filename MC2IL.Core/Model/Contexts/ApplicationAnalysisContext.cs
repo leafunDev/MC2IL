@@ -144,6 +144,8 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
             .. Metadata.methodDefs.Select(m => m.MethodPointer)
                 .Concat(Binary.ConcreteGenericImplementationsByAddress.Keys)
                 .Concat(Binary.AllCustomAttributeGenerators)
+                .Select(InstructionSet.NormalizeCodeAddress)
+                .Distinct()
                 .OrderBy(a => a)
         ];
 
@@ -338,6 +340,7 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     /// </summary>
     public ulong GetAddressOfNextFunctionStart(ulong current)
     {
+        current = InstructionSet.NormalizeCodeAddress(current);
         var idx = Array.BinarySearch(_allKnownFunctionStarts, current + 1);
         if (idx < 0)
             idx = ~idx;

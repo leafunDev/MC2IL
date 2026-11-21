@@ -15,15 +15,14 @@ public abstract class BaseCallingConventionResolver
     public abstract Register ReturnRegister(MethodAnalysisContext ctx);
 
     /// <summary>
-    /// Gets the register that holds a method body's returned value. On 64-bit ABIs with a hidden
+    /// Gets the register that holds a method body's returned value. On ABIs with a hidden
     /// structure-result pointer, the method writes the value through that pointer, so the body
     /// reconstruction models the synthetic return buffer local instead of reading the scalar
     /// return register.
     /// </summary>
     public Register ReturnValueSourceRegister(MethodAnalysisContext ctx)
     {
-        if (ctx.AppContext.Binary.PointerSizeBytes == 8
-            && HiddenReturnBufferRegister(ctx) is { } bufferRegister)
+        if (HiddenReturnBufferRegister(ctx) is { } bufferRegister)
             return bufferRegister;
 
         return ReturnRegister(ctx);
@@ -72,7 +71,7 @@ public abstract class BaseCallingConventionResolver
 
     // Stack values are not present in the raw register layout. Keep typed placeholders for them
     // so later arguments from the other register bank retain their parameter positions.
-    public void RemapRawArguments(Instruction call, MethodAnalysisContext resolved)
+    public virtual void RemapRawArguments(Instruction call, MethodAnalysisContext resolved)
     {
         var app = resolved.AppContext;
 

@@ -12,6 +12,8 @@ namespace LibMC2IL.Elf;
 
 public sealed class ElfFile : ElfStyleRelocationsBinary
 {
+    private const int ElfArmAbiFloatHard = 0x400;
+
     private byte[] _raw;
     private List<IElfProgramHeaderEntry> _elfProgramHeaderEntries;
     private readonly List<ElfSectionHeaderEntry> _elfSectionHeaderEntries;
@@ -24,6 +26,11 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
     private List<long>? _initializerPointers;
 
     private long _globalOffset;
+
+    /// <summary>Whether an ARM ELF advertises the AAPCS VFP-register argument convention.</summary>
+    public bool UsesArmHardFloatAbi => InstructionSetId == DefaultInstructionSets.ARM_V7
+        && (_elfHeader?.Flags & ElfArmAbiFloatHard) != 0;
+
 
     public ElfFile(MemoryStream input) : this(GetFileBytes(input))
     {
