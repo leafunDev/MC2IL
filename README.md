@@ -79,7 +79,7 @@ Select **Extract strings to a text file** in the wizard or run:
     MC2IL.exe --game-path "C:\Games\Example.apk" --output-as strings --output-to mc2il_strings
     MC2IL.exe --game-path "C:\Games\libil2cpp.so" --output-as strings --output-to mc2il_strings
 
-Both commands write only `strings.txt` in the output directory. A package or game folder includes the full IL2CPP string literal table (including empty, short and duplicate values); a standalone binary needs no metadata. Native scanning looks for printable ASCII/UTF-8 and aligned UTF-16 (ASCII or Unicode text with a byte order mark). It records file offsets and defaults to four characters; use `--strings-min-length 1` to include shorter native runs. Control characters within an entry are escaped so each entry stays on one line. Strings generated at runtime or stored in compressed or encrypted data are not recovered by the native scan.
+Both commands write only `strings.txt` in the output directory. A package or game folder includes the IL2CPP string literal table (including empty, short and duplicate text values); a standalone binary needs no metadata. Native scanning looks for printable ASCII/UTF-8 and aligned UTF-16 (ASCII or Unicode text with a byte order mark). It records file offsets and defaults to four characters; use `--strings-min-length 1` to include shorter native runs. Entries made only of control characters and optional whitespace are omitted. Control characters in text are escaped so each entry stays on one line; original table indices and binary offsets are preserved. Strings generated at runtime or stored in compressed or encrypted data are not recovered by the native scan.
 
 ## Output formats
 

@@ -38,12 +38,18 @@ public sealed class StringTableOutputFormat : MC2ILOutputFormat
         var outputPath = Path.Combine(outputRoot, "strings.txt");
         using var writer = new StreamWriter(outputPath, append: false, new UTF8Encoding(false), bufferSize: 64 * 1024);
 
-        var literalCount = metadata?.stringLiterals.Length ?? 0;
+        var literalCount = 0;
+        var skippedLiterals = 0;
         if (metadata != null)
         {
             writer.WriteLine("[IL2CPP string literals: table index]");
-            for (uint index = 0; index < literalCount; index++)
-                WriteEntry(writer, index.ToString(CultureInfo.InvariantCulture), metadata.GetStringLiteralFromIndex(index));
+            for (uint index = 0; index < metadata.stringLiterals.Length; index++)
+            {
+                if (TryWriteEntry(writer, index.ToString(CultureInfo.InvariantCulture), metadata.GetStringLiteralFromIndex(index)))
+                    literalCount++;
+                else
+                    skippedLiterals++;
+            }
             writer.WriteLine();
         }
 
@@ -57,7 +63,7 @@ public sealed class StringTableOutputFormat : MC2ILOutputFormat
         var bigEndianCount = WriteUtf16Runs(binary, writer, bigEndian: true);
         writer.Flush();
 
-        Logger.InfoNewline($"Wrote {literalCount} IL2CPP literals and {narrowCount + littleEndianCount + bigEndianCount} native string candidates to {outputPath}.",
+        Logger.InfoNewline($"Wrote {literalCount} IL2CPP literals and {narrowCount + littleEndianCount + bigEndianCount} native string candidates to {outputPath} (skipped {skippedLiterals} control-only IL2CPP literals).",
             "StringsOutput");
     }
 
@@ -76,22 +82,16 @@ public sealed class StringTableOutputFormat : MC2ILOutputFormat
                 continue;
             }
 
-            if (length >= _minimumNativeLength)
-            {
-                WriteNativeEntry(writer, start, bytes.Slice(start, offset - start), Encoding.UTF8);
+            if (length >= _minimumNativeLength && TryWriteNativeEntry(writer, start, bytes.Slice(start, offset - start), Encoding.UTF8))
                 entries++;
-            }
 
             offset += Math.Max(width, 1);
             start = offset;
             length = 0;
         }
 
-        if (length >= _minimumNativeLength)
-        {
-            WriteNativeEntry(writer, start, bytes.Slice(start), Encoding.UTF8);
+        if (length >= _minimumNativeLength && TryWriteNativeEntry(writer, start, bytes.Slice(start), Encoding.UTF8))
             entries++;
-        }
 
         return entries;
     }
@@ -136,11 +136,8 @@ public sealed class StringTableOutputFormat : MC2ILOutputFormat
                 length++;
             }
 
-            if (length >= _minimumNativeLength)
-            {
-                WriteNativeEntry(writer, start, bytes.Slice(start, offset - start), encoding);
+            if (length >= _minimumNativeLength && TryWriteNativeEntry(writer, start, bytes.Slice(start, offset - start), encoding))
                 entries++;
-            }
 
             // Leave the next boundary for the next iteration in case it is itself a BOM.
             if (offset == start && !tagged)
@@ -196,22 +193,41 @@ public sealed class StringTableOutputFormat : MC2ILOutputFormat
             or UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator);
     }
 
-    private static void WriteNativeEntry(TextWriter writer, int offset, ReadOnlySpan<byte> bytes, Encoding encoding)
+    private static bool TryWriteNativeEntry(TextWriter writer, int offset, ReadOnlySpan<byte> bytes, Encoding encoding)
     {
 #if NETSTANDARD2_0
         var value = encoding.GetString(bytes.ToArray());
 #else
         var value = encoding.GetString(bytes);
 #endif
-        WriteEntry(writer, "0x" + offset.ToString("X8", CultureInfo.InvariantCulture), value);
+        return TryWriteEntry(writer, "0x" + offset.ToString("X8", CultureInfo.InvariantCulture), value);
     }
 
-    private static void WriteEntry(TextWriter writer, string position, string value)
+    private static bool TryWriteEntry(TextWriter writer, string position, string value)
     {
+        if (IsControlOnly(value))
+            return false;
+
         writer.Write(position);
         writer.Write('\t');
         writer.Write('"');
         writer.Write(value.EscapeString());
         writer.WriteLine('"');
+        return true;
+    }
+
+    private static bool IsControlOnly(string value)
+    {
+        // Keep empty strings and ordinary spaces. Ignore whitespace around control
+        // characters, but keep the original value intact if it contains any text.
+        var hasControl = false;
+        foreach (var ch in value)
+        {
+            if (char.IsControl(ch))
+                hasControl = true;
+            else if (!char.IsWhiteSpace(ch))
+                return false;
+        }
+        return hasControl;
     }
 }

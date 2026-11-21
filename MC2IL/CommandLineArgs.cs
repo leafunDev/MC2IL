@@ -54,7 +54,7 @@ public class CommandLineArgs
     [Option("csharp-assemblies", HelpText = "Limit C# output to a comma-separated list of assembly names. Use with --output-as csharp.")]
     public string? CSharpAssemblies { get; set; }
 
-    [Option("strings-min-length", HelpText = "Minimum character count for native strings (default: 4). IL2CPP literals are always exported in full.")]
+    [Option("strings-min-length", HelpText = "Minimum character count for native strings (default: 4). This limit does not apply to IL2CPP literals.")]
     public int? StringsMinimumLength { get; set; }
 
     [Option("output-to", HelpText = "Root directory to output to. Defaults to mc2il_out in the current working directory.")]
