@@ -137,6 +137,7 @@ public static class IlGenerator
         Dictionary<Block, CilInstruction> blockEntryMap = [];
         List<(CilInstruction BranchInstruction, Block TargetBlock)> pendingBlockBranchFixups = [];
         HashSet<LocalVariable>? fieldReadLocals = null;
+        HashSet<LocalVariable>? staticFieldReadLocals = null;
 
         var isIteratorMoveNext = context.Name == "MoveNext" && context.DeclaringType is { } declaringType
             && IteratorFactoryRecovery.IsIteratorType(declaringType);
@@ -154,9 +155,14 @@ public static class IlGenerator
                 instructionMap.Add(instruction, generated);
 
                 if (instruction is { OpCode: OpCode.Move, Operands:
-                    [LocalVariable { Type: { } localType } destination, FieldReference { Field.IsStatic: false }] }
+                    [LocalVariable { Type: { } localType } destination, FieldReference field] }
                     && IsManagedReference(localType))
-                    (fieldReadLocals ??= []).Add(destination);
+                {
+                    if (field.Field.IsStatic)
+                        (staticFieldReadLocals ??= []).Add(destination);
+                    else
+                        (fieldReadLocals ??= []).Add(destination);
+                }
 
                 if (!blockEntryMap.ContainsKey(block) && generated.Count > 0)
                     blockEntryMap[block] = generated[0];
@@ -201,6 +207,9 @@ public static class IlGenerator
                 InlineReferenceComparisonInputs(block, i, graph, instructionMap, inlineLocals, body);
                 // Keep the field and ldlen together so the comparison can inline the full expression.
                 InlineSingleUseArrayLengthReceiver(block, i, graph, instructionMap, inlineLocals, body);
+                // Try relocating a static field before the general pass forwards its stack value.
+                if (staticFieldReadLocals != null)
+                    InlineSingleUseFieldReceiver(block, i, graph, staticFieldReadLocals, instructionMap, inlineLocals, body, isStatic: true);
                 InlineSingleUseFirstInput(block, i, graph, instructionMap, inlineLocals);
                 InlineSingleUseComparisonInput(block, i, graph, instructionMap, inlineLocals, body);
                 InlineSingleUseCallArguments(block, i, graph, instructionMap, inlineLocals, body);
@@ -1039,7 +1048,7 @@ public static class IlGenerator
 
     private static void InlineSingleUseFieldReceiver(Block block, int consumerIndex, ISILControlFlowGraph graph,
         HashSet<LocalVariable> fieldReadLocals, Dictionary<Instruction, List<CilInstruction>> instructionMap,
-        Dictionary<LocalVariable, CilLocalVariable> locals, CilMethodBody body)
+        Dictionary<LocalVariable, CilLocalVariable> locals, CilMethodBody body, bool isStatic = false)
     {
         var consumer = block.Instructions[consumerIndex];
         var receiver = consumer switch
@@ -1054,6 +1063,7 @@ public static class IlGenerator
                 => source.Local,
             _ => null
         };
+        var onlyPlainThisFieldReads = true;
 
         if (receiver?.Type is not { } receiverType || !fieldReadLocals.Contains(receiver)
             || !locals.TryGetValue(receiver, out var ilLocal)
@@ -1061,18 +1071,50 @@ public static class IlGenerator
             || consumerIl.Count == 0 || consumerIl[0].OpCode != CilOpCodes.Ldloc
             || !ReferenceEquals(consumerIl[0].Operand, ilLocal)
             || !TryFindSingleUseProducer(block, consumerIndex, receiver, out _, out _, out var producer, CanCross)
-            || producer is not { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.IsStatic: false } field] }
+            || producer is not { OpCode: OpCode.Move, Operands: [_, FieldReference field] }
+            || field.Field.IsStatic != isStatic
             || !MetadataResolver.IsSameType(receiverType, field.Field.FieldType)
             || CountLocalUses(graph, receiver) != 1)
             return;
+
+        if (isStatic)
+        {
+            // Forwarding a static read across a field snapshot leaves a statement between
+            // the read and the receiver use, so ILSpy introduces the temporary again.
+            // A dominating read of the same static field proves its class was initialized.
+            // We can then move this one ordinary read past current-instance field loads.
+            if (onlyPlainThisFieldReads
+                && field is { Parent: null, Field.FieldType: not CustomModifierTypeAnalysisContext }
+                && instructionMap.TryGetValue(producer, out var producerIl)
+                && TryGetFieldLoadExpression(field, producerIl, ilLocal, out var fieldLoads)
+                && HasEarlierStaticFieldRead(fieldLoads[0].Operand))
+                RelocateSingleUseExpression(producer, producerIl, consumerIl, 0, instructionMap, body);
+            return;
+        }
 
         // Leave the field read at its original evaluation point. Argument preparation and calls
         // may throw or change that field. The saved reference can stay below their stack values.
         TryInlineStackValue(producer, consumer, receiver, instructionMap, locals);
 
-        bool CanCross(Instruction instruction) =>
-            instructionMap.TryGetValue(instruction, out var generated)
-            && HasStandaloneStackEffect(generated, body, generated.Count, 0);
+        bool CanCross(Instruction instruction)
+        {
+            if (!instructionMap.TryGetValue(instruction, out var generated)
+                || !HasStandaloneStackEffect(generated, body, generated.Count, 0))
+                return false;
+
+            if (isStatic && onlyPlainThisFieldReads && generated.Any(cil => cil.OpCode != CilOpCodes.Nop))
+                onlyPlainThisFieldReads = instruction is { Operands: [_, FieldReference
+                    { Parent: null, Field.FieldType: not CustomModifierTypeAnalysisContext }] }
+                    && IsStackNeutralThisFieldRead(instruction, instructionMap, locals);
+            return true;
+        }
+
+        bool HasEarlierStaticFieldRead(object? descriptor) =>
+            graph.Instructions.Any(instruction => instruction != producer
+                && instructionMap.TryGetValue(instruction, out var emitted)
+                && emitted.Any(cil => cil.OpCode == CilOpCodes.Ldsfld && Equals(cil.Operand, descriptor))
+                && emitted.All(cil => cil.OpCode.FlowControl is CilFlowControl.Next or CilFlowControl.Call)
+                && InstructionDominates(graph, instruction, producer));
     }
 
     private static void RelocateSingleUseExpression(Instruction producer, List<CilInstruction> producerIl,
