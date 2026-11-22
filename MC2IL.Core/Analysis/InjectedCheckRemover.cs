@@ -19,6 +19,17 @@ public static class InjectedCheckRemover
     private static void Run(ISILControlFlowGraph cfg, bool removeNullChecks, bool removeBoundsChecks,
         IEnumerable<LocalVariable>? parameters = null)
     {
+        // Shared IL2CPP throw blocks can make an earlier guard appear observable until
+        // later guards that lead to the same block have been removed. Rebuild dataflow
+        // after each round so those outer checks can be reconsidered on the simplified CFG.
+        while (RunPass(cfg, removeNullChecks, removeBoundsChecks, parameters))
+        {
+        }
+    }
+
+    private static bool RunPass(ISILControlFlowGraph cfg, bool removeNullChecks, bool removeBoundsChecks,
+        IEnumerable<LocalVariable>? parameters)
+    {
         var defOf = BuildDefMap(cfg, parameters, out var stableParameters, out var addressed);
         var ignoredExceptionConstructions = FindUnusedExceptionConstructions(cfg);
         var redundantLengthLoads = new HashSet<Instruction>();
@@ -65,11 +76,12 @@ public static class InjectedCheckRemover
         }
 
         if (!removedAny)
-            return;
+            return false;
 
         // delete any throw blocks
         cfg.RemoveUnreachableBlocks();
         DeadCodeEliminator.Run(cfg, redundantLengthLoads);
+        return true;
     }
 
     private static void RemoveThrowEdge(Block block, Block throwTarget, Block continuation)
@@ -481,8 +493,23 @@ public static class InjectedCheckRemover
                     return true;
                 }
 
-                return IsImplicitNullCheckOperation(instruction, receiver, defOf, arraysOnly,
-                    knownNonNullThis, pathInstructions, callsNeedingNullCheck);
+                if (IsImplicitNullCheckOperation(instruction, receiver, defOf, arraysOnly,
+                        knownNonNullThis, pathInstructions, callsNeedingNullCheck))
+                    return true;
+
+                // A compiler-inserted guard can run before the right-hand side of an
+                // assignment, while C# performs the null check at the eventual callvirt.
+                // Walk forward to that call only when this path keeps the tested value
+                // unchanged and does not take its address. Branches are still required
+                // to reach a matching dereference on every arm above.
+                if (instruction.OpCode is OpCode.Return or OpCode.Throw
+                    || receiver is LocalVariable checkedLocal
+                        && (ReferenceEquals(instruction.Destination, checkedLocal)
+                            || instruction.Operands.Any(operand => operand is AddressOf { Target: var addressed }
+                                && ReferenceEquals(addressed, checkedLocal))))
+                    return false;
+
+                pathInstructions.Add(instruction);
             }
 
             if (current.Successors is not [var next])
@@ -507,6 +534,15 @@ public static class InjectedCheckRemover
         var operand = FirstAccess(operation);
         if (operand is ArrayLength length && SameValueOnPath(receiver, length.Array, pathInstructions, defOf)
             || AsArrayAccess(operand) is { } access && SameValueOnPath(receiver, access.Array, pathInstructions, defOf))
+            return true;
+
+        // ARM64 IL2CPP often reads an object's class/header pointer before the first
+        // managed field or call. That raw load is the surviving CIL null check; the
+        // explicit helper branch is redundant when it dereferences the tested object.
+        if (receiver is LocalVariable { Type: { } receiverType }
+            && IlGenerator.IsManagedReference(receiverType)
+            && operand is MemoryOperand { Base: { } memoryBase }
+            && SameValueOnPath(receiver, memoryBase, pathInstructions, defOf))
             return true;
 
         if (arraysOnly)
