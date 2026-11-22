@@ -1831,7 +1831,8 @@ public static class IlGenerator
 
                 // klass pointer read => GetType
                 if (instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual
-                    && TryEmitExactTypeComparison(instruction, method, locals, writeLine))
+                    && (TryEmitExactTypeComparison(instruction, method, locals, writeLine)
+                        || TryEmitOverloadedReferenceEquals(instruction, context, method, locals, writeLine)))
                     break;
 
                 var leftOperand = instruction.Operands[1];
@@ -2642,6 +2643,60 @@ public static class IlGenerator
 
         StoreToOperand(instruction.Operands[0], method, locals, writeLine);
         return true;
+    }
+
+    private static bool TryEmitOverloadedReferenceEquals(Instruction instruction, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        var left = instruction.Operands[1];
+        var right = instruction.Operands[2];
+        IOperand value;
+        TypeAnalysisContext? valueType;
+
+        if (IsZeroConstant(left) && (valueType = ReferenceComparisonType(right)) != null)
+            value = right;
+        else if (IsZeroConstant(right) && (valueType = ReferenceComparisonType(left)) != null)
+            value = left;
+        else
+            return false;
+
+        if (!HasOverloadedReferenceEquality(valueType))
+            return false;
+
+        // Keep the native reference comparison semantics while avoiding a cast that only
+        // exists to suppress a class's overloaded == / != operators in generated C#.
+        var factory = method.DeclaringModule!.CorLibTypeFactory;
+        var objectType = factory.CorLibScope.CreateTypeReference("System", "Object");
+        var referenceEquals = objectType.CreateMemberReference("ReferenceEquals", MethodSignature.CreateStatic(
+            factory.Boolean, [factory.Object, factory.Object]));
+
+        LoadOperand(value, method, locals, writeLine, context.AppContext.SystemTypes.SystemObjectType);
+        method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldnull);
+        method.CilMethodBody.Instructions.Add(CilOpCodes.Call, referenceEquals);
+
+        if (instruction.OpCode == OpCode.CheckNotEqual)
+        {
+            method.CilMethodBody.Instructions.Add(CilOpCodes.Ldc_I4_0);
+            method.CilMethodBody.Instructions.Add(CilOpCodes.Ceq);
+        }
+
+        StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+        return true;
+    }
+
+    private static bool HasOverloadedReferenceEquality(TypeAnalysisContext? type)
+    {
+        var visited = new HashSet<TypeAnalysisContext>();
+        for (var current = type; current != null && visited.Add(current); current = current.BaseType)
+        {
+            if (current is { FullName: "UnityEngine.Object", DeclaringAssembly.CleanAssemblyName: "UnityEngine.CoreModule" or "UnityEngine" }
+                || current.Methods.Any(method => method is
+                    { Name: "op_Equality" or "op_Inequality", IsStatic: true, ReturnType.FullName: "System.Boolean", Parameters.Count: 2 }
+                    && method.Parameters.Any(parameter => ReferenceEquals(parameter.ParameterType, current))))
+                return true;
+        }
+
+        return false;
     }
 
     private static bool IsKlassPointerLoad(IOperand operand, out LocalVariable local)
