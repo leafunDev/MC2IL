@@ -27,7 +27,7 @@ MC2IL.exe --plugins-dir "C:\MC2IL-plugins" --game-path "C:\Games\Example.apk" --
 ```
 
 Use `--list-processors` to check that MC2IL loaded the plugin and registered its processing layer.
-A full Mirror source export is available in PluginTemplates/MirrorSerializedRecovery. It separates Weaver-generated SyncVar serialization, empty markers, and RPC dispatch into partial sidecar files while leaving the regular Assembly-CSharp scripts readable. The generated network members stay available under CSharp/Assembly-CSharp/MirrorSerialization. Select the format with --output-as mirror-serialized-recovery.
+See the [official plugins](../README.md#official-plugins) for additional output formats.
 
 ## Plugin shape
 
