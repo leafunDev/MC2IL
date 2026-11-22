@@ -31,24 +31,33 @@ internal static class ClassHierarchyTestRecovery
                 var targetDepthLoad, var depthComparison, var depthBranch]
             || LoadBase(objectClassLoad, 0, PointerSize) is not { Type: { } receiverType } receiver
             || !IlGenerator.IsManagedReference(receiverType)
-            || targetClassLoad is not { OpCode: OpCode.Move, MemoryAccessSize: PointerSize,
+            || targetClassLoad is not { OpCode: OpCode.Move,
                 Operands: [LocalVariable targetClass, TypeAnalysisContext targetType] }
+            || targetClassLoad.MemoryAccessSize is not (null or PointerSize)
             || targetType is not { Definition: not null, IsInterface: false, IsValueType: false, GenericParameters.Count: 0 }
             || targetType.IsDelegate
             || !ReferenceEquals(LoadBase(objectDepthLoad, HierarchyDepthOffset, 1), objectClassLoad.Destination)
             || !ReferenceEquals(LoadBase(targetDepthLoad, HierarchyDepthOffset, 1), targetClass)
             || targetDepthLoad.Destination is not LocalVariable targetDepth
-            || depthComparison is not { OpCode: OpCode.CheckLessUnsigned, OperandWidth: 32,
+            || depthComparison is not { OpCode: OpCode.CheckLessUnsigned or OpCode.CheckGreaterOrEqualUnsigned, OperandWidth: 32,
                 Operands: [LocalVariable depthCondition, LocalVariable actualDepth, LocalVariable requiredDepth] }
             || actualDepth != objectDepthLoad.Destination || requiredDepth != targetDepth
-            || depthBranch is not { OpCode: OpCode.ConditionalJump, Operands: [Block failure, LocalVariable depthTest] }
-            || depthTest != depthCondition || depthBlock.Successors.Count != 2 || !depthBlock.Successors.Contains(failure))
+            || depthBranch is not { OpCode: OpCode.ConditionalJump, Operands: [Block depthBranchTarget, LocalVariable depthTest] }
+            || depthTest != depthCondition || depthBlock.Successors.Count != 2 || !depthBlock.Successors.Contains(depthBranchTarget))
             return;
 
-        var membershipBlock = depthBlock.Successors.First(block => block != failure);
+        // Native checks can be emitted with either polarity: branch on depth < target
+        // to the failure block, or branch on depth >= target to the membership test.
+        var branchTargetsMembership = depthComparison.OpCode == OpCode.CheckGreaterOrEqualUnsigned;
+        var membershipBlock = branchTargetsMembership
+            ? depthBranchTarget
+            : depthBlock.Successors.First(block => block != depthBranchTarget);
+        var failure = branchTargetsMembership
+            ? depthBlock.Successors.First(block => block != depthBranchTarget)
+            : depthBranchTarget;
         var membershipInstructions = membershipBlock.Instructions.Where(i => i.OpCode != OpCode.Nop).ToArray();
         if (membershipBlock.Predecessors is not [var predecessor] || predecessor != depthBlock
-            || membershipBlock.Successors.Count != 2 || !membershipBlock.Successors.Contains(failure)
+            || membershipBlock.Successors.Count != 2
             || membershipInstructions is not [var hierarchyLoad, var scaleDepth, var addAddress,
                 var ancestorLoad, var compareClass, var membershipBranch]
             || !ReferenceEquals(LoadBase(hierarchyLoad, HierarchyOffset, PointerSize), objectClassLoad.Destination)
@@ -64,7 +73,7 @@ internal static class ClassHierarchyTestRecovery
             || !(ReferenceEquals(comparedType, targetClass)
                 || comparedType is TypeAnalysisContext compared && MetadataResolver.IsSameType(compared, targetType))
             || membershipBranch is not { OpCode: OpCode.ConditionalJump, Operands: [Block miss, LocalVariable classTest] }
-            || miss != failure || classTest != condition || !HasCheckedReceiver(depthBlock, receiver))
+            || !membershipBlock.Successors.Contains(miss) || classTest != condition || !HasCheckedReceiver(depthBlock, receiver))
             return;
 
         var replaced = new HashSet<Instruction>(depthInstructions.Concat(membershipInstructions));
@@ -118,6 +127,9 @@ internal static class ClassHierarchyTestRecovery
                 var instruction = predecessor.Instructions[i];
                 if (ReferenceEquals(instruction.Destination, receiver))
                     return false;
+                if (ReferenceEquals(instruction, predecessor.Instructions.LastOrDefault())
+                    && IsNonNullBranchEdge(predecessor, block, receiver))
+                    return true;
                 if (!instruction.NullCheckReceiver || !instruction.IsCall
                     || instruction.Operands[0] is not MethodAnalysisContext { IsStatic: false })
                     continue;
@@ -129,4 +141,30 @@ internal static class ClassHierarchyTestRecovery
         }
         return false;
     }
+
+    private static bool IsNonNullBranchEdge(Block predecessor, Block continuation, LocalVariable receiver)
+    {
+        if (predecessor.Successors.Count != 2
+            || !predecessor.Successors.Contains(continuation)
+            || predecessor.Instructions.LastOrDefault() is not
+                { OpCode: OpCode.ConditionalJump, Operands: [Block trueTarget, LocalVariable condition] })
+            return false;
+
+        var comparison = predecessor.Instructions.Take(predecessor.Instructions.Count - 1)
+            .LastOrDefault(instruction => ReferenceEquals(instruction.Destination, condition));
+        if (comparison is not { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual,
+                Operands: [_, var left, var right] })
+            return false;
+
+        var comparesReceiverToZero = ReferenceEquals(left, receiver) && IsZero(right)
+            || ReferenceEquals(right, receiver) && IsZero(left);
+        if (!comparesReceiverToZero)
+            return false;
+
+        var branchIsTaken = ReferenceEquals(trueTarget, continuation);
+        var comparisonIsTrueForNonNull = comparison.OpCode == OpCode.CheckNotEqual;
+        return branchIsTaken == comparisonIsTrueForNonNull;
+    }
+
+    private static bool IsZero(IOperand operand) => operand is Immediate { Value: 0 } or DefaultValue;
 }
