@@ -27,14 +27,30 @@ internal static class UnusedReceiverRecovery
 
             var receiverIndex = call.OpCode == OpCode.CallVoid ? 1 : 2;
             if (call.Operands.Count <= receiverIndex
-                || call.Operands[receiverIndex] is not LocalVariable { Type.FullName:
-                    "System.Boolean" or "System.Byte" or "System.SByte" or "System.Int16" or "System.UInt16"
-                    or "System.Int32" or "System.UInt32" or "System.Int64" or "System.UInt64" }
-                || !call.Operands.Skip(receiverIndex + 1).Take(target.Parameters.Count).Any(argument => ReferenceEquals(argument, self)))
+                || call.Operands[receiverIndex] is not LocalVariable { Type: { } receiverType })
+                continue;
+
+            var receiverIsInteger = receiverType.FullName is
+                "System.Boolean" or "System.Byte" or "System.SByte" or "System.Int16" or "System.UInt16"
+                or "System.Int32" or "System.UInt32" or "System.Int64" or "System.UInt64";
+            var receiverTypeIsIncompatible = !receiverType.IsValueType
+                && !receiverType.IsAssignableTo(owner)
+                && !MetadataResolver.IsSameType(receiverType, owner);
+            if (!receiverIsInteger && !receiverTypeIsIncompatible)
+                continue;
+
+            // Some optimized IL2CPP calls leave the previous managed reference in X0 when
+            // the instance method never reads `this`. A reference with an unrelated managed
+            // type is strong evidence of that case: retaining it produces an invalid cast in
+            // recovered C# (for example, GameObject -> Bootstrap). Integer garbage is only
+            // recoverable when the caller's real `this` was also forwarded as an argument.
+            if (receiverIsInteger
+                && !call.Operands.Skip(receiverIndex + 1).Take(target.Parameters.Count)
+                    .Any(argument => ReferenceEquals(argument, self)))
                 continue;
 
             // A direct call may leave garbage in X0 when the callee ignores its receiver.
-            // Only use a real receiver already present among the original managed arguments.
+            // Replace it with the caller's real `this`, which is assignable to the callee.
             if (!verified.TryGetValue(target, out var unused))
                 verified[target] = unused = IgnoresReceiver(target, arm64);
             if (unused)
@@ -119,3 +135,4 @@ internal static class UnusedReceiverRecovery
         _ => false
     };
 }
+
