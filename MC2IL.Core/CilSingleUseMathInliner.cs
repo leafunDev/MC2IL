@@ -40,6 +40,7 @@ internal static class CilSingleUseMathInliner
         var starts = new bool[instructions.Count];
         starts[0] = true;
         var successors = new int[instructions.Count][];
+        var predecessors = new List<int>[instructions.Count];
         var predecessorCounts = new int[instructions.Count];
         var branchTargetCounts = new int[instructions.Count];
         var addressedArguments = new HashSet<object>();
@@ -74,7 +75,10 @@ internal static class CilSingleUseMathInliner
                 && i + 1 < instructions.Count)
                 starts[i + 1] = true;
             foreach (var successor in successors[i])
+            {
                 predecessorCounts[successor]++;
+                (predecessors[successor] ??= []).Add(i);
+            }
 
             if (instruction.OpCode.Code is CilCode.Ldarga or CilCode.Ldarga_S or CilCode.Starg or CilCode.Starg_S
                 && instruction.Operand is { } argument)
@@ -115,13 +119,15 @@ internal static class CilSingleUseMathInliner
             var scratchStores = new HashSet<CilLocalVariable>();
             var safe = true;
             IEnumerable<int> gap;
+            HashSet<int> conditionalBranches;
             if (first == enclosingBlock[slot.Load])
             {
                 if (slot.Load <= slot.Store || slot.Load - slot.Store > 128)
                     continue;
                 gap = Enumerable.Range(slot.Store + 1, slot.Load - slot.Store - 1);
+                conditionalBranches = [];
             }
-            else if (!TryGetStraightLineGap(slot.Store, slot.Load, out gap))
+            else if (!TryGetStraightLineGap(slot.Store, slot.Load, out gap, out conditionalBranches))
             {
                 continue;
             }
@@ -133,6 +139,8 @@ internal static class CilSingleUseMathInliner
                 var instruction = instructions[i];
                 if (instruction.OpCode == CilOpCodes.Stloc && instruction.Operand is CilLocalVariable stored)
                     scratchStores.Add(stored);
+                else if (conditionalBranches.Contains(i))
+                    continue;
                 // Across blocks, follow only a unique chain of unconditional branches.
                 // Calls and other writes could change the inputs before the expression is used.
                 else if (!IsNonWriting(instruction.OpCode.Code))
@@ -178,6 +186,8 @@ internal static class CilSingleUseMathInliner
 
                 if (!IsFloatingExpression(expression))
                     break;
+                if (conditionalBranches.Count != 0 && expression.Any(IsSingleFloatPropertyGetter))
+                    break;
                 if (expression.Any(IsSingleFloatPropertyGetter)
                     && gap.Any(index => instructions[index].OpCode.Code == CilCode.Ldfld))
                     break;
@@ -212,10 +222,24 @@ internal static class CilSingleUseMathInliner
             }
         }
 
-        bool TryGetStraightLineGap(int storeIndex, int loadIndex, out IEnumerable<int> gap)
+        bool TryGetStraightLineGap(int storeIndex, int loadIndex, out IEnumerable<int> gap,
+            out HashSet<int> conditionalBranches)
         {
             var path = new List<int>();
             var visited = new HashSet<int>();
+            conditionalBranches = [];
+            var canReachUse = new bool[instructions.Count];
+            var reversePath = new Queue<int>();
+            canReachUse[loadIndex] = true;
+            reversePath.Enqueue(loadIndex);
+            while (reversePath.Count != 0)
+                foreach (var predecessor in predecessors[reversePath.Dequeue()] ?? [])
+                    if (!canReachUse[predecessor])
+                    {
+                        canReachUse[predecessor] = true;
+                        reversePath.Enqueue(predecessor);
+                    }
+
             var current = storeIndex + 1;
             while (current >= 0 && current < instructions.Count && path.Count <= 128)
             {
@@ -228,10 +252,20 @@ internal static class CilSingleUseMathInliner
                     break;
 
                 path.Add(current);
-                if (successors[current].Length != 1
-                    || instructions[current].OpCode.Code == CilCode.Br && branchTargetCounts[successors[current][0]] != 1)
+                if (successors[current].Length == 1)
+                {
+                    if (instructions[current].OpCode.Code == CilCode.Br
+                        && branchTargetCounts[successors[current][0]] != 1)
+                        break;
+                    current = successors[current][0];
+                    continue;
+                }
+                if (successors[current].Length != 2
+                    || canReachUse[successors[current][0]] == canReachUse[successors[current][1]])
                     break;
-                current = successors[current][0];
+
+                conditionalBranches.Add(current);
+                current = canReachUse[successors[current][0]] ? successors[current][0] : successors[current][1];
             }
 
             gap = [];
