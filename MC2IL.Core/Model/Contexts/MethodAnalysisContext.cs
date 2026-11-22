@@ -489,6 +489,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         PackedByteAggregateRecovery.RecoverReturns(this);
 
         ArrayRecovery.RecoverSplitElementAccesses(this);
+        // Array and call recovery can finish typing boolean flag expressions only after the
+        // earlier cleanup pass. Simplify them while locals are still in SSA form, so the
+        // definition chain stays unambiguous and dead numeric mask operations can be removed.
+        BooleanFlagSimplifier.Run(this);
         SsaForm.Remove(this);
 
         // Phi removal leaves a copy per merged version, most of which can share one local
