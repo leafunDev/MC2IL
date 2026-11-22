@@ -102,7 +102,8 @@ public static class InjectedCheckRemover
                 && (HasImplicitNullCheck(continuation, receiver, defOf,
                         arraysOnly: thrown.ExceptionType == "System.IndexOutOfRangeException",
                         allowNonThrowingComputations: thrown.ExceptionType == "System.NullReferenceException" && receiver is LocalVariable,
-                        knownNonNullThis: knownNonNullThis)
+                        knownNonNullThis: knownNonNullThis,
+                        nullFailure: thrown.ExceptionType == "System.NullReferenceException" ? thrown.Block : null)
                     || thrown.ExceptionType == "System.NullReferenceException"
                     && (IsObjectAllocationCheck(checkedBlock, definition, continuation, receiver, defOf)
                         || HasImplicitNullCheckAfterGuardCopies(checkedBlock, nullComparison, continuation, receiver, addressed)
@@ -429,11 +430,11 @@ public static class InjectedCheckRemover
 
     private static bool HasImplicitNullCheck(Block continuation, IOperand receiver,
         Dictionary<LocalVariable, Instruction> defOf, bool arraysOnly, bool allowNonThrowingComputations,
-        LocalVariable? knownNonNullThis)
+        LocalVariable? knownNonNullThis, Block? nullFailure)
     {
         var callsNeedingNullCheck = new HashSet<Instruction>();
         if (!HasImplicitNullCheckOnEveryPath(continuation, receiver, defOf, arraysOnly,
-                allowNonThrowingComputations, knownNonNullThis, [], [], callsNeedingNullCheck))
+                allowNonThrowingComputations, knownNonNullThis, nullFailure, [], [], callsNeedingNullCheck))
             return false;
 
         foreach (var call in callsNeedingNullCheck)
@@ -443,7 +444,7 @@ public static class InjectedCheckRemover
 
     private static bool HasImplicitNullCheckOnEveryPath(Block start, IOperand receiver,
         Dictionary<LocalVariable, Instruction> defOf, bool arraysOnly, bool allowNonThrowingComputations,
-        LocalVariable? knownNonNullThis, List<Instruction> pathInstructions, HashSet<Block> visitedPath,
+        LocalVariable? knownNonNullThis, Block? nullFailure, List<Instruction> pathInstructions, HashSet<Block> visitedPath,
         HashSet<Instruction> callsNeedingNullCheck)
     {
         // A native null guard can precede a conditional whose separate branches both
@@ -451,17 +452,12 @@ public static class InjectedCheckRemover
         var current = start;
         while (visitedPath.Count < 32 && visitedPath.Add(current))
         {
+            // A neighboring guard may still reach the same native failure block.
+            if (current == nullFailure)
+                return true;
+
             foreach (var instruction in current.Instructions)
             {
-                // A native null-check helper can be shared by several receivers in one
-                // method. If a later guard still throws the same NullReferenceException,
-                // that path preserves the observable outcome of this check too; requiring
-                // every path to dereference this exact receiver leaves redundant guards and
-                // turns the shared helper into a spurious source-level throw.
-                if (instruction is { OpCode: OpCode.Throw,
-                        Operands: [TypeAnalysisContext { FullName: "System.NullReferenceException" }] })
-                    return true;
-
                 if (instruction.OpCode is OpCode.Nop or OpCode.Jump)
                 {
                     pathInstructions.Add(instruction);
@@ -489,20 +485,6 @@ public static class InjectedCheckRemover
                     continue;
                 }
 
-                if (instruction is { IsCall: true, Operands: [MethodAnalysisContext getter, ..] }
-                    && InlinedFieldGetterRecovery.IsVerifiedDirectGetter(getter))
-                {
-                    if (IsImplicitNullCheckOperation(instruction, receiver, defOf, arraysOnly,
-                            knownNonNullThis, pathInstructions, callsNeedingNullCheck))
-                        return true;
-
-                    // ARM64 may inline an auto-property's field load and then recover it as a
-                    // verified getter call. Crossing that read is safe: it has no side effects,
-                    // and a null getter receiver already raises the same exception.
-                    pathInstructions.Add(instruction);
-                    continue;
-                }
-
                 if (instruction.OpCode == OpCode.ConditionalJump)
                 {
                     if (current.Successors.Count != 2)
@@ -511,15 +493,23 @@ public static class InjectedCheckRemover
                     foreach (var successor in current.Successors)
                     {
                         if (!HasImplicitNullCheckOnEveryPath(successor, receiver, defOf, arraysOnly,
-                                allowNonThrowingComputations, knownNonNullThis, [.. pathInstructions],
+                                allowNonThrowingComputations, knownNonNullThis, nullFailure, [.. pathInstructions],
                                 [.. visitedPath], callsNeedingNullCheck))
                             return false;
                     }
                     return true;
                 }
 
-                return IsImplicitNullCheckOperation(instruction, receiver, defOf, arraysOnly,
-                    knownNonNullThis, pathInstructions, callsNeedingNullCheck);
+                if (IsImplicitNullCheckOperation(instruction, receiver, defOf, arraysOnly,
+                        knownNonNullThis, pathInstructions, callsNeedingNullCheck))
+                    return true;
+
+                // An ordinary instance read can also fail on a different null receiver.
+                // Its only effect is that same exception, so the search can continue.
+                if (nullFailure == null || !allowNonThrowingComputations || !IsPlainInstanceRead(instruction))
+                    return false;
+
+                pathInstructions.Add(instruction);
             }
 
             if (current.Successors is not [var next])
@@ -554,12 +544,11 @@ public static class InjectedCheckRemover
             && SameValueOnPath(receiver, field.Local, pathInstructions, defOf))
             return true;
 
-        // The native guard was emitted for a source-level instance call. Marking the
-        // recovered call to retain its null check lets IL generation use callvirt, which
-        // also preserves virtual dispatch when the target is virtual.
+        // Use callvirt for the null check only if it preserves how the target is dispatched.
         if (!operation.IsCall
-            || operation.Operands[0] is not MethodAnalysisContext { IsStatic: false, DeclaringType.IsValueType: false } target
-            || target.Name == ".ctor")
+            || operation.Operands[0] is not MethodAnalysisContext { IsStatic: false, DeclaringType: { IsValueType: false } owner } target
+            || target.Name == ".ctor"
+            || !operation.NullCheckReceiver && target.IsVirtual && !target.IsFinal && !owner.IsSealed)
             return false;
 
         var receiverIndex = operation.OpCode == OpCode.CallVoid ? 1 : 2;
@@ -690,6 +679,9 @@ public static class InjectedCheckRemover
             { OpCode: >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned,
                 Operands: [LocalVariable, var left, var right, FloatingPointPrecision] } =>
                 IsFloatValue(left) && IsFloatValue(right),
+            { OpCode: OpCode.Convert, Operands: [LocalVariable, LocalVariable source, NumericConversion
+                { Kind: >= NumericConversionKind.SignedInt32ToFloat32 and <= NumericConversionKind.UnsignedInt64ToFloat64,
+                    FixedPointScale: 0 }] } => source.Type?.FullName is "System.Int32" or "System.Int64" or "System.UInt32" or "System.UInt64",
             { OpCode: OpCode.PackFloatAggregate, Destination: LocalVariable destination } =>
                 defOf.ContainsKey(destination) && FloatAggregateRecovery.IsLiteralPack(instruction),
             _ => false,
@@ -707,6 +699,17 @@ public static class InjectedCheckRemover
         && operand is FieldReference { Parent: null, Field.IsStatic: false } field
         && ReferenceEquals(field.Local, knownNonNullThis)
         && field.Field.FieldType is not CustomModifierTypeAnalysisContext;
+
+    private static bool IsPlainInstanceRead(Instruction instruction) => instruction switch
+    {
+        { OpCode: OpCode.Move, Operands: [LocalVariable, FieldReference
+            { Parent: null, Field.IsStatic: false, Local.Type: { } owner } field] } =>
+            IlGenerator.IsManagedReference(owner) && field.Field.FieldType is not CustomModifierTypeAnalysisContext,
+        { OpCode: OpCode.Call, NullCheckReceiver: true,
+            Operands: [MethodAnalysisContext getter, LocalVariable, LocalVariable] } =>
+            InlinedFieldGetterRecovery.IsVerifiedDirectGetter(getter),
+        _ => false,
+    };
 
     private static bool IsDirectThisFieldRead(IOperand operand) =>
         operand is FieldReference { Parent: null, Local.IsThis: true, Field.IsStatic: false } field
@@ -964,7 +967,7 @@ public static class InjectedCheckRemover
         Dictionary<LocalVariable, Instruction> defOf, HashSet<LocalVariable> seen) =>
         left == null || right == null ? left == null && right == null : SameValue(left, right, defOf, seen);
 
-    private sealed record InjectedThrow(string? ExceptionType, IOperand? Operand);
+    private sealed record InjectedThrow(string? ExceptionType, IOperand? Operand, Block Block);
 
     // Exception checks can share a native block with a dead allocation of another exception
     // type. Ignore only an unused parameterless NullReferenceException/IndexOutOfRangeException
@@ -1011,8 +1014,25 @@ public static class InjectedCheckRemover
         return ignored;
     }
 
-    // Describes the throw performed by a block containing no other observable operation.
+    // Phi lowering may split a guard's failure edge even after its copies become dead.
     private static InjectedThrow? GetInjectedThrow(Block block, HashSet<Instruction> ignoredExceptionConstructions)
+    {
+        for (var remaining = 12; remaining > 0; remaining--)
+        {
+            if (block.Successors is not [var successor]
+                || block.Instructions.LastOrDefault() is not { OpCode: OpCode.Jump, Operands: [Block target] }
+                || target != successor
+                || block.Instructions.Take(block.Instructions.Count - 1).Any(instruction => instruction.OpCode != OpCode.Nop))
+                return GetDirectThrow(block, ignoredExceptionConstructions);
+
+            block = successor;
+        }
+
+        return null;
+    }
+
+    // Describes the throw performed by a block containing no other observable operation.
+    private static InjectedThrow? GetDirectThrow(Block block, HashSet<Instruction> ignoredExceptionConstructions)
     {
         var meaningful = block.Instructions
             .Where(instruction => !ignoredExceptionConstructions.Contains(instruction)
@@ -1024,7 +1044,7 @@ public static class InjectedCheckRemover
             && meaningful[1] is { OpCode: OpCode.Throw, Operands: [LocalVariable thrownOperand] }
             && ReferenceEquals(constructed, thrownOperand)
             && (meaningful.Length == 2 || meaningful[2].OpCode == OpCode.Return))
-            return new InjectedThrow(null, thrownOperand);
+            return new InjectedThrow(null, thrownOperand, block);
 
         InjectedThrow? thrown = null;
 
@@ -1041,12 +1061,12 @@ public static class InjectedCheckRemover
 
                 case OpCode.Throw when thrown == null
                     && instruction.Operands is [TypeAnalysisContext { FullName: "System.NullReferenceException" or "System.IndexOutOfRangeException" } exception]:
-                    thrown = new InjectedThrow(exception.FullName, null);
+                    thrown = new InjectedThrow(exception.FullName, null, block);
                     continue;
 
                 case OpCode.Throw when thrown == null
                     && instruction.Operands is [LocalVariable or FieldReference or MemoryOperand or Register]:
-                    thrown = new InjectedThrow(null, instruction.Operands.First());
+                    thrown = new InjectedThrow(null, instruction.Operands.First(), block);
                     continue;
 
                 default:
