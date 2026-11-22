@@ -20,6 +20,9 @@ public class Instruction : IOperand
     // Number of bytes read or written by a native load/store, when known.
     public int? MemoryAccessSize;
 
+    // Number of identical floating-point lanes written by a native SIMD splat.
+    public int? VectorElementCount;
+
     // This immediate address came from a PC-relative native instruction, not an integer literal.
     public bool IsPcRelativeAddress;
 

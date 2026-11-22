@@ -60,10 +60,20 @@ internal static class AutoPropertyRestorer
                 if (getter == null && setter == null)
                     continue;
 
-                var getterIsTrivial = getter != null && IsTrivialGetter(getter, backingField, runtimeContext);
+                var getterIsDirect = getter != null && IsTrivialGetter(getter, backingField, runtimeContext);
+                var getterIsCompilerGeneratedAutoProperty = getter != null
+                    && IsCompilerGeneratedAutoPropertyGetter(getter, backingField, runtimeContext);
+                var getterIsTrivial = getterIsDirect || getterIsCompilerGeneratedAutoProperty;
                 var setterIsTrivial = setter != null && IsTrivialSetter(setter, backingField, runtimeContext);
                 if (!getterIsTrivial && !setterIsTrivial)
                     continue;
+
+                // Value-type returns can be expanded by native recovery into component
+                // copies (for example, Vector3.x/y/z). The compiler-generated accessor
+                // and its synthetic backing-field name prove that this is still an
+                // auto-property getter, so restore the direct field load before ILSpy sees it.
+                if (getterIsCompilerGeneratedAutoProperty && !getterIsDirect)
+                    NormalizeGetter(getter!, backingField);
 
                 if (backingField.IsStatic)
                 {
@@ -279,6 +289,44 @@ internal static class AutoPropertyRestorer
                && instructions[0].OpCode.Code == CilCode.Ldarg_0
                && IsFieldInstruction(instructions[1], CilCode.Ldfld, field, runtimeContext)
                && instructions[2].OpCode.Code == CilCode.Ret;
+    }
+
+    private static bool IsCompilerGeneratedAutoPropertyGetter(
+        MethodDefinition getter, FieldDefinition backingField, RuntimeContext runtimeContext)
+    {
+        if (getter.IsStatic != backingField.IsStatic
+            || getter.Parameters.Count != 0
+            || !HasSimpleBody(getter)
+            || getter.CustomAttributes.All(attribute =>
+                attribute.Constructor?.DeclaringType?.FullName != CompilerGeneratedAttributeName))
+            return false;
+
+        return SignificantInstructions(getter).Any(instruction =>
+            (getter.IsStatic
+                ? instruction.OpCode.Code is CilCode.Ldsfld or CilCode.Ldsflda
+                : instruction.OpCode.Code is CilCode.Ldfld or CilCode.Ldflda)
+            && instruction.Operand is IFieldDescriptor descriptor
+            && ReferenceEquals(ResolveField(descriptor, runtimeContext), backingField));
+    }
+
+    private static void NormalizeGetter(MethodDefinition getter, FieldDefinition backingField)
+    {
+        var body = getter.CilMethodBody!;
+        body.Instructions.Clear();
+        body.LocalVariables.Clear();
+        body.InitializeLocals = false;
+        body.ComputeMaxStackOnBuild = false;
+        body.MaxStack = 1;
+
+        if (getter.IsStatic)
+            body.Instructions.Add(CilOpCodes.Ldsfld, backingField);
+        else
+        {
+            body.Instructions.Add(CilOpCodes.Ldarg_0);
+            body.Instructions.Add(CilOpCodes.Ldfld, backingField);
+        }
+
+        body.Instructions.Add(CilOpCodes.Ret);
     }
 
     private static bool IsTrivialSetter(MethodDefinition setter, FieldDefinition field, RuntimeContext runtimeContext)

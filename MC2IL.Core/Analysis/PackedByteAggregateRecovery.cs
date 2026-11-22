@@ -12,6 +12,61 @@ namespace MC2IL.Core.Analysis;
 // Model the bytes as fields at the managed boundary instead of casting a struct to an int.
 internal static class PackedByteAggregateRecovery
 {
+    internal static void RecoverCallArguments(MethodAnalysisContext method)
+    {
+        if (!SupportsPackedWords(method))
+            return;
+
+        var graph = method.ControlFlowGraph!;
+        var definitions = graph.Instructions.Where(instruction => instruction.Destination is LocalVariable)
+            .ToLookup(instruction => (LocalVariable)instruction.Destination!);
+        foreach (var block in graph.Blocks)
+        for (var index = 0; index < block.Instructions.Count; index++)
+        {
+            var call = block.Instructions[index];
+            if (!call.IsCall || call.Operands[0] is not MethodAnalysisContext target)
+                continue;
+
+            var firstArgument = (call.OpCode == OpCode.CallVoid ? 1 : 2) + (target.IsStatic ? 0 : 1);
+            for (var parameter = 0; parameter < target.Parameters.Count && firstArgument + parameter < call.Operands.Count; parameter++)
+            {
+                var type = target.Parameters[parameter].ParameterType;
+                if (GetByteFields(type) is not { } fields)
+                    continue;
+
+                var bits = call.Operands[firstArgument + parameter];
+                if (bits is LocalVariable local)
+                {
+                    // Parameter hints can type a native bitwise result as the managed struct.
+                    // Its producer still proves that the register contains an integer word.
+                    if (local.Type == type && definitions[local].Count() == 1 && IsWordProducer(definitions[local].Single()))
+                        local.Type = method.AppContext.SystemTypes.SystemInt32Type;
+                    if (!IsWordType(local.Type))
+                        continue;
+                }
+                else if (bits is not Immediate { Value: >= int.MinValue and <= uint.MaxValue })
+                    continue;
+
+                var value = CreateLocal(method, "unpackedArgument", type);
+                var materialize = new List<Instruction> { new(-1, OpCode.Move, [value, new DefaultValue(type)]) };
+                for (var lane = 0; lane < fields.Length; lane++)
+                {
+                    IOperand source = bits;
+                    if (lane != 0)
+                    {
+                        var shifted = CreateLocal(method, $"argumentByte{lane}", method.AppContext.SystemTypes.SystemUInt32Type);
+                        materialize.Add(new Instruction(-1, OpCode.ShiftRightUnsigned, [shifted, bits, new Immediate(lane * 8)]));
+                        source = shifted;
+                    }
+                    materialize.Add(new Instruction(-1, OpCode.Move, [new FieldReference(fields[lane], value, fields[lane].Offset), source]));
+                }
+                block.Instructions.InsertRange(index, materialize);
+                index += materialize.Count;
+                call.SetOperand(firstArgument + parameter, value);
+            }
+        }
+    }
+
     internal static bool RecoverParameters(MethodAnalysisContext method)
     {
         var graph = method.ControlFlowGraph!;

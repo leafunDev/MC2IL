@@ -65,8 +65,6 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
 
     public override void RemapRawArguments(Instruction call, MethodAnalysisContext resolved, MethodAnalysisContext caller)
     {
-        if (Environment.GetEnvironmentVariable("MC2IL_TRACE_RAW_ARGUMENTS") is { Length: > 0 } trace)
-            System.IO.File.AppendAllText(trace, $"{caller.FullName} -> {resolved.FullName}: raw={HasRawArgumentLayout(call, resolved.AppContext)}; params={string.Join(",", resolved.Parameters.Select(p => p.ParameterType.FullName + ":" + (GetFloatAggregateFields(p.ParameterType)?.Length ?? 0)))}; {call}\n");
         if (!HasRawArgumentLayout(call, resolved.AppContext))
             return;
 

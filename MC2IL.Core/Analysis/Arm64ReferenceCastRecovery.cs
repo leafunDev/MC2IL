@@ -59,6 +59,10 @@ internal static class Arm64ReferenceCastRecovery
             }
 
             var discarded = new HashSet<Instruction>(check.Instructions);
+            // Replacing the guard branch also discards its comparison. After SSA removal,
+            // that comparison may reuse the type check's condition local.
+            discarded.Add(nullTest);
+            discarded.Add(branch);
             if (success != storeBlock)
                 discarded.UnionWith(success.Instructions);
             var discardedLocals = new HashSet<LocalVariable>(discarded.Select(i => i.Destination).OfType<LocalVariable>());

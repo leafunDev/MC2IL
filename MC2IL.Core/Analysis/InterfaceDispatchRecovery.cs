@@ -122,6 +122,16 @@ public static class InterfaceDispatchRecovery
     private static LocalVariable? MatchVTableEntryChain(Dictionary<LocalVariable, Instruction> definitions,
         Instruction? vtableEntry, int slot, int vtableOffset)
     {
+        // AArch64 commonly computes (klass + (entryOffset << 4)) + vtableOffset.
+        // Normalize this reassociation to the same operands as klass + ((entryOffset << 4) + offset).
+        if (vtableEntry is { OpCode: OpCode.Add, Operands: [_, LocalVariable inner, Immediate finalOffset] }
+            && finalOffset.Value == vtableOffset
+            && ChaseCopies(definitions, inner) is { OpCode: OpCode.Add, Operands: [_, LocalVariable klass, LocalVariable shift] }
+            && ChaseCopies(definitions, shift) is { OpCode: OpCode.ShiftLeft })
+        {
+            return MatchEntryIndex(definitions, klass, shift, slot);
+        }
+
         if (vtableEntry is not { OpCode: OpCode.Add, Operands: [_, LocalVariable addLeft, LocalVariable addRight] })
             return null;
 
@@ -136,7 +146,15 @@ public static class InterfaceDispatchRecovery
             || offset.Value != vtableOffset)
             return null;
 
-        if (ChaseCopies(definitions, shifted) is not { OpCode: OpCode.ShiftLeft, Operands: [_, LocalVariable index, Immediate { Value: InvokeDataShift }] })
+        return MatchEntryIndex(definitions, klassCandidate, shifted, slot);
+    }
+
+    private static LocalVariable? MatchEntryIndex(Dictionary<LocalVariable, Instruction> definitions,
+        LocalVariable klassCandidate, LocalVariable shifted, int slot)
+    {
+        if (Definition(definitions, klassCandidate) is not { OpCode: OpCode.Move,
+                Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable }] }
+            || ChaseCopies(definitions, shifted) is not { OpCode: OpCode.ShiftLeft, Operands: [_, LocalVariable index, Immediate { Value: InvokeDataShift }] })
             return null;
 
         var entryOffset = ChaseCopies(definitions, index);
@@ -218,6 +236,7 @@ public static class InterfaceDispatchRecovery
         }
 
         dispatch.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
+        dispatch.NullCheckReceiver = true;
         callingConventions?.RemapRawArguments(dispatch, resolved, method);
 
         // name [phi+8] as the hidden MethodInfo param, like ResolveVirtualCalls. A tail call's target
@@ -275,6 +294,14 @@ public static class InterfaceDispatchRecovery
             instruction.SetOperands();
         }
 
+        // The managed interface call supplies the receiver check. Once lookup is removed,
+        // its count and class reads may die when no other instruction consumes them.
+        var klassRead = Definition(definitions, match.KlassLocal);
+        var lookupLoads = new HashSet<Instruction>(head.Instructions.Where(instruction => instruction == klassRead
+            || instruction is { OpCode: OpCode.Move, Destination: LocalVariable,
+                Operands: [_, MemoryOperand { Base: LocalVariable loadBase, Index: null, Scale: 0 }] }
+                && loadBase == match.KlassLocal));
+
         foreach (var successor in head.Successors)
             successor.Predecessors.Remove(head);
         head.Successors.Clear();
@@ -305,6 +332,7 @@ public static class InterfaceDispatchRecovery
             block.Predecessors.Clear();
             cfg.Blocks.Remove(block);
         }
+        DeadCodeEliminator.Run(cfg, lookupLoads);
     }
 
     // The region has to be closed, so nothing else may enter or leave it

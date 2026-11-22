@@ -14,8 +14,15 @@ public static class BooleanFlagSimplifier
     public static void Run(MethodAnalysisContext method)
     {
         var booleanType = method.AppContext.SystemTypes.SystemBooleanType;
+        var definitions = new Dictionary<LocalVariable, Instruction>();
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction.Destination is LocalVariable destination)
+                definitions[destination] = instruction;
+
+        FoldTypedBitwiseOperations(method);
+
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
             if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual) || instruction.Operands.Count < 3)
                 continue;
@@ -26,13 +33,160 @@ public static class BooleanFlagSimplifier
                     ? instruction.Operands[2]
                     : null;
 
-            if (value is not LocalVariable { Type: { } type } || type != booleanType)
+            if (value is not LocalVariable local
+                || !TryGetBooleanBit(local, definitions, booleanType, out var booleanValue, out var inverted))
                 continue;
 
-            instruction.OpCode = instruction.OpCode == OpCode.CheckNotEqual ? OpCode.Move : OpCode.Not;
-            instruction.SetOperands(instruction.Operands[0], value);
+            // Native code often materializes a bool as (condition ? 1 : 0), flips it with
+            // XOR 1, then compares the integer with zero. Collapse the whole proven 0/1
+            // expression back to a bool copy or logical negation before emitting CIL.
+            inverted ^= instruction.OpCode == OpCode.CheckEqual;
+            instruction.OpCode = inverted ? OpCode.Not : OpCode.Move;
+            instruction.SetOperands(instruction.Operands[0], booleanValue);
         }
     }
+
+    // This can also run after SSA removal: it relies only on the operation's resolved bool type
+    // and immediate mask, not on which definition reaches a particular use.
+    internal static void FoldTypedBitwiseOperations(MethodAnalysisContext method)
+    {
+        var booleanType = method.AppContext.SystemTypes.SystemBooleanType;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            TryFoldBooleanBitwiseIdentity(instruction, booleanType);
+    }
+
+    private static bool TryFoldBooleanBitwiseIdentity(Instruction instruction, TypeAnalysisContext booleanType)
+    {
+        if (instruction.Operands is not [LocalVariable { Type: { } resultType } destination, var left, var right]
+            || resultType != booleanType)
+            return false;
+
+        if (instruction.OpCode == OpCode.And)
+        {
+            if (IsZeroConstant(left) || IsZeroConstant(right))
+                return ToBooleanConstant(instruction, destination, 0);
+            if (IsBoolean(left, booleanType) && IsOne(right))
+                return ToBooleanMove(instruction, destination, left);
+            if (IsBoolean(right, booleanType) && IsOne(left))
+                return ToBooleanMove(instruction, destination, right);
+        }
+        else if (instruction.OpCode == OpCode.Or)
+        {
+            if (IsBoolean(left, booleanType) && IsZeroConstant(right))
+                return ToBooleanMove(instruction, destination, left);
+            if (IsBoolean(right, booleanType) && IsZeroConstant(left))
+                return ToBooleanMove(instruction, destination, right);
+            if (IsBoolean(left, booleanType) && IsOne(right)
+                || IsBoolean(right, booleanType) && IsOne(left))
+                return ToBooleanConstant(instruction, destination, 1);
+        }
+        else if (instruction.OpCode == OpCode.Xor)
+        {
+            if (IsBoolean(left, booleanType) && IsZeroConstant(right))
+                return ToBooleanMove(instruction, destination, left);
+            if (IsBoolean(right, booleanType) && IsZeroConstant(left))
+                return ToBooleanMove(instruction, destination, right);
+            if (IsBoolean(left, booleanType) && IsOne(right))
+                return ToBooleanNot(instruction, destination, left);
+            if (IsBoolean(right, booleanType) && IsOne(left))
+                return ToBooleanNot(instruction, destination, right);
+        }
+
+        return false;
+    }
+
+    private static bool IsBoolean(IOperand operand, TypeAnalysisContext booleanType)
+        => operand is LocalVariable { Type: { } type } && type == booleanType;
+
+    private static bool ToBooleanMove(Instruction instruction, IOperand destination, IOperand value)
+    {
+        instruction.OpCode = OpCode.Move;
+        instruction.SetOperands(destination, value);
+        return true;
+    }
+
+    private static bool ToBooleanNot(Instruction instruction, IOperand destination, IOperand value)
+    {
+        instruction.OpCode = OpCode.Not;
+        instruction.SetOperands(destination, value);
+        return true;
+    }
+
+    private static bool ToBooleanConstant(Instruction instruction, IOperand destination, long value)
+    {
+        instruction.OpCode = OpCode.Move;
+        instruction.SetOperands(destination, new Immediate(value));
+        return true;
+    }
+
+    private static bool TryGetBooleanBit(LocalVariable value,
+        Dictionary<LocalVariable, Instruction> definitions, TypeAnalysisContext booleanType,
+        out LocalVariable booleanValue, out bool inverted, int depth = 0)
+    {
+        booleanValue = null!;
+        inverted = false;
+        if (depth >= 16)
+            return false;
+
+        if (!definitions.TryGetValue(value, out var definition))
+        {
+            if (value.Type != booleanType)
+                return false;
+
+            booleanValue = value;
+            return true;
+        }
+
+        switch (definition)
+        {
+            case { OpCode: OpCode.Move, Operands: [_, LocalVariable source] }:
+                return TryGetBooleanBit(source, definitions, booleanType, out booleanValue, out inverted, depth + 1);
+
+            case { OpCode: OpCode.Not, Operands: [_, LocalVariable source] }:
+                if (!TryGetBooleanBit(source, definitions, booleanType, out booleanValue, out inverted, depth + 1))
+                    return false;
+                inverted = !inverted;
+                return true;
+
+            case { OpCode: OpCode.Select, Operands: [_, LocalVariable condition, Immediate whenTrue, Immediate whenFalse] }
+                when whenTrue.Value is 0 or 1 && whenFalse.Value is 0 or 1 && whenTrue.Value != whenFalse.Value:
+                if (!TryGetBooleanBit(condition, definitions, booleanType, out booleanValue, out inverted, depth + 1))
+                    return false;
+                inverted ^= whenTrue.Value == 0;
+                return true;
+
+            case { OpCode: OpCode.Xor, Operands: [_, var left, var right] }
+                when IsOne(right) && left is LocalVariable leftLocal:
+                if (!TryGetBooleanBit(leftLocal, definitions, booleanType, out booleanValue, out inverted, depth + 1))
+                    return false;
+                inverted = !inverted;
+                return true;
+
+            case { OpCode: OpCode.Xor, Operands: [_, var left, var right] }
+                when IsOne(left) && right is LocalVariable rightLocal:
+                if (!TryGetBooleanBit(rightLocal, definitions, booleanType, out booleanValue, out inverted, depth + 1))
+                    return false;
+                inverted = !inverted;
+                return true;
+
+            case { OpCode: OpCode.And, Operands: [_, var left, var right] }
+                when IsOne(right) && left is LocalVariable leftLocal:
+                return TryGetBooleanBit(leftLocal, definitions, booleanType, out booleanValue, out inverted, depth + 1);
+
+            case { OpCode: OpCode.And, Operands: [_, var left, var right] }
+                when IsOne(left) && right is LocalVariable rightLocal:
+                return TryGetBooleanBit(rightLocal, definitions, booleanType, out booleanValue, out inverted, depth + 1);
+
+            default:
+                if (value.Type != booleanType)
+                    return false;
+
+                booleanValue = value;
+                return true;
+        }
+    }
+
+    private static bool IsOne(IOperand operand) => operand is Immediate { Value: 1 };
 
     // After SSA propagation a boolean return can have the form (phi(flag, 1) & 1).
     // The untyped merge would otherwise become an object local when the phi is lowered.

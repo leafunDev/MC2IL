@@ -198,6 +198,7 @@ public static class IlGenerator
                 // Keep the field and ldlen together so the comparison can inline the full expression.
                 InlineSingleUseArrayLengthReceiver(block, i, graph, instructionMap, inlineLocals, body);
                 InlineSingleUseFirstInput(block, i, graph, instructionMap, inlineLocals);
+                InlineSingleUseCastAssignment(block, i, graph, instructionMap, inlineLocals, body);
                 InlineSingleUseComparisonInput(block, i, graph, instructionMap, inlineLocals, body);
                 InlineSingleUseCallArguments(block, i, graph, instructionMap, inlineLocals, body);
                 if (fieldReadLocals != null)
@@ -280,6 +281,8 @@ public static class IlGenerator
         }
 
         CilSingleUseMathInliner.Run(body, locals);
+        if (isIteratorMoveNext)
+            IteratorReceiverInliner.Run(context, body, instructionMap);
         CilBranchCleanup.Run(body);
         SetRecoveredMaxStack(body);
     }
@@ -574,6 +577,41 @@ public static class IlGenerator
                 { Parent: null, Local.IsThis: true, Field.IsStatic: false }] }
             && emitted is [var load, var field, _]
             && load.OpCode == CilOpCodes.Ldarg_0 && field.OpCode == CilOpCodes.Ldfld;
+    }
+
+    private static void InlineSingleUseCastAssignment(Block block, int index, ISILControlFlowGraph graph,
+        Dictionary<Instruction, List<CilInstruction>> instructionMap,
+        Dictionary<LocalVariable, CilLocalVariable> locals, CilMethodBody body)
+    {
+        var cast = block.Instructions[index];
+        if (cast is not { OpCode: OpCode.CastClass, Operands:
+                [FieldReference { Parent: null, Local.IsThis: true, Local.Type.IsValueType: false } destination, _, LocalVariable value] }
+            || !locals.TryGetValue(value, out var slot)
+            || !TryFindSingleUseProducer(block, index, value, out var callBlock, out var callIndex, out var producer)
+            || producer is not { OpCode: OpCode.Call, Operands: [MethodAnalysisContext, ..] }
+            || !instructionMap.TryGetValue(producer, out var expression)
+            || expression.Count < 2 || expression[^1].OpCode != CilOpCodes.Stloc || expression[^1].Operand != slot
+            || !ProducesStandaloneStackValue(expression, body)
+            || !instructionMap.TryGetValue(cast, out var castIl)
+            || castIl is not [{ OpCode.Code: CilCode.Ldarg_0 }, { OpCode.Code: CilCode.Ldloc, Operand: var operand }, ..]
+            || operand != slot || CountLocalUses(graph, value) != 1)
+            return;
+
+        if (producer.Operands is [_, _, LocalVariable firstArgument, ..]
+            && locals.TryGetValue(firstArgument, out var input)
+            && expression[0] is { OpCode.Code: CilCode.Ldloc, Operand: var loaded } && loaded == input
+            && TryFindSingleUseProducer(callBlock, callIndex, firstArgument, out _, out _, out var fieldLoad)
+            && fieldLoad is { OpCode: OpCode.Move, Operands: [_, FieldReference { Parent: null } source] }
+            && source.Field == destination.Field && source.Local == destination.Local
+            && instructionMap.TryGetValue(fieldLoad, out var loadIl) && loadIl.Count >= 2
+            && loadIl[^1].OpCode == CilOpCodes.Stloc && loadIl[^1].Operand == input
+            && ProducesStandaloneStackValue(loadIl, body) && CountLocalUses(graph, firstArgument) == 1)
+        {
+            RelocateSingleUseExpression(fieldLoad, loadIl, expression, 0, instructionMap, body);
+        }
+
+        // Loading this before the call cannot change which object receives the result.
+        RelocateSingleUseExpression(producer, expression, castIl, 1, instructionMap, body);
     }
 
     private static void InlineSingleUseComparisonInput(Block block, int index, ISILControlFlowGraph graph,
@@ -2273,6 +2311,14 @@ public static class IlGenerator
             return;
 
         var destination = move.Operands[0];
+        // A native word load/store can copy an entire small struct. Once both ends are
+        // typed as that struct, CIL must preserve the value without a numeric conversion.
+        if (OperandType(destination) is { IsValueType: true, IsEnumType: false } valueType
+            && valueType.Type is LibMC2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE
+                or LibMC2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST
+            && MetadataResolver.IsSameType(valueType, OperandType(move.Operands[1])))
+            return;
+
         // CIL uses the same stack width for both signed and unsigned 32-bit values.
         // An extra conv.u4 hides direct parameter and constant stores from iterator recovery.
         if (OperandType(destination)?.FullName is "System.Int32" or "System.UInt32"
@@ -2543,6 +2589,17 @@ public static class IlGenerator
                 // A delegate constructor takes its target as a native pointer, which is exactly ldftn.
                 if (expectedType?.FullName == "System.IntPtr")
                 {
+                    var targetPointer = GetNativeMethodPointer(runtimeMethod.RepresentedMethod);
+                    if (runtimeMethod.RepresentedMethod.AppContext.InstructionSet is NewArmV8InstructionSet
+                        && targetPointer != 0)
+                    {
+                        // Keep ARM64 native addresses as integers. ILSpy otherwise mistakes ldftn
+                        // for a managed delegate target when the recovered value is an IntPtr.
+                        instructions.Add(CilOpCodes.Ldc_I8, unchecked((long)targetPointer));
+                        instructions.Add(CilOpCodes.Conv_I);
+                        break;
+                    }
+
                     instructions.Add(CilOpCodes.Ldftn, runtimeMethod.RepresentedMethod.ToMethodDescriptor());
                     break;
                 }
@@ -2585,6 +2642,27 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldnull);
                 break;
         }
+    }
+
+    private static ulong GetNativeMethodPointer(MethodAnalysisContext method)
+    {
+        if (method.UnderlyingPointer != 0)
+            return method.UnderlyingPointer;
+
+        // A method on a closed generic type may have no pointer on its open definition.
+        // Reuse the native pointer recorded for the matching concrete instantiation.
+        var baseMethod = method is ConcreteGenericMethodAnalysisContext concrete
+            ? concrete.BaseMethodContext
+            : method;
+        var declaringType = method.DeclaringType?.FullName;
+        if (baseMethod.Definition == null || declaringType == null)
+            return 0;
+
+        return method.AppContext.ConcreteGenericMethodsByRef.Values
+            .Where(candidate => ReferenceEquals(candidate.BaseMethodContext.Definition, baseMethod.Definition)
+                && candidate.DeclaringType?.FullName == declaringType)
+            .Select(candidate => candidate.UnderlyingPointer)
+            .FirstOrDefault(pointer => pointer != 0);
     }
 
     private static bool TryEmitExactTypeComparison(Instruction instruction, MethodDefinition method,

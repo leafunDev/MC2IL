@@ -685,6 +685,8 @@ public static class LocalVariables
                     break;
                 case OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
                     or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.ShiftRightUnsigned:
+                    if (instruction.OpCode == OpCode.Negate)
+                        changed |= PropagateArithmetic(instruction, method);
                     changed |= PropagateBooleanResult(instruction, method.AppContext.SystemTypes)
                         || PropagateIntegerResult(instruction, method);
                     break;
@@ -732,13 +734,40 @@ public static class LocalVariables
     // Arithmetic on a float operand is float arithmetic, so the result is that float type.
     private static bool PropagateArithmetic(Instruction instruction, MethodAnalysisContext method)
     {
-        if (instruction.Operands is not [LocalVariable { Type: null } destination, var left, var right, ..])
+        if (instruction.Operands.Count < 2 || instruction.Operands[0] is not LocalVariable destination)
             return false;
 
         if (instruction.Operands.LastOrDefault() is FloatingPointPrecision precision)
-            return SetTypeIfUnknown(destination, precision.IsDouble
+        {
+            // The lifted ARM64/wasm instruction keeps its native FP precision even when
+            // register aliasing and phi nodes erased the managed types. Use that precision
+            // for every scalar operand as well as the result, so the type flows backward
+            // through copies/phis to the loads that supplied the arithmetic.
+            var precisionType = precision.IsDouble
                 ? method.AppContext.SystemTypes.SystemDoubleType
-                : method.AppContext.SystemTypes.SystemSingleType);
+                : method.AppContext.SystemTypes.SystemSingleType;
+            var changed = SetTypeIfUnknown(destination, precisionType);
+            for (var i = 1; i < instruction.Operands.Count - 1; i++)
+                if (instruction.Operands[i] is LocalVariable input)
+                    changed |= SetTypeIfUnknown(input, precisionType);
+            return changed;
+        }
+
+        if (instruction.OpCode == OpCode.Negate)
+        {
+            if (destination.Type != null || FloatOperandType(instruction.Operands[1], method) is not { } negatedType)
+                return false;
+            return SetTypeIfUnknown(destination, negatedType);
+        }
+
+        if (instruction.Operands.Count < 3)
+            return false;
+
+        if (destination.Type != null)
+            return false;
+
+        var left = instruction.Operands[1];
+        var right = instruction.Operands[2];
 
         if ((FloatOperandType(left, method) ?? FloatOperandType(right, method)) is not { } floatType)
             return false;
@@ -895,6 +924,8 @@ public static class LocalVariables
         {
             FloatLiteral => method.AppContext.SystemTypes.SystemSingleType,
             DoubleLiteral => method.AppContext.SystemTypes.SystemDoubleType,
+            FieldReference field when field.Field.FieldType.FullName is "System.Single" or "System.Double"
+                => field.Field.FieldType,
             LocalVariable { Type: { FullName: "System.Single" } single } => single,
             LocalVariable { Type: { FullName: "System.Double" } @double } => @double,
             _ => null,

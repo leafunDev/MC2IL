@@ -1238,7 +1238,7 @@ public static class MetadataResolver
             }
             else
             {
-                methodInfo = GetMethodInfoArgument(instruction, definitions);
+                methodInfo = GetMethodInfoArgument(instruction, definitions, method);
             }
 
             if (methodInfo is not { RepresentedMethod: { } representedMethod })
@@ -1257,10 +1257,7 @@ public static class MetadataResolver
                     || current.FullName == candidate.FullName))
                 continue;
 
-            var firstArg = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
-            var hiddenParamIndex = firstArg
-                + (representedMethod.AppContext.InstructionSet.CallingConventionResolver?.ReturnsViaHiddenBuffer(representedMethod) == true ? 1 : 0)
-                + (representedMethod.IsStatic ? 0 : 1) + representedMethod.Parameters.Count;
+            var hiddenParamIndex = HiddenMethodInfoArgumentIndex(instruction, representedMethod);
 
             if (hiddenParamIndex >= instruction.Operands.Count
                 || ResolveMethodInfo(instruction.Operands[hiddenParamIndex], definitions, []) is not { RepresentedMethod: { } hiddenMethod }
@@ -1450,6 +1447,8 @@ public static class MetadataResolver
                 var candidate = block.Instructions[i];
                 if (candidate == targetRead || candidate == methodInfoRead || candidate.OpCode == OpCode.Nop
                     || candidate is { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable or Immediate] }
+                    || checkedReceiver && candidate.OpCode == OpCode.PackFloatAggregate
+                        && candidate.Operands.Skip(2).All(operand => operand is LocalVariable or FloatLiteral or DoubleLiteral)
                     || checkedReceiver && candidate is { OpCode: OpCode.Move, Operands: [LocalVariable,
                         FieldReference { Field.IsStatic: false, Field.FieldType: not CustomModifierTypeAnalysisContext }] })
                     continue;
@@ -1535,17 +1534,39 @@ public static class MetadataResolver
     }
 
     private static RuntimeMethodInfoAnalysisContext? GetMethodInfoArgument(Instruction call,
-        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions, MethodAnalysisContext caller)
     {
         var firstArg = call.OpCode == OpCode.CallVoid ? 1 : 2;
 
         for (var i = call.Operands.Count - 1; i >= firstArg; i--)
         {
-            if (ResolveMethodInfo(call.Operands[i], definitions, []) is { } methodInfo)
+            // Unresolved calls retain every argument register, including the caller's own
+            // MethodInfo and handles left by earlier calls. A later register must not mask
+            // the callee's actual hidden argument just because it still has a known type.
+            if (ResolveMethodInfo(call.Operands[i], definitions, []) is { } methodInfo
+                && !ReferenceEquals(methodInfo.RepresentedMethod, caller)
+                && i == HiddenMethodInfoArgumentIndex(call, methodInfo.RepresentedMethod)
+                && MatchesNativeCallTarget(call, methodInfo.RepresentedMethod))
                 return methodInfo;
         }
 
         return null;
+    }
+
+    private static int HiddenMethodInfoArgumentIndex(Instruction call, MethodAnalysisContext target) =>
+        (call.OpCode == OpCode.CallVoid ? 1 : 2)
+        + (target.AppContext.InstructionSet.CallingConventionResolver?.ReturnsViaHiddenBuffer(target) == true ? 1 : 0)
+        + (target.IsStatic ? 0 : 1) + target.Parameters.Count;
+
+    private static bool MatchesNativeCallTarget(Instruction call, MethodAnalysisContext target)
+    {
+        if (call.Operands[0] is not Immediate address || target.UnderlyingPointer == 0)
+            return true;
+
+        // A stale handle can coincidentally occupy the right argument slot for its own
+        // signature. When both addresses are known, require the body being called to agree.
+        var mask = target.AppContext.InstructionSet is ArmV7InstructionSet ? ~1ul : ulong.MaxValue;
+        return (address.UnsignedValue & mask) == (target.UnderlyingPointer & mask);
     }
 
     internal static void RecoverDelegateTargets(MethodAnalysisContext method)

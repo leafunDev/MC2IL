@@ -2,6 +2,7 @@ using System;
 using MC2IL.Core.Graphs;
 using MC2IL.Core.ISIL;
 using MC2IL.Core.Model.Contexts;
+using MC2IL.Core.Utils;
 
 namespace MC2IL.Core.Analysis;
 
@@ -105,13 +106,29 @@ public static class ConstantFolder
         switch (instruction.OpCode)
         {
             case OpCode.And:
+                // ARM64 may zero-extend a small blittable value by ANDing its X register
+                // with 0xFFFFFFFF. For a 4-byte value type such as UnityEngine.LayerMask,
+                // that does not change the value. Keep it as a typed copy: emitting the
+                // native operation directly would try to apply CIL `and` to a valuetype.
+                if (Constant(instruction.Operands[2]) == uint.MaxValue
+                    && instruction.Operands[0] is LocalVariable { Type: { IsValueType: true } resultType }
+                    && instruction.Operands[1] is LocalVariable { Type: { IsValueType: true } inputType }
+                    && MetadataResolver.IsSameType(resultType, inputType)
+                    && TypeSizes.UnboxedSize(inputType, pointerSize) == sizeof(int))
+                    return ToMove(instruction, instruction.Operands[1]);
+
                 if (Constant(instruction.Operands[1]) == 0 || Constant(instruction.Operands[2]) == 0)
                     return ToConstant(instruction, 0);
                 // x & 1 == x only when x is a 0/1 boolean
                 return BooleanIdentity(instruction, 1) is { } andBool && ToMove(instruction, andBool);
             case OpCode.Or:
-            case OpCode.Xor:
             case OpCode.Add:
+                return Identity(instruction, 0);
+            case OpCode.Xor:
+                if (Constant(instruction.Operands[1]) == 1 && IsBoolean(instruction.Operands[2]))
+                    return ToNot(instruction, instruction.Operands[2]);
+                if (Constant(instruction.Operands[2]) == 1 && IsBoolean(instruction.Operands[1]))
+                    return ToNot(instruction, instruction.Operands[1]);
                 return Identity(instruction, 0);
             case OpCode.Multiply:
                 return Identity(instruction, 1);
@@ -216,6 +233,14 @@ public static class ConstantFolder
     {
         instruction.OpCode = OpCode.Move;
         instruction.SetOperands(instruction.Operands[0], source);
+        return true;
+    }
+
+    private static bool ToNot(Instruction instruction, IOperand value)
+    {
+        var destination = instruction.Operands[0];
+        instruction.OpCode = OpCode.Not;
+        instruction.SetOperands(destination, value);
         return true;
     }
 }

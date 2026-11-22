@@ -28,9 +28,11 @@ internal static class Arm64TypeCheckRecovery
                 || classLoad is not { OpCode: OpCode.Move, MemoryAccessSize: 8,
                     Operands: [LocalVariable { Type: RuntimeClassTypeAnalysisContext } klass,
                         MemoryOperand { Base: LocalVariable { Type: { } sourceType } value, Index: null, Addend: 0, Scale: 0 }] }
+                || classLoad.OperandWidth is not (null or 64)
                 || !IlGenerator.IsManagedReference(sourceType)
                 || targetLoad is not { OpCode: OpCode.Move,
                     Operands: [LocalVariable { Type: RuntimeClassTypeAnalysisContext } targetClass, TypeAnalysisContext targetType] }
+                || targetLoad.OperandWidth is not (null or 64)
                 || !IlGenerator.IsManagedReference(targetType) || targetType.IsInterface
                 || targetType is SzArrayTypeAnalysisContext or ArrayTypeAnalysisContext or GenericParameterTypeAnalysisContext
                 || !IsLoad(sourceDepthLoad, klass, 0x12C, 1, out var sourceDepth)
@@ -48,6 +50,7 @@ internal static class Arm64TypeCheckRecovery
                     Operands: [LocalVariable offset, var shiftedDepth, Immediate { Value: 3 }] }
                 || shiftedDepth != targetDepth
                 || add is not { OpCode: OpCode.Add, Operands: [LocalVariable slot, var baseTable, var indexOffset] }
+                || add.OperandWidth is not (null or 64)
                 || baseTable != table || indexOffset != offset
                 || !IsLoad(ancestorLoad, slot, -8, 8, out var ancestor)
                 || typeCheck.OperandWidth is not (null or 64)

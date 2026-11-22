@@ -420,6 +420,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Indirect jumps/calls should probably be resolved here before stack analysis
 
         StackAnalyzer.Analyze(this);
+        Arm64StackValueRecovery.Run(this);
         ValueTypeReceiverRecovery.BindStackConstructorReceivers(this);
 
         // Dominator info must be computed after stack analysis, which removes unreachable/empty
@@ -465,12 +466,15 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+        if (Arm64FloatVectorLaneRecovery.Run(this))
+            LocalVariables.ResolveTypesAndFields(this);
         DumpMethodIr("after type resolution");
         if (ArmV7DynamicFieldAccessRecovery.Run(this))
             LocalVariables.ResolveTypesAndFields(this);
         ValueTypeReceiverRecovery.ResolveStaticFieldAddresses(this);
         MetadataInitGuardRemover.RunClassReloads(this);
         MetadataResolver.RecoverDelegateTargets(this);
+        Arm64AggregateLiteralRecovery.Run(this);
         LocalVariables.RecoverFloatAggregateSources(this);
 
         // A struct-valued native getter may load each component separately and return its hidden
@@ -510,9 +514,14 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InternalCallGuardRemover.Run(this);
         KeyFunctionRecovery.Run(this);
         TrivialConstructorRecovery.Run(this);
+        PackedByteAggregateRecovery.RecoverCallArguments(this);
         PackedByteAggregateRecovery.RecoverReturns(this);
 
         ArrayRecovery.RecoverSplitElementAccesses(this);
+        // Array and call recovery can finish typing boolean flag expressions only after the
+        // earlier cleanup pass. Simplify them while locals are still in SSA form, so the
+        // definition chain stays unambiguous and dead numeric mask operations can be removed.
+        BooleanFlagSimplifier.Run(this);
         SsaForm.Remove(this);
 
         // Phi removal leaves a copy per merged version, most of which can share one local
@@ -549,6 +558,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ArrayRecovery.MergeReloadedLoopArrayLengths(ControlFlowGraph!);
 
         LocalVariables.TypeAddressedLocals(this);
+        BooleanFlagSimplifier.FoldTypedBitwiseOperations(this);
 
         ConstantBranchFolder.Run(this);
         Arm64ClampRecovery.Run(this);

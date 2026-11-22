@@ -28,6 +28,20 @@ internal static class Arm64ZeroStoreRecovery
             var instructions = block.Instructions;
             for (var i = 0; i < instructions.Count; i++)
             {
+                if (instructions[i] is { OpCode: OpCode.Move, MemoryAccessSize: > 0,
+                        Operands: [FieldReference { Parent: null, Field.IsStatic: true } staticField, var constant] } staticStore
+                    && IsZero(constant)
+                    && staticField.Offset == staticField.Field.Offset
+                    && Arm64CallingConventionResolver.GetFloatAggregateFields(staticField.Field.FieldType) is { } members
+                    && staticStore.MemoryAccessSize == members.Length
+                        * (members[0].FieldType.FullName == "System.Single" ? sizeof(float) : sizeof(double)))
+                {
+                    staticStore.SetOperand(1, new DefaultValue(staticField.Field.FieldType));
+                    staticStore.MemoryAccessSize = null;
+                    staticStore.OperandWidth = null;
+                    continue;
+                }
+
                 if (!TryGetWrite(instructions[i], out var target, out var size))
                     continue;
 
@@ -117,9 +131,7 @@ internal static class Arm64ZeroStoreRecovery
     {
         if (instruction is { OpCode: OpCode.Move, MemoryAccessSize: 4 or 8 or 16,
                 Operands: [FieldReference { Field.IsStatic: false, Offset: >= 0 and <= int.MaxValue - 16 } field, var value] }
-            && (value is Immediate { Value: 0 }
-                || value is FloatLiteral single && BitConverter.DoubleToInt64Bits(single.Value) == 0
-                || value is DoubleLiteral wide && BitConverter.DoubleToInt64Bits(wide.Value) == 0))
+            && IsZero(value))
         {
             target = field;
             size = instruction.MemoryAccessSize.Value;
@@ -129,6 +141,10 @@ internal static class Arm64ZeroStoreRecovery
         size = 0;
         return false;
     }
+
+    private static bool IsZero(IOperand value) => value is Immediate { Value: 0 }
+        || value is FloatLiteral single && BitConverter.DoubleToInt64Bits(single.Value) == 0
+        || value is DoubleLiteral wide && BitConverter.DoubleToInt64Bits(wide.Value) == 0;
 
     private static bool CoversAggregate(Dictionary<int, Lane> layout, int offset, int size)
     {

@@ -96,6 +96,29 @@ public static class NewArm64Utils
         }
     }
 
+    // Disarm reports the SIMD FMOV immediate as an integer zero. Decode its imm8
+    // from the original instruction instead of losing a repeated floating-point value.
+    internal static double DecodeVectorFloatImmediate(uint encoding, bool doublePrecision)
+    {
+        var immediate = ((encoding >> 16) & 7) << 5 | ((encoding >> 5) & 31);
+        var sign = immediate >> 7;
+        var repeated = (immediate >> 6) & 1;
+        var exponentLow = (immediate >> 4) & 3;
+        var fraction = immediate & 15;
+        if (doublePrecision)
+        {
+            var exponent = ((repeated ^ 1) << 10) | (repeated * 0x3FC) | exponentLow;
+            var bits = ((ulong)sign << 63) | ((ulong)exponent << 52) | ((ulong)fraction << 48);
+            return BitConverter.Int64BitsToDouble(unchecked((long)bits));
+        }
+        else
+        {
+            var exponent = ((repeated ^ 1) << 7) | (repeated * 0x7C) | exponentLow;
+            var bits = (sign << 31) | (exponent << 23) | (fraction << 19);
+            return BitConverter.ToSingle(BitConverter.GetBytes(bits), 0);
+        }
+    }
+
     public static List<Arm64Instruction> ToList(this Disassembler.SpanEnumerator enumerator)
     {
         var ret = new List<Arm64Instruction>();

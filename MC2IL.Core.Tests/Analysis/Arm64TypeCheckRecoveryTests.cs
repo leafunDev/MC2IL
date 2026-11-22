@@ -60,7 +60,9 @@ public class Arm64TypeCheckRecoveryTests
     [TestCase("table-offset")]
     [TestCase("slot-offset")]
     [TestCase("scale")]
+    [TestCase("address-width")]
     [TestCase("target")]
+    [TestCase("array-target")]
     [TestCase("external-use")]
     [TestCase("external-write")]
     [TestCase("side-effect")]
@@ -79,7 +81,14 @@ public class Arm64TypeCheckRecoveryTests
             case "table-offset": ChangeOffset(pattern.TableRead, 0xC0); break;
             case "slot-offset": ChangeOffset(pattern.AncestorRead, 0); break;
             case "scale": pattern.Shift.SetOperand(2, Imm(2)); break;
+            case "address-width": lookup.Instructions.Single(i => i.OpCode == OpCode.Add).OperandWidth = 32; break;
             case "target": pattern.TypeCheck.SetOperand(2, MC2ILApi.CurrentAppContext!.SystemTypes.SystemObjectType); break;
+            case "array-target":
+                var arrayType = new SzArrayTypeAnalysisContext(MC2ILApi.CurrentAppContext!.SystemTypes.SystemObjectType);
+                pattern.TargetLoad.SetOperand(1, arrayType);
+                ((LocalVariable)pattern.TargetLoad.Operands[0]).Type = new RuntimeClassTypeAnalysisContext(arrayType, arrayType.DeclaringAssembly);
+                pattern.TypeCheck.SetOperand(2, arrayType);
+                break;
             case "external-use": pattern.Success.SetOperands(pattern.TargetDepthRead.Destination!); break;
             case "external-write":
                 graph.Blocks.Single(block => block.Instructions.Contains(pattern.Success)).Instructions.Insert(0,
