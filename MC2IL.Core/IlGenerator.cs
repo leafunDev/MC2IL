@@ -1672,8 +1672,14 @@ public static class IlGenerator
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
-                        LoadOperand(instruction.Operands[thisParamIndex], method, locals, writeLine,
-                            targetMethod.DeclaringType, isReceiver: true);
+                    {
+                        var receiver = instruction.Operands[thisParamIndex];
+                        if (IsOptimizedCurrentInstanceReceiver(receiver, context, targetMethod))
+                            instructions.Add(CilOpCodes.Ldarg_0);
+                        else
+                            LoadOperand(receiver, method, locals, writeLine,
+                                targetMethod.DeclaringType, isReceiver: true);
+                    }
                     else
                     {
                         instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Non static method called without 'this' param ({instruction})"));
@@ -2084,6 +2090,31 @@ public static class IlGenerator
         ReferenceEquals(first, second)
         || first.FullName == second.FullName
         && first.DeclaringAssembly.CleanAssemblyName == second.DeclaringAssembly.CleanAssemblyName;
+
+    private static bool IsOptimizedCurrentInstanceReceiver(IOperand receiver,
+        MethodAnalysisContext caller, MethodAnalysisContext target)
+    {
+        if (receiver is not TypeAnalysisContext receiverType
+            || receiverType is RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
+                or RuntimeFieldInfoAnalysisContext or RgctxTableTypeAnalysisContext
+                or MethodRgctxTableTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext
+            || caller.IsStatic
+            || caller.DeclaringType is not { } callerType
+            || target.DeclaringType is not { } targetType
+            || !SameType(receiverType, targetType))
+            return false;
+
+        // IL2CPP can leave a class metadata pointer in the receiver register when an
+        // instance method never reads `this`. In that case, use the caller's live `this`
+        // only when it is assignable to the target method's declaring type.
+        for (var current = callerType; current != null; current = current.BaseType)
+        {
+            if (SameType(current, targetType))
+                return true;
+        }
+
+        return false;
+    }
 
     private static int ConstructorReceiverIndex(Instruction constructorCall) => constructorCall.OpCode == OpCode.CallVoid ? 1 : 2;
 
