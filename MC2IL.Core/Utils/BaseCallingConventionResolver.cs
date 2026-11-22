@@ -143,6 +143,9 @@ public abstract class BaseCallingConventionResolver
         call.SetOperands(operands);
     }
 
+    public virtual void RemapRawArguments(Instruction call, MethodAnalysisContext resolved, MethodAnalysisContext caller)
+        => RemapRawArguments(call, resolved);
+
     protected static int ArgBase(Instruction call) => call.OpCode is OpCode.CallVoid ? 1 : 2;
 
     private static string? RegisterName(IOperand operand) => operand switch

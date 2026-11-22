@@ -79,7 +79,8 @@ internal static class FloatAggregateRecovery
                 }
                 else
                 {
-                    RecoverStaticLoad(block, i, method.DeclaringType, type, fields, reads);
+                    if (!RecoverContiguousLoad(block, i, fields, reads))
+                        RecoverStaticLoad(block, i, method.DeclaringType, type, fields, reads);
                 }
             }
             else if (instruction is { OpCode: OpCode.Move, Operands: [var destination, var firstValue] }
@@ -652,6 +653,60 @@ internal static class FloatAggregateRecovery
 
         return operand is FieldReference { Parent: null, Local.IsThis: false } projection
                && projection.Field == field ? projection.Local : null;
+    }
+
+    private static bool RecoverContiguousLoad(Block block, int index, FieldAnalysisContext[] fields,
+        Dictionary<LocalVariable, int> reads)
+    {
+        var pack = block.Instructions[index];
+        var pending = new HashSet<LocalVariable>();
+        foreach (var operand in pack.Operands.Skip(2))
+            if (operand is not LocalVariable lane || !pending.Add(lane)
+                || !reads.TryGetValue(lane, out var count) || count != 1)
+                return false;
+
+        var loads = new List<Instruction>();
+        MemoryOperand? first = null;
+        for (var position = index - 1; position >= 0 && pending.Count != 0; position--)
+        {
+            var candidate = block.Instructions[position];
+            if (candidate.OpCode == OpCode.Nop)
+                continue;
+            if (candidate is not { OpCode: OpCode.Move, Operands: [LocalVariable destination, var source] })
+                return false;
+            if (!pending.Contains(destination))
+            {
+                if (source is not (LocalVariable or Immediate or RuntimeMethodInfoAnalysisContext
+                    or MemoryOperand { Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext }, Index: null, Scale: 0 }))
+                    return false;
+                continue;
+            }
+
+            var lane = pack.Operands.ToList().FindIndex(2, operand => ReferenceEquals(operand, destination)) - 2;
+            var laneSize = fields[lane].FieldType.FullName == "System.Double" ? sizeof(double) : sizeof(float);
+            if (source is not MemoryOperand { Base: LocalVariable, Index: null, Scale: 0 } memory
+                || candidate.MemoryAccessSize != laneSize
+                || first is { } previous && (!ReferenceEquals(previous.Base, memory.Base)
+                    || previous.Addend != memory.Addend - fields[lane].Offset))
+                return false;
+            first ??= new MemoryOperand(memory.Base, addend: memory.Addend - fields[lane].Offset);
+            loads.Add(candidate);
+            pending.Remove(destination);
+        }
+
+        if (pending.Count != 0 || first == null)
+            return false;
+
+        // Read the complete value where its first lane was read. A full-width memory load
+        // also lets array recovery recognize an element whose individual lanes were too small.
+        var replacement = loads[^1];
+        replacement.SetOperands(pack.Operands[0], first.Value);
+        replacement.MemoryAccessSize = fields.Length * (fields[0].FieldType.FullName == "System.Double" ? sizeof(double) : sizeof(float));
+        replacement.OperandWidth = null;
+        foreach (var load in loads.Take(loads.Count - 1))
+            Remove(load);
+        Remove(pack);
+        return true;
     }
 
     private static void RecoverStaticLoad(Block block, int index, TypeAnalysisContext? caller, TypeAnalysisContext type,

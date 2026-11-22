@@ -191,6 +191,8 @@ public static class ArrayRecovery
                     continue;
 
                 var stride = ElementSize(elementType, pointerSize);
+                if (stride == 0 && elementType.IsValueType)
+                    stride = MetadataElementSize(elementType, pointerSize);
                 if (stride <= 0 || instruction.MemoryAccessSize != stride
                     || displacement is not { } offset || offset.Offset < ElementsOffset(pointerSize))
                     continue;
