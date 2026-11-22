@@ -23,6 +23,10 @@ public static class SsaSimplifier
                 if (instruction.OpCode == OpCode.Move
                     && instruction.Operands[0] is LocalVariable dest
                     && !parameterLocals.Contains(dest)
+                    // Stack-slot locals model mutable native storage, not SSA temporaries.
+                    // A pointer to a slot can be formed before this write and consumed later,
+                    // so forwarding the value copy would silently erase the storage update.
+                    && !dest.Register.Name.StartsWith("stack_", System.StringComparison.Ordinal)
                     && IsForwardable(instruction.Operands[1]))
                     forwarded[dest] = instruction.Operands[1];
 

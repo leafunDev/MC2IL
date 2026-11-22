@@ -42,6 +42,17 @@ public static class DeadCodeEliminator
             }
         }
 
+        var stackSlotVersions = new Dictionary<string, List<LocalVariable>>();
+        foreach (var local in definitions.Keys)
+        {
+            if (!local.Register.Name.StartsWith("stack_", System.StringComparison.Ordinal))
+                continue;
+
+            if (!stackSlotVersions.TryGetValue(local.Register.Name, out var versions))
+                stackSlotVersions[local.Register.Name] = versions = [];
+            versions.Add(local);
+        }
+
         var live = new HashSet<LocalVariable>();
         var pending = new Stack<LocalVariable>();
         foreach (var instruction in cfg.Instructions)
@@ -96,6 +107,16 @@ public static class DeadCodeEliminator
         {
             if (live.Add(local))
                 pending.Push(local);
+
+            // SSA gives each write to a stack location a different LocalVariable, but an
+            // AddressOf formed before a write still aliases the same physical slot. Keep
+            // every version's write when any version of that slot is observed through an
+            // address, then follow the ordinary source dependencies above.
+            if (local.Register.Name.StartsWith("stack_", System.StringComparison.Ordinal)
+                && stackSlotVersions.TryGetValue(local.Register.Name, out var versions))
+                foreach (var version in versions)
+                    if (live.Add(version))
+                        pending.Push(version);
         }
     }
 
