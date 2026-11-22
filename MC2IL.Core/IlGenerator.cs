@@ -281,6 +281,8 @@ public static class IlGenerator
         }
 
         CilSingleUseMathInliner.Run(body, locals);
+        if (isIteratorMoveNext)
+            IteratorReceiverInliner.Run(context, body, instructionMap);
         CilBranchCleanup.Run(body);
         SetRecoveredMaxStack(body);
     }
