@@ -10,7 +10,8 @@ public abstract class ElfStyleRelocationsBinary(Stream input) : Il2CppBinary(inp
 {
     protected readonly List<(ulong start, ulong end)> relocationBlocks = [];
 
-    protected void ApplyRelocations(IDictionary<ElfDynamicType, ulong> dynamicEntries, ulong loadBias, ElfMachine machine)
+    protected void ApplyRelocations(IDictionary<ElfDynamicType, ulong> dynamicEntries, ulong loadBias, ElfMachine machine,
+        Action<ulong, uint>? recordArm64PltImport = null)
     {
         // The android bionic linker only verifies the DT_SYMENT entry if it exists, so we just skip checking
         if (!dynamicEntries.TryGetValue(ElfDynamicType.DT_SYMTAB, out var symtabAddress))
@@ -39,7 +40,7 @@ public abstract class ElfStyleRelocationsBinary(Stream input) : Il2CppBinary(inp
             var type = (ElfDynamicType)dynamicEntries[ElfDynamicType.DT_PLTREL];
             ApplyRelocationsImpl(type == ElfDynamicType.DT_REL
                 ? ParseRelSection(jmprelRva, size)
-                : ParseRelaSection(jmprelRva, size));
+                : ParseRelaSection(jmprelRva, size), recordArm64PltImport);
 
             MarkRelocationRegion(jmprelRva, size);
         }
@@ -81,7 +82,8 @@ public abstract class ElfStyleRelocationsBinary(Stream input) : Il2CppBinary(inp
             relocationBlocks.Add((loadBias + start, loadBias + start + size));
         }
 
-        void ApplyRelocationsImpl(ICollection<(ulong Offset, ulong Info, ulong? Addend)> relocations)
+        void ApplyRelocationsImpl(ICollection<(ulong Offset, ulong Info, ulong? Addend)> relocations,
+            Action<ulong, uint>? recordPltImport = null)
         {
             LibLogger.VerboseNewline($"Applying {relocations.Count} relocations");
 
@@ -132,6 +134,10 @@ public abstract class ElfStyleRelocationsBinary(Stream input) : Il2CppBinary(inp
                 {
                     continue;
                 }
+
+                if (machine == ElfMachine.EM_AARCH64 && type == ElfRelocationType.R_AARCH64_JUMP_SLOT
+                    && symbolEntry.Shndx == 0 && symbolEntry.Type == ElfDynamicSymbolType.STT_FUNC && addend == 0)
+                    recordPltImport?.Invoke(relocationAddress, symbolEntry.NameOffset);
 
                 var (value, handled) = machine switch
                 {

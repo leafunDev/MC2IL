@@ -286,6 +286,7 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
 
         Register? AddCallAt(ulong target)
         {
+            var doubleType = context.AppContext.SystemTypes.SystemDoubleType;
             if (context.AppContext.MethodsByAddress.TryGetValue(target, out var possibleMethods) && possibleMethods.Count > 0)
             {
                 MethodAnalysisContext ctx;
@@ -342,6 +343,16 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                             .MemoryAccessSize = returnFields[i].FieldType.FullName == "System.Single" ? 4 : 8;
                     return ctx.ReturnType == context.ReturnType ? aggregateResult : null;
                 }
+            }
+            else if (context.AppContext.Binary is LibMC2IL.Elf.ElfFile elf && elf.GetArm64PltImport(target) == "acos"
+                && doubleType.DeclaringAssembly?.GetTypeByFullName("System.Math")?.Methods.FirstOrDefault(candidate =>
+                    candidate is { Name: "Acos", IsStatic: true } && candidate.ReturnType == doubleType
+                    && candidate.Parameters.Count == 1 && candidate.Parameters[0].ParameterType == doubleType) is { } acos)
+            {
+                var result = CallingConventions.ReturnRegister(acos);
+                // The only argument and result of acos(double) are both in D0.
+                Add(address, OpCode.Call, acos, result, result);
+                return context.ReturnType == doubleType ? result : null;
             }
             else
             {

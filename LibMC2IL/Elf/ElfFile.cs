@@ -21,6 +21,7 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
     private readonly List<ElfSymbolTableEntry> _symbolTable = [];
     private readonly Dictionary<string, ElfSymbolTableEntry> _exportNameTable = new();
     private readonly Dictionary<ulong, ElfSymbolTableEntry> _exportAddressTable = new();
+    private readonly Dictionary<ulong, string> _arm64PltImports = new();
     private List<long>? _initializerPointers;
 
     private long _globalOffset;
@@ -194,17 +195,60 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
     {
         try
         {
-            ApplyRelocations(_dynamicSection
-                    .Where(x => x.Tag != ElfDynamicType.DT_NEEDED)
-                    .ToDictionary(x => x.Tag, x => x.Value), 
-                (ulong)0,
-                (ElfMachine)_elfHeader!.Machine);
+            var entries = _dynamicSection.Where(entry => entry.Tag != ElfDynamicType.DT_NEEDED)
+                .ToDictionary(entry => entry.Tag, entry => entry.Value);
+            var machine = (ElfMachine)_elfHeader!.Machine;
+            var imports = new Dictionary<ulong, uint>();
+            ApplyRelocations(entries, 0, machine, (slot, nameOffset) => imports[slot] = nameOffset);
+
+            if (imports.Count == 0 || _elfFileIdent!.Endianness != 1
+                || !entries.TryGetValue(ElfDynamicType.DT_STRTAB, out var table)
+                || !entries.TryGetValue(ElfDynamicType.DT_STRSZ, out var size)
+                || !TryMapVirtualAddressToRaw(table, out var rawTable) || rawTable < 0 || (ulong)rawTable > (ulong)_raw.Length
+                || size > (ulong)_raw.Length - (ulong)rawTable)
+                return;
+
+            foreach (var import in imports)
+            {
+                if (import.Value >= size)
+                    continue;
+                var nameStart = (int)rawTable + (int)import.Value;
+                var nameLength = _raw.AsSpan(nameStart, (int)(size - import.Value)).IndexOf((byte)0);
+                if (nameLength > 0)
+                    _arm64PltImports.Add(import.Key, System.Text.Encoding.ASCII.GetString(_raw, nameStart, nameLength));
+            }
         }
         catch
         {
             LibLogger.Info("Exception during relocation mapping!");
             throw;
         }
+    }
+
+    public string? GetArm64PltImport(ulong address)
+    {
+        if (_arm64PltImports.Count == 0 || (address & 3) != 0 || !TryMapVirtualAddressToRaw(address, out var raw)
+            || raw < 0 || raw > _raw.Length - 16)
+            return null;
+
+        var stub = _raw.AsSpan((int)raw, 16);
+        var adrp = BinaryPrimitives.ReadUInt32LittleEndian(stub);
+        var load = BinaryPrimitives.ReadUInt32LittleEndian(stub.Slice(4));
+        var add = BinaryPrimitives.ReadUInt32LittleEndian(stub.Slice(8));
+        var branch = BinaryPrimitives.ReadUInt32LittleEndian(stub.Slice(12));
+
+        // ADRP X16, page; LDR X17, [X16, slot]; ADD X16, X16, slot; BR X17
+        if ((adrp & 0x9F00001Fu) != 0x90000010u || (load & 0xFFC003FFu) != 0xF9400211u
+            || (add & 0xFFC003FFu) != 0x91000210u || branch != 0xD61F0220u)
+            return null;
+        var offset = ((load >> 10) & 0xFFFu) * 8;
+        if (offset != ((add >> 10) & 0xFFFu))
+            return null;
+
+        var imm21 = ((adrp >> 3) & 0x1FFFFCu) | ((adrp >> 29) & 3u);
+        var pages = (int)(imm21 << 11) >> 11;
+        var slot = unchecked((address & ~0xFFFul) + (ulong)((long)pages << 12) + offset);
+        return _arm64PltImports.TryGetValue(slot, out var name) ? name : null;
     }
 
     private void ProcessSymbols()
