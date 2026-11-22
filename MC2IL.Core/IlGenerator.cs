@@ -279,6 +279,7 @@ public static class IlGenerator
             EmitUnrecoveredReturn(context, definition, writeLine);
         }
 
+        CilZeroFloatConversionRecovery.Run(body);
         CilSingleUseMathInliner.Run(body, locals);
         CilArithmeticNormalizer.Run(body);
         CilBranchCleanup.Run(body);
