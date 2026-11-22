@@ -603,7 +603,7 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
     {
         const ulong dfTextRel = 4;
         bits = 0;
-        if (size is not (sizeof(uint) or sizeof(ulong)) || address > ulong.MaxValue - (uint)size
+        if (size is not (sizeof(byte) or sizeof(uint) or sizeof(ulong)) || address > ulong.MaxValue - (uint)size
             || _dynamicSection.Any(entry => entry.Tag == ElfDynamicType.DT_TEXTREL
                 || entry.Tag == ElfDynamicType.DT_FLAGS && (entry.Value & dfTextRel) != 0))
             return false;
@@ -639,7 +639,7 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
 
         var bytes = _raw.AsSpan((int)rawAddress, size);
         var bigEndian = _elfFileIdent?.Endianness == 2;
-        bits = size == sizeof(uint)
+        bits = size == sizeof(byte) ? bytes[0] : size == sizeof(uint)
             ? bigEndian ? BinaryPrimitives.ReadUInt32BigEndian(bytes) : BinaryPrimitives.ReadUInt32LittleEndian(bytes)
             : bigEndian ? BinaryPrimitives.ReadUInt64BigEndian(bytes) : BinaryPrimitives.ReadUInt64LittleEndian(bytes);
         return true;

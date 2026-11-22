@@ -479,6 +479,7 @@ public static class MetadataResolver
     internal static bool ResolveFieldOffsets(MethodAnalysisContext method, List<Instruction> instructions)
     {
         var changed = false;
+        Dictionary<LocalVariable, (LocalVariable Base, long Offset)>? fieldAddresses = null;
 
         foreach (var instruction in instructions)
         {
@@ -493,7 +494,23 @@ public static class MetadataResolver
                 if (memory.Index != null || memory.Scale != 0)
                     continue;
 
-                if (memory.Base is not LocalVariable local || local?.Type == null)
+                if (memory.Base is not LocalVariable local)
+                    continue;
+
+                // ARM64 often computes the base of an inline struct once, then loads
+                // several fields through it. Recover the original object and byte offset.
+                if ((local.Type == null || local.Type.FullName is "System.IntPtr" or "System.UIntPtr")
+                    && method.AppContext.InstructionSet is NewArmV8InstructionSet)
+                {
+                    fieldAddresses ??= FindFieldAddresses(instructions);
+                    if (fieldAddresses.TryGetValue(local, out var fieldAddress))
+                    {
+                        local = fieldAddress.Base;
+                        memory.Addend = unchecked(memory.Addend + fieldAddress.Offset);
+                    }
+                }
+
+                if (local.Type == null)
                     continue;
 
                 // check if static field access
@@ -522,11 +539,14 @@ public static class MetadataResolver
                 var genericLookupOffset = valueTypeBase ? lookupOffset + 2L * pointerSize : lookupOffset;
 
                 FieldAnalysisContext? field;
+                var offsetWithinField = 0L;
                 if (genericOwner != null && staticOwner == null)
                 {
                     // Metadata has all-0 offsets for generic definitions, so recompute layout
                     // using the closed instance where the generic arguments are known.
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner, genericLookupOffset);
+                    field = instruction.MemoryAccessSize != null
+                        ? GenericInstanceFieldLayout.FindContainingField(genericOwner, genericLookupOffset, out offsetWithinField)
+                        : GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner, genericLookupOffset);
                 }
                 else if (staticOwner == null && owner.GenericParameters.Count > 0)
                 {
@@ -562,13 +582,14 @@ public static class MetadataResolver
                     if (instruction.MemoryAccessSize is { } accessSize
                         && field.FieldType.IsValueType
                         && accessSize < TypeSizes.UnboxedSize(field.FieldType, pointerSize)
-                        && field.BackingData?.FieldOffset is { } fieldOffset
-                        && FindInlineValueFieldPath(field.FieldType, lookupOffset - fieldOffset, pointerSize,
+                        && FindInlineValueFieldPath(field.FieldType, offsetWithinField, pointerSize,
                             new HashSet<TypeAnalysisContext>()) is { } nestedPath
                         && TypeSizes.UnboxedSize(nestedPath[^1].FieldType, pointerSize) == accessSize)
                     {
                         fieldPath.AddRange(nestedPath);
                     }
+                    else if (offsetWithinField != 0)
+                        continue;
                 }
                 else if (staticOwner != null
                          && instruction.MemoryAccessSize is { } staticAccessSize
@@ -608,6 +629,70 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    private static Dictionary<LocalVariable, (LocalVariable Base, long Offset)> FindFieldAddresses(List<Instruction> instructions)
+    {
+        var addresses = new Dictionary<LocalVariable, (LocalVariable, long)>();
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        var seen = new HashSet<LocalVariable>();
+        foreach (var instruction in instructions)
+        {
+            if (instruction.Destination is not LocalVariable destination)
+                continue;
+            if (!seen.Add(destination))
+                definitions.Remove(destination);
+            else
+                definitions[destination] = instruction;
+        }
+
+        var visited = new HashSet<LocalVariable>();
+        var unresolved = new HashSet<LocalVariable>();
+        foreach (var local in definitions.Keys)
+            if (definitions[local].OpCode is OpCode.Add or OpCode.Phi)
+                Resolve(local);
+        return addresses;
+
+        (LocalVariable Base, long Offset)? Resolve(LocalVariable local)
+        {
+            if (addresses.TryGetValue(local, out var known))
+                return known;
+            if (unresolved.Contains(local) || visited.Count >= 16 || !visited.Add(local))
+                return null;
+
+            (LocalVariable Base, long Offset)? address = null;
+            if (local.Type is { } type && IlGenerator.IsManagedReference(type))
+                address = (local, 0);
+            else if (definitions.TryGetValue(local, out var definition) && definition.OperandWidth != 32)
+            {
+                if (definition is { OpCode: OpCode.Add, Operands: [_, LocalVariable baseLocal, Immediate offset] }
+                    && offset.Value >= 0 && Resolve(baseLocal) is { } parent
+                    && parent.Offset <= int.MaxValue - offset.Value)
+                    address = (parent.Base, parent.Offset + offset.Value);
+                else if (definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+                    address = Resolve(source);
+                else if (definition.OpCode == OpCode.Phi)
+                {
+                    for (var i = 1; i < definition.Operands.Count; i++)
+                    {
+                        if (definition.Operands[i] is not LocalVariable incoming || Resolve(incoming) is not { } resolved
+                            || address != null && address != resolved)
+                        {
+                            address = null;
+                            break;
+                        }
+                        address = resolved;
+                    }
+                }
+            }
+
+            visited.Remove(local);
+            if (address is { } found)
+                addresses.Add(local, found);
+            else
+                unresolved.Add(local);
+            return address;
+        }
     }
 
     /// <summary>

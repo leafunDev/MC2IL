@@ -522,7 +522,7 @@ internal static class FloatAggregateRecovery
         return false;
     }
 
-    private static bool TryGetStackOffset(LocalVariable local, out long offset)
+    internal static bool TryGetStackOffset(LocalVariable local, out long offset)
     {
         var name = local.Register.Name;
         var negative = name.StartsWith("stack_-", StringComparison.Ordinal);

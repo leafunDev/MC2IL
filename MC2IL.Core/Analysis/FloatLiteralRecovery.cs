@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using LibMC2IL.Elf;
 using MC2IL.Core.InstructionSets;
 using MC2IL.Core.ISIL;
@@ -14,6 +15,151 @@ namespace MC2IL.Core.Analysis;
 /// </summary>
 public static class FloatLiteralRecovery
 {
+    // Optimized constructors copy adjacent 32-bit initializers from a constant
+    // pool with an LDR/STR of D or Q. The register does not contain a double.
+    internal static void RecoverPackedFieldInitializers(MethodAnalysisContext method)
+    {
+        if (method.Name != ".ctor" || method.DeclaringType is not { IsValueType: false } owner
+            || owner.Definition is not { } definition
+            || (definition.Attributes & TypeAttributes.LayoutMask) == TypeAttributes.ExplicitLayout
+            || method.AppContext.Binary is not ElfFile elf || method.AppContext.InstructionSet is not NewArmV8InstructionSet)
+            return;
+
+        var graph = method.ControlFlowGraph!;
+        var definitions = graph.Instructions.Where(instruction => instruction.Destination is LocalVariable)
+            .ToDictionary(instruction => (LocalVariable)instruction.Destination!);
+
+        foreach (var block in graph.Blocks)
+        for (var i = 0; i < block.Instructions.Count; i++)
+        {
+            var store = block.Instructions[i];
+            if (store is not { OpCode: OpCode.Move, MemoryAccessSize: 8 or 16,
+                    Operands: [MemoryOperand { Base: LocalVariable receiver, Index: null, Scale: 0 } target, LocalVariable word] }
+                || !word.Register.Name.StartsWith("V", StringComparison.Ordinal)
+                || !definitions.TryGetValue(word, out var load)
+                || load is not { OpCode: OpCode.Move,
+                    Operands: [_, MemoryOperand { Index: null, Scale: 0 } pool] }
+                || load.MemoryAccessSize != store.MemoryAccessSize)
+                continue;
+
+            var linkCount = 0;
+            var offset = target.Addend;
+            while (!receiver.IsThis && linkCount++ < 8 && definitions.TryGetValue(receiver, out var copy))
+            {
+                if (copy is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+                    receiver = source;
+                else if (copy is { OpCode: OpCode.Add, OperandWidth: not 32, Operands: [_, LocalVariable baseLocal, Immediate displacement] })
+                {
+                    receiver = baseLocal;
+                    offset += displacement.Value;
+                }
+                else
+                    break;
+            }
+
+            var address = pool.Addend;
+            if (pool.Base is LocalVariable page
+                && definitions.TryGetValue(page, out var pageLoad)
+                && pageLoad is { OpCode: OpCode.Move, IsPcRelativeAddress: true, Operands: [_, Immediate pageAddress] })
+                address += pageAddress.Value;
+            else if (pool.Base != null)
+                continue;
+
+            if (!receiver.IsThis || offset < 0 || address <= 0)
+                continue;
+
+            var values = new List<(FieldReference Field, IOperand Value)>();
+            for (var lane = 0; lane < store.MemoryAccessSize / 4; lane++)
+            {
+                var fieldOffset = offset + lane * 4;
+                var fields = owner.Fields.Where(field => !field.IsStatic && field.BackingData?.FieldOffset == fieldOffset).Take(2).ToArray();
+                if (fields.Length != 1 || !elf.TryReadReadOnlyScalar((ulong)address + (uint)(lane * 4), 4, out var bits))
+                    break;
+                var field = fields[0];
+                IOperand? value = field.FieldType.FullName switch
+                {
+                    "System.Single" => new FloatLiteral(BitConverter.ToSingle(BitConverter.GetBytes(unchecked((int)bits)), 0)),
+                    "System.Int32" or "System.UInt32" => new Immediate(unchecked((int)bits)),
+                    _ => null
+                };
+                if (value == null)
+                    break;
+                values.Add((new FieldReference(field, receiver, (int)fieldOffset), value));
+            }
+
+            if (values.Count * 4 != store.MemoryAccessSize)
+                continue;
+
+            store.MemoryAccessSize = 4;
+            store.SetOperands(values[0].Field, values[0].Value);
+            foreach (var (field, value) in values.Skip(1))
+                block.Instructions.Insert(++i, new Instruction(store.Index, OpCode.Move, field, value) { MemoryAccessSize = 4 });
+        }
+    }
+
+    internal static void RecoverTypedBitCopies(MethodAnalysisContext method)
+    {
+        if (method.AppContext.InstructionSet is not NewArmV8InstructionSet)
+            return;
+
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var loads = new Dictionary<LocalVariable, (string Type, int Size, NumericConversionKind Reinterpret)>();
+        foreach (var instruction in instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Move, Operands: [LocalVariable value, FieldReference field] })
+                continue;
+            var type = field.Field.FieldType.FullName;
+            if (type == "System.Single" && instruction.MemoryAccessSize == 4)
+                loads[value] = (type, 4, NumericConversionKind.I32ReinterpretFloat32);
+            else if (type == "System.Double" && instruction.MemoryAccessSize == 8)
+                loads[value] = (type, 8, NumericConversionKind.I64ReinterpretFloat64);
+        }
+
+        if (loads.Count == 0)
+            return;
+
+        var consumers = new Dictionary<LocalVariable, List<Instruction>>();
+        foreach (var instruction in instructions)
+        foreach (var local in DeadCodeEliminator.UsedLocals(instruction))
+        {
+            if (!loads.TryGetValue(local, out var load))
+                continue;
+
+            // Keep the native word representation if any consumer actually uses
+            // the bits as integers, or accesses the value by address.
+            if (!(instruction is { OpCode: OpCode.Convert, Operands: [_, var source, NumericConversion conversion] }
+                    && ReferenceEquals(source, local) && conversion.Kind == load.Reinterpret
+                || instruction is { OpCode: OpCode.Move, Operands: [FieldReference target, var stored] }
+                    && ReferenceEquals(stored, local) && instruction.MemoryAccessSize == load.Size
+                    && target.Field.FieldType.FullName == load.Type))
+            {
+                loads.Remove(local);
+                continue;
+            }
+
+            if (!consumers.TryGetValue(local, out var uses))
+                consumers.Add(local, uses = []);
+            uses.Add(instruction);
+        }
+
+        foreach (var entry in loads)
+        {
+            var local = entry.Key;
+            var load = entry.Value;
+            if (!consumers.TryGetValue(local, out var uses) || !uses.Any(instruction => instruction.OpCode == OpCode.Convert))
+                continue;
+            local.Type = load.Size == 4 ? method.AppContext.SystemTypes.SystemSingleType : method.AppContext.SystemTypes.SystemDoubleType;
+            foreach (var instruction in uses)
+            {
+                if (instruction.OpCode != OpCode.Convert)
+                    continue;
+                instruction.OpCode = OpCode.Move;
+                instruction.OperandWidth = null;
+                instruction.RemoveOperandAt(2);
+            }
+        }
+    }
+
     internal static void RecoverNativeLoads(MethodAnalysisContext method)
     {
         if (method.AppContext.Binary is not ElfFile elf || method.AppContext.InstructionSet is not NewArmV8InstructionSet)

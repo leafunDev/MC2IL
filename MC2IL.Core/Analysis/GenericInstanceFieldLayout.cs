@@ -11,14 +11,19 @@ namespace MC2IL.Core.Analysis;
 public static class GenericInstanceFieldLayout
 {
     public static FieldAnalysisContext? FindFieldAtOffset(TypeAnalysisContext definition, long targetOffset)
-        => FindFieldAtOffset(definition, targetOffset, null);
+        => FindField(definition, targetOffset, null, false, out _);
 
     public static FieldAnalysisContext? FindFieldAtOffset(GenericInstanceTypeAnalysisContext genericInstance, long targetOffset)
-        => FindFieldAtOffset(genericInstance.GenericType, targetOffset, genericInstance);
+        => FindField(genericInstance.GenericType, targetOffset, genericInstance, false, out _);
 
-    private static FieldAnalysisContext? FindFieldAtOffset(TypeAnalysisContext definition, long targetOffset,
-        GenericInstanceTypeAnalysisContext? genericInstance)
+    internal static FieldAnalysisContext? FindContainingField(GenericInstanceTypeAnalysisContext genericInstance,
+        long targetOffset, out long offsetWithinField)
+        => FindField(genericInstance.GenericType, targetOffset, genericInstance, true, out offsetWithinField);
+
+    private static FieldAnalysisContext? FindField(TypeAnalysisContext definition, long targetOffset,
+        GenericInstanceTypeAnalysisContext? genericInstance, bool allowInterior, out long offsetWithinField)
     {
+        offsetWithinField = 0;
         var pointerSize = definition.AppContext.Binary.PointerSizeBytes;
 
         // Generic definitions report zero offsets, so sequential layouts are rebuilt from the
@@ -63,8 +68,11 @@ public static class GenericInstanceFieldLayout
             alignment = Math.Min(alignment, pack);
             offset = (offset + alignment - 1) & ~(alignment - 1);
 
-            if (offset == targetOffset)
+            if (offset == targetOffset || allowInterior && targetOffset > offset && targetOffset - offset < size)
+            {
+                offsetWithinField = targetOffset - offset;
                 return genericInstance == null ? field : new ConcreteGenericFieldAnalysisContext(field, genericInstance);
+            }
 
             offset += size;
         }

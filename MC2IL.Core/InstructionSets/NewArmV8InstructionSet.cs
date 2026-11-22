@@ -164,8 +164,35 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
         var instructions = new List<Instruction>();
         var addresses = new List<ulong>();
 
+        var jumpTables = Arm64ByteJumpTable.Find(insns, context.AppContext.Binary);
         foreach (var instruction in insns)
-            ConvertInstructionStatement(instruction, instructions, addresses, context);
+        {
+            if (jumpTables.TryGetValue(instruction.Address, out var table))
+            {
+                if (table == null)
+                {
+                    AddTableInstruction(OpCode.Nop);
+                    continue;
+                }
+
+                var indexRegister = Reg(table.Index);
+                var condition = new Register(null, "TEMP_SWITCH");
+                for (var i = 0; i < table.Targets.Length - 1; i++)
+                {
+                    AddTableInstruction(OpCode.CheckEqual, condition, indexRegister, Imm(i));
+                    AddTableInstruction(OpCode.ConditionalJump, Imm(table.Targets[i]), condition);
+                }
+                AddTableInstruction(OpCode.Jump, Imm(table.Targets[^1]));
+
+                void AddTableInstruction(OpCode code, params List<IOperand> operands)
+                {
+                    addresses.Add(instruction.Address);
+                    instructions.Add(new Instruction(instructions.Count, code, operands));
+                }
+            }
+            else
+                ConvertInstructionStatement(instruction, instructions, addresses, context);
+        }
 
         // Add return if the function doesn't end with one already
         if (instructions.Count > 0 && instructions[^1].OpCode != OpCode.Return)
@@ -327,11 +354,30 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
 
         void AddFloatArithmetic(OpCode opCode)
         {
+            if (instruction.Op0Arrangement == Arm64ArrangementSpecifier.TwoS
+                && instruction.Op1Arrangement == Arm64ArrangementSpecifier.TwoS
+                && (instruction.Op2Arrangement == Arm64ArrangementSpecifier.TwoS
+                    || instruction.Op2Kind == Arm64OperandKind.VectorRegisterElement
+                        && instruction.Op2VectorElement.Width == Arm64VectorElementWidth.S
+                        && instruction.Op2VectorElement.Index is 0 or 1))
+            {
+                var broadcast = instruction.Op2Kind == Arm64OperandKind.VectorRegisterElement;
+                var right = broadcast ? ExtractLane(instruction.Op2Reg, instruction.Op2VectorElement.Index) : Reg(instruction.Op2Reg);
+                Add(address, opCode, Reg(instruction.Op0Reg), Reg(instruction.Op1Reg), right).Arm64PackedFloat =
+                    broadcast ? Arm64PackedFloatOperation.Broadcast : Arm64PackedFloatOperation.Binary;
+                return;
+            }
+
             var operands = new List<IOperand>
             {
                 ConvertOperand(instruction, 0),
                 ConvertOperand(instruction, 1),
-                ConvertOperand(instruction, 2)
+                instruction.Op0Reg is >= Arm64Register.S0 and <= Arm64Register.S31
+                    && instruction.Op2Kind == Arm64OperandKind.VectorRegisterElement
+                    && instruction.Op2VectorElement.Width == Arm64VectorElementWidth.S
+                    && instruction.Op2VectorElement.Index is 0 or 1
+                        ? ExtractLane(instruction.Op2Reg, instruction.Op2VectorElement.Index)
+                        : ConvertOperand(instruction, 2)
             };
 
             if (instruction.Op0Reg is >= Arm64Register.S0 and <= Arm64Register.S31)
@@ -340,6 +386,14 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                 operands.Add(new FloatingPointPrecision(IsDouble: true));
 
             Add(address, opCode, operands);
+        }
+
+        Register ExtractLane(Arm64Register register, int lane)
+        {
+            var result = new Register(null, "TEMP_SIMD_EXTRACT");
+            Add(address, OpCode.Move, result, new Register(null, $"{NormalizeRegister(register)}.S{lane}"), Reg(register)).Arm64PackedFloat = lane == 0
+                ? Arm64PackedFloatOperation.ExtractLow : Arm64PackedFloatOperation.ExtractHigh;
+            return result;
         }
 
         void AddReturn(Register? tailCallResult = null, bool readFloatLanes = false)
@@ -560,6 +614,34 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
 
         switch (instruction.Mnemonic)
         {
+            case Arm64Mnemonic.MOV when instruction.Op0Kind == Arm64OperandKind.VectorRegisterElement
+                && instruction.Op0VectorElement.Width == Arm64VectorElementWidth.S
+                && instruction.Op0VectorElement.Index is 0 or 1
+                && instruction.Op1Kind == Arm64OperandKind.VectorRegisterElement
+                && instruction.Op1VectorElement.Width == Arm64VectorElementWidth.S
+                && instruction.Op1VectorElement.Index is 0 or 1:
+            {
+                var lane = ExtractLane(instruction.Op1Reg, instruction.Op1VectorElement.Index);
+                var vector = Reg(instruction.Op0Reg);
+                Add(address, OpCode.Move, vector, lane, vector).Arm64PackedFloat = instruction.Op0VectorElement.Index == 0
+                    ? Arm64PackedFloatOperation.InsertLow : Arm64PackedFloatOperation.InsertHigh;
+                // Keep the explicit lane definition available to unlowered
+                // consumers as well (for example an unsupported wider vector).
+                Add(address, OpCode.Move, ConvertOperand(instruction, 0), lane);
+                break;
+            }
+            case Arm64Mnemonic.DUP when instruction.Op0Arrangement == Arm64ArrangementSpecifier.TwoS
+                && instruction.Op1Kind == Arm64OperandKind.VectorRegisterElement
+                && instruction.Op1VectorElement.Width == Arm64VectorElementWidth.S
+                && instruction.Op1VectorElement.Index is 0 or 1:
+                var duplicated = ExtractLane(instruction.Op1Reg, instruction.Op1VectorElement.Index);
+                Add(address, OpCode.Move, Reg(instruction.Op0Reg), duplicated).Arm64PackedFloat = Arm64PackedFloatOperation.Duplicate;
+                break;
+            case Arm64Mnemonic.MOVI when instruction.Op0Arrangement == Arm64ArrangementSpecifier.TwoS
+                && TryGetPackedOrrImmediate(instruction, out var bits):
+                Add(address, OpCode.Move, Reg(instruction.Op0Reg), Imm(unchecked((int)bits)))
+                    .Arm64PackedFloat = Arm64PackedFloatOperation.ReplicateBits;
+                break;
             case Arm64Mnemonic.MOV:
             case Arm64Mnemonic.MOVZ:
                 if (instruction.Op0Kind == Arm64OperandKind.Register && IsReg31(instruction.Op0Reg))
@@ -568,7 +650,18 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                     break;
                 }
 
-                Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                if (instruction.Op0Reg is >= Arm64Register.S0 and <= Arm64Register.S31
+                    && instruction.Op1Kind == Arm64OperandKind.VectorRegisterElement
+                    && instruction.Op1VectorElement.Width == Arm64VectorElementWidth.S
+                    && instruction.Op1VectorElement.Index is 0 or 1)
+                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), ExtractLane(instruction.Op1Reg, instruction.Op1VectorElement.Index));
+                else
+                {
+                    var move = Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                    if (instruction.Op0Arrangement is Arm64ArrangementSpecifier.SixteenB or Arm64ArrangementSpecifier.EightB
+                        or Arm64ArrangementSpecifier.TwoS && instruction.Op1Arrangement == instruction.Op0Arrangement)
+                        move.Arm64PackedFloat = Arm64PackedFloatOperation.Copy;
+                }
                 break;
             case Arm64Mnemonic.SXTB:
             case Arm64Mnemonic.SXTH:
@@ -1595,6 +1688,7 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
             >= Arm64Register.H0 and <= Arm64Register.H31 => 2,
             >= Arm64Register.W0 and <= Arm64Register.W31 or >= Arm64Register.S0 and <= Arm64Register.S31 => 4,
             >= Arm64Register.X0 and <= Arm64Register.X31 or >= Arm64Register.D0 and <= Arm64Register.D31 => 8,
+            >= Arm64Register.V0 and <= Arm64Register.V31 => 16,
             _ => null,
         },
     };

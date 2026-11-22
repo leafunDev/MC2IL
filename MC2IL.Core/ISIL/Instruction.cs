@@ -20,6 +20,9 @@ public class Instruction : IOperand
     // Number of bytes read or written by a native load/store, when known.
     public int? MemoryAccessSize;
 
+    // Provenance needed to separate the two low S lanes before managed type propagation.
+    internal Arm64PackedFloatOperation Arm64PackedFloat;
+
     // This immediate address came from a PC-relative native instruction, not an integer literal.
     public bool IsPcRelativeAddress;
 
@@ -142,6 +145,10 @@ public class Instruction : IOperand
     {
         var sources = OpCode switch
         {
+            OpCode.Move when _operands.Count == 3 && Arm64PackedFloat is Arm64PackedFloatOperation.ExtractLow
+                or Arm64PackedFloatOperation.ExtractHigh or Arm64PackedFloatOperation.InsertLow or Arm64PackedFloatOperation.InsertHigh
+                => [_operands[1], _operands[2]],
+
             OpCode.Move or OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
                 or OpCode.Newobj
