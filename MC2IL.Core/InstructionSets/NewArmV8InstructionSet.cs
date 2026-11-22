@@ -155,6 +155,8 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
     public override List<Instruction> GetIsilFromMethod(MethodAnalysisContext context)
     {
         var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, context.UnderlyingPointer);
+        var mainInstructionCount = insns.Count;
+        var (outlinedBlocks, outlinedBranchTargets) = RecoverOutlinedBranchBlocks(context, insns);
 
         if (adrpOffsets == null) // initializers for ThreadStatic fields only run on the first thread
             adrpOffsets = new();
@@ -165,8 +167,9 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
         var addresses = new List<ulong>();
 
         var jumpTables = Arm64ByteJumpTable.Find(insns, context.AppContext.Binary);
-        foreach (var instruction in insns)
+        for (var instructionIndex = 0; instructionIndex < mainInstructionCount; instructionIndex++)
         {
+            var instruction = insns[instructionIndex];
             if (jumpTables.TryGetValue(instruction.Address, out var table))
             {
                 if (table == null)
@@ -194,14 +197,31 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                 }
             }
             else
-                ConvertInstructionStatement(instruction, instructions, addresses, context);
+                ConvertInstructionStatement(instruction, instructions, addresses, context, outlinedBranchTargets);
         }
 
-        // Add return if the function doesn't end with one already
+        // Terminate the contiguous method range before adding recovered outlined blocks. Otherwise
+        // the CFG would incorrectly fall through from the physical end of the method into a block
+        // that is reachable only through one of the out-of-range branches above.
         if (instructions.Count > 0 && instructions[^1].OpCode != OpCode.Return)
         {
             var index = instructions[^1].Index + 1;
+            addresses.Add(ulong.MaxValue);
+            if (context.IsVoid)
+                instructions.Add(new Instruction(index, OpCode.Return));
+            else
+                instructions.Add(new Instruction(index, OpCode.Return, CallingConventions.ReturnValueSourceRegister(context)));
+        }
 
+        foreach (var block in outlinedBlocks)
+            foreach (var instruction in block)
+                ConvertInstructionStatement(instruction, instructions, addresses, context, outlinedBranchTargets);
+
+        // Add return if the final outlined block doesn't end with one already.
+        if (instructions.Count > 0 && instructions[^1].OpCode != OpCode.Return)
+        {
+            var index = instructions[^1].Index + 1;
+            addresses.Add(ulong.MaxValue);
             if (context.IsVoid)
                 instructions.Add(new Instruction(index, OpCode.Return));
             else
@@ -238,6 +258,54 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
         return instructions;
     }
 
+    private static (List<List<Arm64Instruction>> Blocks, HashSet<ulong> BranchTargets)
+        RecoverOutlinedBranchBlocks(MethodAnalysisContext context, List<Arm64Instruction> methodInstructions)
+    {
+        var blocks = new List<List<Arm64Instruction>>();
+        var branchTargets = new HashSet<ulong>();
+        var methodAddresses = new HashSet<ulong>(methodInstructions.Select(instruction => instruction.Address));
+        var methodStart = context.UnderlyingPointer;
+        var methodEnd = methodStart + (ulong)context.RawBytes.Length;
+
+        foreach (var branch in methodInstructions)
+        {
+            if (branch.Mnemonic != Arm64Mnemonic.B
+                || branch.MnemonicConditionCode is not (Arm64ConditionCode.NONE or Arm64ConditionCode.AL))
+                continue;
+
+            var target = branch.BranchTarget;
+            if (target >= methodStart && target < methodEnd || branchTargets.Contains(target))
+                continue;
+
+            List<Arm64Instruction> candidate;
+            try
+            {
+                // Clang can outline a tiny block and leave it outside the function's contiguous
+                // range. Keep it only when its final unconditional branch rejoins this method.
+                candidate = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, target,
+                    managed: false, count: 32);
+            }
+            catch
+            {
+                continue;
+            }
+
+            if (candidate.Count == 0
+                || candidate[^1].Mnemonic != Arm64Mnemonic.B
+                || candidate[^1].MnemonicConditionCode is not (Arm64ConditionCode.NONE or Arm64ConditionCode.AL)
+                || candidate[^1].BranchTarget < methodStart || candidate[^1].BranchTarget >= methodEnd
+                || !methodAddresses.Contains(candidate[^1].BranchTarget)
+                || candidate.Take(candidate.Count - 1).Any(instruction => instruction.Mnemonic is
+                    Arm64Mnemonic.RET or Arm64Mnemonic.RETAA or Arm64Mnemonic.RETAB or Arm64Mnemonic.BR or Arm64Mnemonic.INVALID))
+                continue;
+
+            branchTargets.Add(target);
+            blocks.Add(candidate);
+        }
+
+        return (blocks, branchTargets);
+    }
+
     private static void BindIncomingAggregateLanes(MethodAnalysisContext context, List<Instruction> instructions)
     {
         if (context.Parameters.Count == 0)
@@ -260,7 +328,8 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
         instructions.InsertRange(0, entry);
     }
 
-    private void ConvertInstructionStatement(Arm64Instruction instruction, List<Instruction> instructions, List<ulong> addresses, MethodAnalysisContext context)
+    private void ConvertInstructionStatement(Arm64Instruction instruction, List<Instruction> instructions,
+        List<ulong> addresses, MethodAnalysisContext context, HashSet<ulong> outlinedBranchTargets)
     {
         var address = instruction.Address;
 
@@ -1608,7 +1677,8 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                         break;
                     }
 
-                    if (target < context.UnderlyingPointer || target >= context.UnderlyingPointer + (ulong)context.RawBytes.Length)
+                    if ((target < context.UnderlyingPointer || target >= context.UnderlyingPointer + (ulong)context.RawBytes.Length)
+                        && !outlinedBranchTargets.Contains(target))
                     {
                         // unconditional branch out of the method is a tail call
                         AddReturn(AddCallAt(target));
