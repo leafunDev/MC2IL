@@ -1957,6 +1957,21 @@ public static class IlGenerator
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
+            case OpCode.Select:
+            {
+                var startFalse = new CilInstruction(CilOpCodes.Nop);
+                var store = new CilInstruction(CilOpCodes.Nop);
+                var type = OperandType(instruction.Operands[0]);
+                LoadOperand(instruction.Operands[1], method, locals, writeLine, context.AppContext.SystemTypes.SystemBooleanType);
+                instructions.Add(CilOpCodes.Brfalse, new CilInstructionLabel(startFalse));
+                LoadOperand(instruction.Operands[2], method, locals, writeLine, type);
+                instructions.Add(CilOpCodes.Br, new CilInstructionLabel(store));
+                instructions.Add(startFalse);
+                LoadOperand(instruction.Operands[3], method, locals, writeLine, type);
+                instructions.Add(store);
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+            }
             case OpCode.Not:
             case OpCode.Negate:
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, OperandType(instruction.Operands[0]));

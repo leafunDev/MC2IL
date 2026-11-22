@@ -44,8 +44,10 @@ internal static class Arm64FloatPairRecovery
         // into the synthetic exit. They place no demands on the packed value.
         var livePhis = new HashSet<Instruction>();
         var pendingPhis = new Queue<Instruction>();
+        var helpersWithoutVectorArguments = new Dictionary<ulong, bool>();
         foreach (var usage in uses)
-            if (usage.Value.Any(use => use.OpCode != OpCode.Phi))
+            if (definitions.TryGetValue(usage.Key, out var producer) && producer.OpCode == OpCode.Phi
+                && usage.Value.Any(use => use.OpCode != OpCode.Phi && !IsUnusedHelperOperand(use, usage.Key)))
                 MarkPhi(usage.Key);
         while (pendingPhis.Count != 0)
             foreach (var input in pendingPhis.Dequeue().Operands.Skip(1).OfType<LocalVariable>())
@@ -59,6 +61,22 @@ internal static class Arm64FloatPairRecovery
 
         // Follow only connected SSA values whose packed representation has no
         // observable use as a whole word, double, wider vector or address.
+        var maskComparisons = new Dictionary<Instruction, (Instruction Comparison, Instruction Extraction, Instruction Duplicate)>();
+        foreach (var instruction in instructions)
+        {
+            if (instruction is not { Arm64PackedFloat: Arm64PackedFloatOperation.SelectByMask,
+                    Operands: [_, LocalVariable mask, _, _] }
+                || !definitions.TryGetValue(mask, out var duplicate)
+                || duplicate is not { Arm64PackedFloat: Arm64PackedFloatOperation.Duplicate, Operands: [_, LocalVariable lane] }
+                || !definitions.TryGetValue(lane, out var extraction)
+                || extraction is not { Arm64PackedFloat: Arm64PackedFloatOperation.ExtractLow,
+                    Operands: [_, _, LocalVariable comparisonResult] }
+                || !definitions.TryGetValue(comparisonResult, out var comparison)
+                || comparison.Arm64PackedFloat != Arm64PackedFloatOperation.GreaterMask)
+                continue;
+            maskComparisons.Add(instruction, (comparison, extraction, duplicate));
+        }
+
         var pairs = new HashSet<LocalVariable>();
         foreach (var instruction in instructions)
         {
@@ -70,13 +88,11 @@ internal static class Arm64FloatPairRecovery
 
             var group = new HashSet<LocalVariable>();
             var remaining = new Queue<LocalVariable>();
-            Require(candidate);
-            var valid = true;
+            var valid = Require(candidate);
             while (remaining.Count != 0 && valid)
             {
                 var local = remaining.Dequeue();
-                valid = definitions.TryGetValue(local, out var definition)
-                    && CanSplitDefinition(definition)
+                valid = definitions.TryGetValue(local, out var definition) && CanSplitDefinition(definition)
                     && (!uses.TryGetValue(local, out var readers) || readers.All(use => CanSplitUse(use, local)));
             }
             if (valid)
@@ -99,6 +115,10 @@ internal static class Arm64FloatPairRecovery
             {
                 Arm64PackedFloatOperation.Binary => Require(definition.Operands[1]) && Require(definition.Operands[2]),
                 Arm64PackedFloatOperation.Broadcast => Require(definition.Operands[1]),
+                Arm64PackedFloatOperation.Negate => Require(definition.Operands[1]),
+                Arm64PackedFloatOperation.SelectByMask => maskComparisons.TryGetValue(definition, out var mask)
+                    && RequireFloatLane(mask.Comparison.Operands[1]) && RequireFloatLane(mask.Comparison.Operands[2])
+                    && Require(definition.Operands[2]) && Require(definition.Operands[3]),
                 Arm64PackedFloatOperation.InsertLow => Require(definition.Operands[2]),
                 Arm64PackedFloatOperation.InsertHigh => definition.Operands[2] is LocalVariable previous
                     && (IsScalarSingle(previous) || Require(previous)),
@@ -116,14 +136,28 @@ internal static class Arm64FloatPairRecovery
                 }
             };
 
+            bool RequireFloatLane(IOperand operand) =>
+                operand is LocalVariable source && (IsScalarSingle(source) || Require(source));
+
             bool CanSplitUse(Instruction use, LocalVariable value)
             {
                 if (IsExtraction(use.Arm64PackedFloat))
                     return ReferenceEquals(use.Operands[2], value);
                 if (use.OpCode == OpCode.Phi)
                     return !livePhis.Contains(use) || Require(use.Destination!);
+                if (use.Arm64PackedFloat == Arm64PackedFloatOperation.SelectByMask
+                    && ReferenceEquals(use.Operands[1], value))
+                    return false;
+                if (use.Arm64PackedFloat == Arm64PackedFloatOperation.GreaterMask)
+                    return true; // The recovered boolean comparison only uses lane zero.
                 if (IsPairProducer(use.Arm64PackedFloat))
                     return Require(use.Destination!);
+                if (use is { OpCode: OpCode.PackFloatAggregate, Operands: [_, TypeAnalysisContext type, ..] }
+                    && Utils.Arm64CallingConventionResolver.GetFloatAggregateFields(type) is { } fields
+                    && fields.All(field => field.FieldType.FullName == "System.Single"))
+                    return use.Operands.Skip(2).Any(operand => ReferenceEquals(operand, value));
+                if (IsUnusedHelperOperand(use, value))
+                    return true;
                 if (use.Operands.Count >= 4 && use.Operands[3] is FloatingPointPrecision { IsDouble: false })
                     return ReferenceEquals(use.Operands[1], value) || ReferenceEquals(use.Operands[2], value);
                 // A direct 4-byte store reads only the low lane. A packed memory
@@ -133,6 +167,33 @@ internal static class Arm64FloatPairRecovery
                     return use.MemoryAccessSize is 4 or 8;
                 return IsPairCopy(use) && ReferenceEquals(use.Operands[1], value) && Require(use.Destination!);
             }
+        }
+
+        bool IsUnusedHelperOperand(Instruction use, LocalVariable value) =>
+            use.IsCall && use.Operands[0] is Immediate address
+            && value.Register.Name.StartsWith("V", StringComparison.Ordinal)
+            && HasNoVectorArguments(address.UnsignedValue);
+
+        bool HasNoVectorArguments(ulong address)
+        {
+            if (address == 0 || method.AppContext.MethodsByAddress.ContainsKey(address))
+                return false;
+            if (helpersWithoutVectorArguments.TryGetValue(address, out var cached))
+                return cached;
+
+            var app = method.AppContext;
+            var keys = app.GetOrCreateKeyFunctionAddresses();
+            // Raw calls to helpers carry placeholder V0-V7 arguments until the
+            // runtime call is resolved. These helpers never consume those slots.
+            var confirmed = address == keys.il2cpp_codegen_initialize_method
+                || address == keys.il2cpp_codegen_initialize_runtime_metadata
+                || address == keys.il2cpp_codegen_initialize_runtime_metadata_inline
+                || address == keys.il2cpp_codegen_runtime_class_init
+                || ThrowHelperRecovery.GetThrownException(app, address)?.FullName is
+                    ("System.NullReferenceException" or "System.IndexOutOfRangeException")
+                    && ThrowHelperRecovery.IsExceptionRaiser(app, address);
+            helpersWithoutVectorArguments.Add(address, confirmed);
+            return confirmed;
         }
 
         var high = new Dictionary<LocalVariable, LocalVariable>();
@@ -146,11 +207,68 @@ internal static class Arm64FloatPairRecovery
         }
 
         var precision = new FloatingPointPrecision(IsDouble: false);
+        var conditions = new Dictionary<Instruction, LocalVariable>();
+        var loweredSelections = maskComparisons.Where(selection =>
+            selection.Key.Destination is LocalVariable value && pairs.Contains(value)).ToArray();
+        foreach (var selection in loweredSelections)
+        {
+            var comparison = selection.Value.Comparison;
+            if (conditions.ContainsKey(comparison))
+                continue;
+            var value = (LocalVariable)selection.Key.Destination!;
+            var condition = new LocalVariable(value.Name + "_mask",
+                new Register(null, "TEMP_SIMD_MASK", comparison.Index), method.AppContext.SystemTypes.SystemBooleanType);
+            conditions.Add(comparison, condition);
+            method.Locals.Add(condition);
+        }
+
+        var deadMasks = new HashSet<Instruction>();
+        var convertedSelections = new HashSet<Instruction>(loweredSelections.Select(selection => selection.Key));
+        // Process the chain from its consumers back to the original comparison.
+        foreach (var mask in loweredSelections.Select(selection => selection.Value.Duplicate))
+            if (OnlyUsedBy(mask, convertedSelections))
+                deadMasks.Add(mask);
+        foreach (var mask in loweredSelections.Select(selection => selection.Value.Extraction))
+            if (OnlyUsedBy(mask, deadMasks))
+                deadMasks.Add(mask);
+        foreach (var mask in conditions.Keys)
+            if (OnlyUsedBy(mask, deadMasks))
+                deadMasks.Add(mask);
+
+        bool OnlyUsedBy(Instruction instruction, HashSet<Instruction> lowered)
+        {
+            var result = (LocalVariable)instruction.Destination!;
+            return !uses.TryGetValue(result, out var readers) || readers.All(use =>
+                lowered.Contains(use) || use.OpCode == OpCode.Phi && !livePhis.Contains(use)
+                || IsUnusedHelperOperand(use, result));
+        }
+
         foreach (var block in graph.Blocks)
         for (var i = 0; i < block.Instructions.Count; i++)
         {
             var instruction = block.Instructions[i];
             var mode = instruction.Arm64PackedFloat;
+            if (mode == Arm64PackedFloatOperation.GreaterMask)
+            {
+                if (conditions.TryGetValue(instruction, out var condition))
+                    Insert(new Instruction(instruction.Index, OpCode.CheckGreater, condition,
+                        instruction.Operands[1], instruction.Operands[2], precision));
+            }
+            if (deadMasks.Contains(instruction))
+            {
+                instruction.OpCode = OpCode.Nop;
+                instruction.SetOperands();
+                instruction.Arm64PackedFloat = Arm64PackedFloatOperation.None;
+                continue;
+            }
+            if (mode == Arm64PackedFloatOperation.GreaterMask)
+            {
+                // Other consumers still need the raw bits of the mask.
+                instruction.OpCode = OpCode.NotImplemented;
+                instruction.SetOperands(new StringLiteral("ARM64 FCMGT mask is used as raw bits."));
+                instruction.Arm64PackedFloat = Arm64PackedFloatOperation.None;
+                continue;
+            }
             if (instruction.OpCode == OpCode.Phi && !livePhis.Contains(instruction))
             {
                 instruction.OpCode = OpCode.Nop;
@@ -179,6 +297,18 @@ internal static class Arm64FloatPairRecovery
                     instruction.SetOperands(low, left, right, precision);
                     Insert(new Instruction(index, instruction.OpCode, second, high[left],
                         mode == Arm64PackedFloatOperation.Binary ? high[right] : right, precision));
+                }
+                else if (mode == Arm64PackedFloatOperation.Negate)
+                {
+                    Insert(new Instruction(index, OpCode.Negate, second, high[(LocalVariable)instruction.Operands[1]]));
+                }
+                else if (mode == Arm64PackedFloatOperation.SelectByMask)
+                {
+                    var whenTrue = (LocalVariable)instruction.Operands[2];
+                    var whenFalse = (LocalVariable)instruction.Operands[3];
+                    var condition = conditions[maskComparisons[instruction].Comparison];
+                    instruction.SetOperands(low, condition, whenTrue, whenFalse);
+                    Insert(new Instruction(index, OpCode.Select, second, condition, high[whenTrue], high[whenFalse]));
                 }
                 else if (mode is Arm64PackedFloatOperation.Duplicate or Arm64PackedFloatOperation.ReplicateBits)
                 {
@@ -223,6 +353,18 @@ internal static class Arm64FloatPairRecovery
                 instruction.RemoveOperandAt(2);
                 instruction.Arm64PackedFloat = Arm64PackedFloatOperation.None;
             }
+            else if (mode == Arm64PackedFloatOperation.SelectByMask)
+            {
+                instruction.OpCode = OpCode.NotImplemented;
+                instruction.SetOperands(new StringLiteral("ARM64 BSL requires a supported SIMD mask and operands."));
+                instruction.Arm64PackedFloat = Arm64PackedFloatOperation.None;
+            }
+            else if (mode == Arm64PackedFloatOperation.Negate)
+            {
+                instruction.OpCode = OpCode.NotImplemented;
+                instruction.SetOperands(new StringLiteral("ARM64 FNEG uses an unsupported packed float value."));
+                instruction.Arm64PackedFloat = Arm64PackedFloatOperation.None;
+            }
             else if (instruction is { OpCode: OpCode.Move, MemoryAccessSize: 8,
                          Operands: [MemoryOperand store, LocalVariable source] } && high.TryGetValue(source, out var secondValue))
             {
@@ -234,12 +376,20 @@ internal static class Arm64FloatPairRecovery
             void Insert(Instruction added) => block.Instructions.Insert(++i, added);
         }
 
-        bool IsScalarSingle(LocalVariable value) =>
+        bool IsScalarSingle(LocalVariable value) => IsScalarSingleThroughCopies(value, []);
+
+        bool IsScalarSingleThroughCopies(LocalVariable value, HashSet<LocalVariable> visited) =>
             value.Type?.FullName == "System.Single"
-            || definitions.TryGetValue(value, out var producer)
+            || visited.Count < 16 && visited.Add(value) && definitions.TryGetValue(value, out var producer)
                 && (producer is { OpCode: OpCode.Move, MemoryAccessSize: 4 }
                     || producer.Operands.Count >= 4 && producer.Operands[3] is FloatingPointPrecision { IsDouble: false }
                     || producer is { OpCode: OpCode.Move, Operands: [_, FloatLiteral] }
+                    || producer is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] }
+                        && (source.Register.Name.StartsWith("V", StringComparison.Ordinal)
+                            || FloatAggregateRecovery.TryGetStackOffset(source, out _))
+                        && IsScalarSingleThroughCopies(source, visited)
+                    || producer.OpCode == OpCode.Phi && producer.Operands.Skip(1).All(input =>
+                        input is LocalVariable incoming && IsScalarSingleThroughCopies(incoming, [.. visited]))
                     || producer is { OpCode: OpCode.Convert, Operands: [_, _,
                         NumericConversion { Kind: NumericConversionKind.I32ReinterpretFloat32
                             or NumericConversionKind.SignedInt32ToFloat32 or NumericConversionKind.UnsignedInt32ToFloat32 }] }
@@ -258,5 +408,6 @@ internal static class Arm64FloatPairRecovery
     private static bool IsPairProducer(Arm64PackedFloatOperation mode) =>
         mode is Arm64PackedFloatOperation.Binary or Arm64PackedFloatOperation.Broadcast
             or Arm64PackedFloatOperation.Duplicate or Arm64PackedFloatOperation.ReplicateBits
-            or Arm64PackedFloatOperation.InsertLow or Arm64PackedFloatOperation.InsertHigh;
+            or Arm64PackedFloatOperation.InsertLow or Arm64PackedFloatOperation.InsertHigh
+            or Arm64PackedFloatOperation.Negate or Arm64PackedFloatOperation.SelectByMask;
 }

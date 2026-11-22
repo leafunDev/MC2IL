@@ -4,6 +4,9 @@ internal enum Arm64PackedFloatOperation
 {
     None,
     Binary,
+    Negate,
+    GreaterMask,
+    SelectByMask,
     Broadcast,
     Duplicate,
     ReplicateBits,

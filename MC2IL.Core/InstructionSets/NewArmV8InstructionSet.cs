@@ -338,7 +338,8 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                     // and expose its lanes to the subsequent native instructions.
                     for (var i = 0; i < returnFields.Length; i++)
                         Add(address, OpCode.Move, new Register(null, $"V{i}"),
-                            new MemoryOperand(aggregateResult, addend: returnFields[i].Offset));
+                            new MemoryOperand(aggregateResult, addend: returnFields[i].Offset))
+                            .MemoryAccessSize = returnFields[i].FieldType.FullName == "System.Single" ? 4 : 8;
                     return ctx.ReturnType == context.ReturnType ? aggregateResult : null;
                 }
             }
@@ -615,6 +616,21 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
 
         switch (instruction.Mnemonic)
         {
+            case Arm64Mnemonic.FCMGT when instruction.Op0Arrangement == Arm64ArrangementSpecifier.TwoS
+                && instruction.Op1Arrangement == Arm64ArrangementSpecifier.TwoS
+                && instruction.Op2Arrangement == Arm64ArrangementSpecifier.TwoS:
+                Add(address, OpCode.CheckGreater, Reg(instruction.Op0Reg), Reg(instruction.Op1Reg), Reg(instruction.Op2Reg))
+                    .Arm64PackedFloat = Arm64PackedFloatOperation.GreaterMask;
+                break;
+            case Arm64Mnemonic.BSL when instruction.Op0Arrangement == Arm64ArrangementSpecifier.EightB
+                && instruction.Op1Arrangement == Arm64ArrangementSpecifier.EightB
+                && instruction.Op2Arrangement == Arm64ArrangementSpecifier.EightB:
+                Add(address, OpCode.Select, Reg(instruction.Op0Reg), Reg(instruction.Op0Reg),
+                    Reg(instruction.Op1Reg), Reg(instruction.Op2Reg)).Arm64PackedFloat = Arm64PackedFloatOperation.SelectByMask;
+                break;
+            case Arm64Mnemonic.UNIMPLEMENTED when TryDecodeFloatPairNegate(context, address, out var negateOutput, out var negateInput):
+                Add(address, OpCode.Negate, negateOutput, negateInput).Arm64PackedFloat = Arm64PackedFloatOperation.Negate;
+                break;
             case Arm64Mnemonic.MOV when instruction.Op0Kind == Arm64OperandKind.VectorRegisterElement
                 && instruction.Op0VectorElement.Width == Arm64VectorElementWidth.S
                 && instruction.Op0VectorElement.Index is 0 or 1
@@ -641,6 +657,11 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
             case Arm64Mnemonic.MOVI when instruction.Op0Arrangement == Arm64ArrangementSpecifier.TwoS
                 && TryGetPackedOrrImmediate(instruction, out var bits):
                 Add(address, OpCode.Move, Reg(instruction.Op0Reg), Imm(unchecked((int)bits)))
+                    .Arm64PackedFloat = Arm64PackedFloatOperation.ReplicateBits;
+                break;
+            case Arm64Mnemonic.FMOV when instruction.Op0Arrangement == Arm64ArrangementSpecifier.TwoS
+                && TryGetFloatPairImmediate(context, address, out var floatImmediate):
+                Add(address, OpCode.Move, Reg(instruction.Op0Reg), new FloatLiteral(floatImmediate))
                     .Arm64PackedFloat = Arm64PackedFloatOperation.ReplicateBits;
                 break;
             case Arm64Mnemonic.MOV:
@@ -902,7 +923,8 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                         // their widths so offset zero resolves to the first nested field.
                         int? scalarSize = instruction.Op0Reg is >= Arm64Register.V0 and <= Arm64Register.V31
                             or >= Arm64Register.S0 and <= Arm64Register.S31
-                            or >= Arm64Register.D0 and <= Arm64Register.D31 ? pairSize : null;
+                            or >= Arm64Register.D0 and <= Arm64Register.D31
+                            or >= Arm64Register.W0 and <= Arm64Register.W31 ? pairSize : null;
                         if (instruction.Op0Kind == Arm64OperandKind.Register && IsReg31(instruction.Op0Reg))
                             Add(address, OpCode.Nop); // discard the first loaded value into WZR/XZR
                         else
@@ -1102,7 +1124,10 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                 if (DiscardZeroRegisterDestination())
                     break;
 
-                Add(address, OpCode.Negate, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                var negate = Add(address, OpCode.Negate, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                if (instruction.Op0Arrangement == Arm64ArrangementSpecifier.TwoS
+                    && instruction.Op1Arrangement == Arm64ArrangementSpecifier.TwoS)
+                    negate.Arm64PackedFloat = Arm64PackedFloatOperation.Negate;
                 break;
             case Arm64Mnemonic.FABS:
             case Arm64Mnemonic.FSQRT:
@@ -1652,6 +1677,50 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
             adrpOffsets!.Remove(NormalizeRegister(instruction.Op0Reg));
         if (instruction.MemIndexMode != Arm64MemoryIndexMode.Offset && instruction.MemBase != Arm64Register.INVALID)
             adrpOffsets!.Remove(NormalizeRegister(instruction.MemBase));
+    }
+
+    private static bool TryDecodeFloatPairNegate(MethodAnalysisContext context, ulong address,
+        out Register destination, out Register source)
+    {
+        destination = source = default;
+        // Some Disarm versions report FNEG Vd.2S, Vn.2S as unimplemented.
+        // Match the full opcode and arrangement, leaving only Rd/Rn variable.
+        if (!TryReadInstructionWord(context, address, out var word) || (word & 0xFFFFFC00u) != 0x2EA0F800u)
+            return false;
+
+        destination = new Register(null, $"V{word & 31}");
+        source = new Register(null, $"V{(word >> 5) & 31}");
+        return true;
+    }
+
+    private static bool TryGetFloatPairImmediate(MethodAnalysisContext context, ulong address, out float value)
+    {
+        value = default;
+        // The vector FMOV can have a zero immediate reported by Disarm even
+        // when its encoded imm8 is nonzero.
+        if (!TryReadInstructionWord(context, address, out var word) || (word & 0xFFF8FC00u) != 0x0F00F400u)
+            return false;
+
+        var imm8 = ((word >> 11) & 0xE0u) | ((word >> 5) & 0x1Fu);
+        var sign = (imm8 & 0x80u) << 24;
+        var exponent = (imm8 & 0x40u) == 0 ? 0x40000000u : 0x3E000000u;
+        var bits = sign | exponent | ((imm8 & 0x3Fu) << 19);
+        value = BitConverter.ToSingle(BitConverter.GetBytes(bits), 0);
+        return true;
+    }
+
+    private static bool TryReadInstructionWord(MethodAnalysisContext context, ulong address, out uint word)
+    {
+        word = default;
+        if (address < context.UnderlyingPointer || address - context.UnderlyingPointer > int.MaxValue
+            || context.RawBytes.Length < sizeof(uint))
+            return false;
+        var offset = (int)(address - context.UnderlyingPointer);
+        if (offset > context.RawBytes.Length - sizeof(uint))
+            return false;
+
+        word = BinaryPrimitives.ReadUInt32LittleEndian(context.RawBytes.AsSpan().Slice(offset, sizeof(uint)));
+        return true;
     }
 
     private static bool TryGetPackedOrrImmediate(Arm64Instruction instruction, out ulong mask)
