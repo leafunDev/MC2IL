@@ -12,8 +12,7 @@ internal static class StructArgumentFieldRecovery
 {
     internal static void Run(MethodAnalysisContext method)
     {
-        if (method.AppContext.InstructionSet.CallingConventionResolver is not Arm64CallingConventionResolver
-            || !method.ParameterLocals.Any(IsByValueStructParameter))
+        if (method.AppContext.InstructionSet.CallingConventionResolver is not Arm64CallingConventionResolver)
             return;
 
         var graph = method.ControlFlowGraph!;
@@ -32,14 +31,17 @@ internal static class StructArgumentFieldRecovery
             if (block.Instructions[index] is { OpCode: OpCode.PackFloatAggregate,
                     Operands: [LocalVariable result, TypeAnalysisContext type, ..] } pack
                 && Arm64CallingConventionResolver.GetFloatAggregateFields(type) is { Length: >= 2 } fields
-                && fields.Length + 2 == pack.Operands.Count)
+                && result.Type == type && fields.Length + 2 == pack.Operands.Count)
                 TryFoldPack(method, block, index, pack, result, type, fields, reads);
         }
     }
 
-    private static bool IsByValueStructParameter(LocalVariable local) =>
-        local is { IsThis: false, Register.Version: -1, Type: { IsValueType: true } type }
-        && (type.Attributes & TypeAttributes.LayoutMask) != TypeAttributes.ExplicitLayout;
+    private static bool IsSupportedReceiver(MethodAnalysisContext method, LocalVariable local) =>
+        local.Type is { } type
+        && (IlGenerator.IsManagedReference(type)
+            || local is { IsThis: false, Register.Version: -1 } && type.IsValueType
+            && (type.Attributes & TypeAttributes.LayoutMask) != TypeAttributes.ExplicitLayout
+            && method.ParameterLocals.Contains(local));
 
     private static void TryFoldPack(MethodAnalysisContext method, Block block, int index, Instruction pack,
         LocalVariable result, TypeAnalysisContext type, FieldAnalysisContext[] fields, Dictionary<LocalVariable, int> reads)
@@ -57,7 +59,7 @@ internal static class StructArgumentFieldRecovery
         var loads = new List<Instruction>(fields.Length);
         FieldReference? source = null;
         // Only walk a straight line of scalar loads. A store or call between loads
-        // could change what reading the entire argument field would observe.
+        // could change the value observed by the combined field read.
         var visited = new HashSet<Block>();
         var position = index - 1;
         for (var current = block; visited.Add(current);)
@@ -72,12 +74,13 @@ internal static class StructArgumentFieldRecovery
                         Operands: [LocalVariable lane, FieldReference { Parent: { Parent: null } parent } field] }
                     || width != size || !lanes.TryGetValue(lane, out var expected) || field.Field != expected
                     || field.Offset != parent.Offset + expected.Offset || parent.Field.IsStatic
-                    || parent.Field.FieldType != type || !IsByValueStructParameter(field.Local)
-                    || parent.Field.DeclaringType != field.Local.Type || !method.ParameterLocals.Contains(field.Local)
+                    || parent.Field.FieldType != type || !IsSupportedReceiver(method, field.Local)
+                    || parent.Field.DeclaringType != field.Local.Type
                     || source != null && (!ReferenceEquals(source.Local, field.Local)
                         || source.Field != parent.Field || source.Offset != parent.Offset))
                     return;
 
+                // Copy coalescing updates the receiver on the outer field reference.
                 source ??= new FieldReference(parent.Field, field.Local, parent.Offset);
                 lanes.Remove(lane);
                 loads.Add(load);

@@ -1038,10 +1038,13 @@ public static class IlGenerator
                 && MetadataResolver.IsSameType(argument.Type, array.ElementType)
                 && purePrefix;
             var canInlineValueField = producer is { OpCode: OpCode.Move, OperandWidth: null,
-                    Operands: [_, FieldReference { Parent: null, Field.IsStatic: false,
-                        Local: { IsThis: false, Type: { IsValueType: true } and not ByRefTypeAnalysisContext } } field] }
+                    Operands: [_, FieldReference { Parent: null, Field.IsStatic: false } field] }
                 && MetadataResolver.IsSameType(argument.Type, field.Field.FieldType)
-                && purePrefix;
+                && (field.Local.IsThis
+                    // A complete struct field can follow other direct loads from this,
+                    // including the receiver of a property setter.
+                    ? field.Field.FieldType.IsValueType && (purePrefix || HasOnlyStableLoadsBefore(consumerIl, loadIndex))
+                    : purePrefix && field.Local.Type is { IsValueType: true } and not ByRefTypeAnalysisContext);
             var canInlineDelegate = delegateParameter && producer.OpCode == OpCode.Newobj
                 && purePrefix && IsBoundDelegateExpression(producerIl);
             // Moving an allocation to its sole call argument keeps its evaluation order when
