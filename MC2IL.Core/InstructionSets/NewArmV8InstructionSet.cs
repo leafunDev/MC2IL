@@ -374,7 +374,7 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                         && instruction.Op2VectorElement.Index is 0 or 1))
             {
                 var broadcast = instruction.Op2Kind == Arm64OperandKind.VectorRegisterElement;
-                var right = broadcast ? ExtractLane(instruction.Op2Reg, instruction.Op2VectorElement.Index) : Reg(instruction.Op2Reg);
+                var right = broadcast ? ExtractArithmeticLane() : Reg(instruction.Op2Reg);
                 Add(address, opCode, Reg(instruction.Op0Reg), Reg(instruction.Op1Reg), right).Arm64PackedFloat =
                     broadcast ? Arm64PackedFloatOperation.Broadcast : Arm64PackedFloatOperation.Binary;
                 return;
@@ -388,7 +388,7 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                     && instruction.Op2Kind == Arm64OperandKind.VectorRegisterElement
                     && instruction.Op2VectorElement.Width == Arm64VectorElementWidth.S
                     && instruction.Op2VectorElement.Index is 0 or 1
-                        ? ExtractLane(instruction.Op2Reg, instruction.Op2VectorElement.Index)
+                        ? ExtractArithmeticLane()
                         : ConvertOperand(instruction, 2)
             };
 
@@ -398,6 +398,18 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                 operands.Add(new FloatingPointPrecision(IsDouble: true));
 
             Add(address, opCode, operands);
+
+            Register ExtractArithmeticLane()
+            {
+                var register = instruction.Op2Reg;
+                // Indexed single-precision FMUL uses five bits for Vm.
+                // Some Disarm versions only retain the low four.
+                if (instruction.Mnemonic == Arm64Mnemonic.FMUL
+                    && TryReadInstructionWord(context, address, out var word)
+                    && (word & 0xFFC0F400u) is 0x5F809000u or 0x0F809000u)
+                    register = (Arm64Register)((int)Arm64Register.V0 + (int)((word >> 16) & 31));
+                return ExtractLane(register, instruction.Op2VectorElement.Index);
+            }
         }
 
         Register ExtractLane(Arm64Register register, int lane)
