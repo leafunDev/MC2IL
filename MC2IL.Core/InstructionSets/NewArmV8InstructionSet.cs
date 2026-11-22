@@ -1354,7 +1354,11 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                     var mathMethod = floatTypeName == null
                         ? null
                         : isNumberVariant
+                            // Older Unity profiles do not expose MinNumber/MaxNumber. Recover
+                            // the available managed Min/Max call instead of leaving a native
+                            // FMINNM/FMAXNM instruction as NotImplemented.
                             ? FindFloatMathMethod(context.AppContext, floatTypeName, methodName + "Number", parameterCount)
+                              ?? FindFloatMathMethod(context.AppContext, floatTypeName, methodName, parameterCount)
                             : FindFloatMathMethod(context.AppContext, floatTypeName, methodName, parameterCount);
 
                     if (mathMethod != null)
