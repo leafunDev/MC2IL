@@ -88,8 +88,10 @@ internal static class TrivialConstructorRecovery
         var instructions = graph.Instructions;
         var dominators = new DominatorInfo(graph);
 
-        foreach (var (receiver, allocatedType) in allocations)
+        foreach (var allocationEntry in allocations)
         {
+            var receiver = allocationEntry.Key;
+            var allocatedType = allocationEntry.Value;
             var allocationIndex = instructions.FindIndex(instruction => instruction is
                 { OpCode: OpCode.Newobj, Operands: [LocalVariable destination, TypeAnalysisContext type] }
                 && ReferenceEquals(destination, receiver) && ReferenceEquals(type, allocatedType));
@@ -272,7 +274,8 @@ internal static class TrivialConstructorRecovery
 
         static string NormalizeName(string name)
         {
-            if (name.StartsWith('<') && name.EndsWith(">k__BackingField", StringComparison.Ordinal))
+            if (name.StartsWith("<", StringComparison.Ordinal)
+                && name.EndsWith(">k__BackingField", StringComparison.Ordinal))
                 name = name.Substring(1, name.IndexOf('>') - 1);
             return new string(name.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
         }
