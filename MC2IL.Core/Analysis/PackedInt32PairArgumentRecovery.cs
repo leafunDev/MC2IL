@@ -3,9 +3,9 @@ using System.Linq;
 using System.Reflection;
 using Disarm;
 using Disarm.InternalDisassembly;
-using MC2IL.Core.Logging;
 using MC2IL.Core.InstructionSets;
 using MC2IL.Core.ISIL;
+using MC2IL.Core.Logging;
 using MC2IL.Core.Model.Contexts;
 using MC2IL.Core.Utils;
 
@@ -29,9 +29,9 @@ internal static class PackedInt32PairArgumentRecovery
                 && TryGetXRegister(local.Register.Name, out _))
             .Select(local => (Local: local, Register: local.Register.Name!, Fields: GetInt32Pair(GetParameterType(method, local))!))
             .ToArray();
-        Logger.VerboseNewline($"{method.FullName}: found {candidates.Length} packed Int32-pair parameters from {method.ParameterLocals.Count} parameter locals.", "PackedInt32PairArgumentRecovery");
         if (candidates.Length == 0)
             return;
+        Logger.VerboseNewline($"{method.FullName}: found {candidates.Length} packed Int32-pair parameters.", "PackedInt32PairArgumentRecovery");
 
         Arm64Instruction[] native;
         try
