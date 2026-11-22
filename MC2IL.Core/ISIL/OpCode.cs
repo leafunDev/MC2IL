@@ -1,4 +1,4 @@
-﻿using MC2IL.Core.Analysis;
+using MC2IL.Core.Analysis;
 
 namespace MC2IL.Core.ISIL;
 
@@ -155,5 +155,8 @@ public enum OpCode
     PackFloatAggregate,
 
     /// <summary>Tests op 2 against the reference type op 3, storing the typed reference or null in op 1.</summary>
-    IsInstance
+    IsInstance,
+
+    /// <summary>Casts the reference in op 3 to the type in op 2 and stores it in op 1.</summary>
+    CastClass
 }

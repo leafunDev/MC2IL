@@ -778,11 +778,11 @@ public static class MetadataResolver
                 // exception-raiser call graph or a returned exception object that is actually thrown.
                 if (ThrowHelperRecovery.GetThrownException(method.AppContext, target) is { } thrown)
                 {
-                    // IL2CPP emits the null and bounds stubs next to one another. An apparent
-                    // use of X0 by the next stub is a fallthrough artefact if the first itself
-                    // reaches the exception raiser.
-                    if (thrown.FullName is "System.NullReferenceException" or "System.IndexOutOfRangeException"
-                        && ThrowHelperRecovery.IsExceptionRaiser(method.AppContext, target))
+                    // A use of X0 after a verified non-returning helper is a fallthrough artefact.
+                    if ((thrown.FullName is "System.NullReferenceException" or "System.IndexOutOfRangeException"
+                            && ThrowHelperRecovery.IsExceptionRaiser(method.AppContext, target))
+                        || (thrown.FullName == "System.InvalidCastException"
+                            && ThrowHelperRecovery.IsArm64InvalidCastRaiser(method.AppContext, target)))
                     {
                         callInstruction.OpCode = OpCode.Throw;
                         callInstruction.SetOperands(thrown);

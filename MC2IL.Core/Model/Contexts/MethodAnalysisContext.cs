@@ -510,6 +510,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Only remove guards once the managed operations that replace their checks are known.
         InlinedFieldGetterRecovery.Run(this);
         InjectedCheckRemover.Run(this);
+        Arm64ReferenceCastRecovery.Run(this);
         if (ArrayStoreGuardRecovery.Run(this))
             InjectedCheckRemover.Run(this, removeNullChecks: true, removeBoundsChecks: false);
         ArrayRecovery.MergeReloadedLoopArrayLengths(ControlFlowGraph!);

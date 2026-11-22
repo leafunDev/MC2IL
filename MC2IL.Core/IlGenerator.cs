@@ -198,6 +198,7 @@ public static class IlGenerator
                 // Keep the field and ldlen together so the comparison can inline the full expression.
                 InlineSingleUseArrayLengthReceiver(block, i, graph, instructionMap, inlineLocals, body);
                 InlineSingleUseFirstInput(block, i, graph, instructionMap, inlineLocals);
+                InlineSingleUseCastAssignment(block, i, graph, instructionMap, inlineLocals, body);
                 InlineSingleUseComparisonInput(block, i, graph, instructionMap, inlineLocals, body);
                 InlineSingleUseCallArguments(block, i, graph, instructionMap, inlineLocals, body);
                 if (fieldReadLocals != null)
@@ -574,6 +575,41 @@ public static class IlGenerator
                 { Parent: null, Local.IsThis: true, Field.IsStatic: false }] }
             && emitted is [var load, var field, _]
             && load.OpCode == CilOpCodes.Ldarg_0 && field.OpCode == CilOpCodes.Ldfld;
+    }
+
+    private static void InlineSingleUseCastAssignment(Block block, int index, ISILControlFlowGraph graph,
+        Dictionary<Instruction, List<CilInstruction>> instructionMap,
+        Dictionary<LocalVariable, CilLocalVariable> locals, CilMethodBody body)
+    {
+        var cast = block.Instructions[index];
+        if (cast is not { OpCode: OpCode.CastClass, Operands:
+                [FieldReference { Parent: null, Local.IsThis: true, Local.Type.IsValueType: false } destination, _, LocalVariable value] }
+            || !locals.TryGetValue(value, out var slot)
+            || !TryFindSingleUseProducer(block, index, value, out var callBlock, out var callIndex, out var producer)
+            || producer is not { OpCode: OpCode.Call, Operands: [MethodAnalysisContext, ..] }
+            || !instructionMap.TryGetValue(producer, out var expression)
+            || expression.Count < 2 || expression[^1].OpCode != CilOpCodes.Stloc || expression[^1].Operand != slot
+            || !ProducesStandaloneStackValue(expression, body)
+            || !instructionMap.TryGetValue(cast, out var castIl)
+            || castIl is not [{ OpCode.Code: CilCode.Ldarg_0 }, { OpCode.Code: CilCode.Ldloc, Operand: var operand }, ..]
+            || operand != slot || CountLocalUses(graph, value) != 1)
+            return;
+
+        if (producer.Operands is [_, _, LocalVariable firstArgument, ..]
+            && locals.TryGetValue(firstArgument, out var input)
+            && expression[0] is { OpCode.Code: CilCode.Ldloc, Operand: var loaded } && loaded == input
+            && TryFindSingleUseProducer(callBlock, callIndex, firstArgument, out _, out _, out var fieldLoad)
+            && fieldLoad is { OpCode: OpCode.Move, Operands: [_, FieldReference { Parent: null } source] }
+            && source.Field == destination.Field && source.Local == destination.Local
+            && instructionMap.TryGetValue(fieldLoad, out var loadIl) && loadIl.Count >= 2
+            && loadIl[^1].OpCode == CilOpCodes.Stloc && loadIl[^1].Operand == input
+            && ProducesStandaloneStackValue(loadIl, body) && CountLocalUses(graph, firstArgument) == 1)
+        {
+            RelocateSingleUseExpression(fieldLoad, loadIl, expression, 0, instructionMap, body);
+        }
+
+        // Loading this before the call cannot change which object receives the result.
+        RelocateSingleUseExpression(producer, expression, castIl, 1, instructionMap, body);
     }
 
     private static void InlineSingleUseComparisonInput(Block block, int index, ISILControlFlowGraph graph,
@@ -1605,6 +1641,20 @@ public static class IlGenerator
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, context.AppContext.SystemTypes.SystemObjectType);
                 instructions.Add(CilOpCodes.Isinst, targetType.ToTypeSignature().ToTypeDefOrRef());
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
+            case OpCode.CastClass:
+                var castField = instruction.Operands[0] as FieldReference;
+                if (castField is { Field.IsStatic: false })
+                    LoadFieldReceiver(castField, method, locals);
+
+                LoadOperand(instruction.Operands[2], method, locals, writeLine);
+                instructions.Add(CilOpCodes.Castclass,
+                    ((TypeAnalysisContext)instruction.Operands[1]).ToTypeSignature().ToTypeDefOrRef());
+                if (castField != null)
+                    instructions.Add(castField.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, castField.Field.ToFieldDescriptor());
+                else
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
             case OpCode.Throw:
