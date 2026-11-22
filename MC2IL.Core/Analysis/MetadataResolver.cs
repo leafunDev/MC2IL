@@ -478,7 +478,7 @@ public static class MetadataResolver
 
     internal static bool ResolveFieldOffsets(MethodAnalysisContext method, List<Instruction> instructions)
     {
-        var changed = false;
+        var changed = ResolvePhiIndexedFieldLoads(method, instructions);
         Dictionary<LocalVariable, (LocalVariable Base, long Offset)>? fieldAddresses = null;
 
         foreach (var instruction in instructions)
@@ -629,6 +629,131 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    // ARM64 can select between two field offsets with CSEL and then load through [this + offset].
+    // Keep that as a normal managed field selection: resolving only constant offsets leaves an
+    // unrepresentable managed-pointer read in the C# output and loses the selected value.
+    private static bool ResolvePhiIndexedFieldLoads(MethodAnalysisContext method, List<Instruction> instructions)
+    {
+        if (method.AppContext.InstructionSet is not NewArmV8InstructionSet)
+            return false;
+
+        var phiDefinitions = new Dictionary<LocalVariable, (Instruction Phi, Block Block)>();
+        foreach (var block in method.ControlFlowGraph!.Blocks)
+            foreach (var instruction in block.Instructions)
+                if (instruction is { OpCode: OpCode.Phi, Operands: [LocalVariable destination, ..] })
+                    phiDefinitions[destination] = (instruction, block);
+
+        if (phiDefinitions.Count == 0)
+            return false;
+
+        var usedNumbers = new HashSet<int>(method.Locals.Select(local => local.Register.Number));
+        var nextNumber = 0;
+        bool changed = false;
+
+        foreach (var load in instructions.ToArray())
+        {
+            if (load is not { OpCode: OpCode.Move, MemoryAccessSize: { } accessSize,
+                    Operands: [LocalVariable destination, MemoryOperand { Base: LocalVariable receiver,
+                        Index: LocalVariable index, Scale: > 0 } memory] }
+                || receiver.Type is not { IsValueType: false } owner
+                || owner is GenericInstanceTypeAnalysisContext || owner.GenericParameters.Count != 0
+                || !phiDefinitions.TryGetValue(index, out var selection)
+                || !ReferenceEquals(selection.Block, method.ControlFlowGraph.Blocks.FirstOrDefault(block => block.Instructions.Contains(load)))
+                || selection.Phi.Operands.Count != selection.Block.Predecessors.Count + 1)
+                continue;
+
+            var selectedFields = new List<FieldAnalysisContext>(selection.Block.Predecessors.Count);
+            var compatibleType = (TypeAnalysisContext?)null;
+            var safe = true;
+            for (var input = 1; input < selection.Phi.Operands.Count; input++)
+            {
+                if (selection.Phi.Operands[input] is not Immediate { Value: >= 0 and <= int.MaxValue } fieldIndex)
+                {
+                    safe = false;
+                    break;
+                }
+
+                long offset;
+                try
+                {
+                    offset = checked(memory.Addend + checked(fieldIndex.Value * memory.Scale));
+                }
+                catch (OverflowException)
+                {
+                    safe = false;
+                    break;
+                }
+
+                if (offset is < 0 or > int.MaxValue
+                    || FindUniqueInstanceFieldAtOffset(owner, (int)offset) is not { } field
+                    || compatibleType != null && !IsSameType(compatibleType, field.FieldType))
+                {
+                    safe = false;
+                    break;
+                }
+
+                var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+                var fieldSize = field.FieldType.IsValueType
+                    ? TypeSizes.UnboxedSize(field.FieldType, pointerSize)
+                    : pointerSize;
+                if (fieldSize != accessSize)
+                {
+                    safe = false;
+                    break;
+                }
+
+                compatibleType ??= field.FieldType;
+                selectedFields.Add(field);
+            }
+
+            var destinationTypeMatches = compatibleType != null
+                && (destination.Type == null || IsSameType(destination.Type, compatibleType));
+
+            if (!safe || compatibleType == null || selectedFields.Count != selection.Block.Predecessors.Count
+                || !destinationTypeMatches)
+                continue;
+
+            while (!usedNumbers.Add(nextNumber))
+                nextNumber++;
+            var selectedValue = new LocalVariable($"phiField{nextNumber}",
+                new Register(nextNumber, $"phiField{nextNumber}"), compatibleType);
+            method.Locals.Add(selectedValue);
+
+            var fieldReads = selectedFields
+                .Select(field => (IOperand)new FieldReference(field, receiver, field.Offset))
+                .ToList();
+            var valuePhi = new Instruction(-1, OpCode.Phi, [selectedValue, .. fieldReads]);
+            var insertAt = selection.Block.Instructions.FindIndex(instruction => instruction.OpCode != OpCode.Phi);
+            selection.Block.Instructions.Insert(insertAt < 0 ? selection.Block.Instructions.Count : insertAt, valuePhi);
+
+            load.SetOperands(destination, selectedValue);
+            load.MemoryAccessSize = null;
+            load.OperandWidth = null;
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    private static FieldAnalysisContext? FindUniqueInstanceFieldAtOffset(TypeAnalysisContext owner, int offset)
+    {
+        FieldAnalysisContext? match = null;
+        for (var type = owner; type != null; type = type.BaseType)
+        {
+            foreach (var field in type.Fields)
+            {
+                if (field.IsStatic || (field.Attributes & FieldAttributes.Literal) != 0
+                    || field.BackingData?.FieldOffset != offset)
+                    continue;
+
+                if (match != null)
+                    return null;
+                match = field;
+            }
+        }
+        return match;
     }
 
     private static Dictionary<LocalVariable, (LocalVariable Base, long Offset)> FindFieldAddresses(List<Instruction> instructions)
