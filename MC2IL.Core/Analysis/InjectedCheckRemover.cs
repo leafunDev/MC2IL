@@ -112,7 +112,12 @@ public static class InjectedCheckRemover
             // If the local did not prove a receiver check, try the bounds pattern.
         }
 
-        return removeBoundsChecks && thrown.ExceptionType == "System.IndexOutOfRangeException"
+        return removeBoundsChecks
+            && (thrown.ExceptionType == "System.IndexOutOfRangeException"
+                // Misidentified ARM64 throw stubs can produce an invalid delegate-typed throw
+                // operand. When the exact index/length check guards the matching array access,
+                // the array access itself preserves the bounds exception.
+                || thrown.ExceptionType == null && thrown.Operand is LocalVariable { Type.IsDelegate: true })
             && IsArrayBoundsCheck(checkedBlock, definition, throwOnTrue, continuation, defOf, removeNullChecks, redundantLengthLoads);
     }
 
@@ -982,6 +987,18 @@ public static class InjectedCheckRemover
     // Describes the throw performed by a block containing no other observable operation.
     private static InjectedThrow? GetInjectedThrow(Block block, HashSet<Instruction> ignoredExceptionConstructions)
     {
+        var meaningful = block.Instructions
+            .Where(instruction => !ignoredExceptionConstructions.Contains(instruction)
+                && instruction.OpCode is not (OpCode.Nop or OpCode.Interrupt))
+            .ToArray();
+        if (meaningful.Length is 2 or 3
+            && meaningful[0] is { OpCode: OpCode.Call, Operands: [MethodAnalysisContext
+                { Name: ".ctor", DeclaringType.IsDelegate: true }, LocalVariable constructed, ..] }
+            && meaningful[1] is { OpCode: OpCode.Throw, Operands: [LocalVariable thrownOperand] }
+            && ReferenceEquals(constructed, thrownOperand)
+            && (meaningful.Length == 2 || meaningful[2].OpCode == OpCode.Return))
+            return new InjectedThrow(null, thrownOperand);
+
         InjectedThrow? thrown = null;
 
         foreach (var instruction in block.Instructions)

@@ -51,7 +51,7 @@ public class CommandLineArgs
     [Option("output-as", HelpText = "Specify the ID of the output format you wish to use.")]
     public IEnumerable<string> OutputFormatIds { get; set; } = new List<string>();
 
-    [Option("recover-only", HelpText = "Recover only the specified types or methods (Full.Type or Full.Type::Method; comma-separated). Applies to csharp and dll_il_recovery.", Separator = ',')]
+    [Option("recover-only", HelpText = "Recover only the specified types or methods (Full.Type or Full.Type::Method; comma-separated). Applies to csharp, dll_il_recovery, and isil.", Separator = ',')]
     public IEnumerable<string> RecoverySelectors { get; set; } = new List<string>();
 
     [Option("csharp-assemblies", HelpText = "Limit C# output to a comma-separated list of assembly names. Use with --output-as csharp.")]

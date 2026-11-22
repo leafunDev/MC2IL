@@ -35,6 +35,8 @@ public class IsilDumpOutputFormat : MC2ILOutputFormat
 
                 if (type.Methods.Count == 0)
                     return;
+                if (context.RecoveryScope is { } scope && !type.Methods.Any(scope.Includes))
+                    return;
 
                 var typeDump = new StringBuilder();
 
@@ -44,6 +46,8 @@ public class IsilDumpOutputFormat : MC2ILOutputFormat
                 {
                     if (method is InjectedMethodAnalysisContext)
                         continue;
+                    if (context.RecoveryScope is { } methodScope && !methodScope.Includes(method))
+                        continue;
 
                     typeDump.Append("Method: ").AppendLine(method.Definition!.HumanReadableSignature).AppendLine();
 
@@ -52,7 +56,7 @@ public class IsilDumpOutputFormat : MC2ILOutputFormat
                         typeDump.AppendLine("Disassembly:");
                         typeDump.Append('\t').AppendLine(context.InstructionSet.PrintAssembly(method).Replace("\n", "\n\t"));
 
-                        typeDump.AppendLine().AppendLine("ISIL:");
+                        typeDump.AppendLine().AppendLine("Initial ISIL:");
 
                         method.Analyze();
 
@@ -64,7 +68,30 @@ public class IsilDumpOutputFormat : MC2ILOutputFormat
 
                         foreach (var isilInsn in method.ConvertedIsil)
                         {
-                            typeDump.Append('\t').Append(isilInsn).AppendLine();
+                            typeDump.Append('\t').Append(isilInsn);
+                            if (isilInsn.NativeAddress is { } nativeAddress)
+                                typeDump.Append(" [native 0x").Append(nativeAddress.ToString("X")).Append(']');
+                            if (isilInsn.OperandWidth is { } width)
+                                typeDump.Append(" [width ").Append(width).Append(']');
+                            if (isilInsn.MemoryAccessSize is { } memorySize)
+                                typeDump.Append(" [memory ").Append(memorySize).Append(']');
+                            typeDump.AppendLine();
+                        }
+
+                        if (method.ControlFlowGraph is { } graph)
+                        {
+                            typeDump.AppendLine().AppendLine("Analyzed CFG ISIL:");
+                            foreach (var isilInsn in graph.Instructions)
+                            {
+                                typeDump.Append('\t').Append(isilInsn);
+                                if (isilInsn.NativeAddress is { } nativeAddress)
+                                    typeDump.Append(" [native 0x").Append(nativeAddress.ToString("X")).Append(']');
+                                if (isilInsn.OperandWidth is { } width)
+                                    typeDump.Append(" [width ").Append(width).Append(']');
+                                if (isilInsn.MemoryAccessSize is { } memorySize)
+                                    typeDump.Append(" [memory ").Append(memorySize).Append(']');
+                                typeDump.AppendLine();
+                            }
                         }
 
                         method.ReleaseAnalysisData();

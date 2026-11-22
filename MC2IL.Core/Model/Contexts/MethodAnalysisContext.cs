@@ -513,6 +513,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         FloatLiteralRecovery.Run(this);
 
         // Runs late so the array type and length reach the allocation call as operands after copy propagation has inlined them
+        // Revisit split native array addresses after SSA/phi copies have been simplified; ARM64
+        // can otherwise hide the array base behind an untyped phi during the earlier pass.
+        if (AppContext.InstructionSet is NewArmV8InstructionSet)
+            ArrayRecovery.RecoverSplitElementAccesses(this);
         ArrayRecovery.Run(this);
 
         // The resolved signature tells which register values are actually used by a call.

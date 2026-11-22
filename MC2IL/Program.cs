@@ -737,10 +737,10 @@ internal static class Program
 
         if (runtimeArgs.RecoverySelectors.Count != 0
             && (runtimeArgs.OutputFormats == null || !runtimeArgs.OutputFormats.Any()
-                || runtimeArgs.OutputFormats.Any(format => format is not (AsmResolverDllOutputFormatIlRecovery or CSharpOutputFormat))))
+                || runtimeArgs.OutputFormats.Any(format => format is not (AsmResolverDllOutputFormatIlRecovery or CSharpOutputFormat or IsilDumpOutputFormat))))
         {
             CleanupExtractedFiles();
-            throw new SoftException("--recover-only requires --output-as csharp or dll_il_recovery.");
+            throw new SoftException("--recover-only requires --output-as csharp, dll_il_recovery, or isil.");
         }
 
         MC2ILApi.RuntimeOptions = runtimeArgs;
