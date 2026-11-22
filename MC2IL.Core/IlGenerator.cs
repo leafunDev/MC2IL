@@ -280,6 +280,7 @@ public static class IlGenerator
         }
 
         CilSingleUseMathInliner.Run(body, locals);
+        CilArithmeticNormalizer.Run(body);
         CilBranchCleanup.Run(body);
         SetRecoveredMaxStack(body);
     }
