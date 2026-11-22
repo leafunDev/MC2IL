@@ -487,9 +487,9 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
             }
         }
 
-        Register ExtractLane(Arm64Register register, int lane)
+        Register ExtractLane(Arm64Register register, int lane, string temporaryName = "TEMP_SIMD_EXTRACT")
         {
-            var result = new Register(null, "TEMP_SIMD_EXTRACT");
+            var result = new Register(null, temporaryName);
             Add(address, OpCode.Move, result, new Register(null, $"{NormalizeRegister(register)}.S{lane}"), Reg(register)).Arm64PackedFloat = lane == 0
                 ? Arm64PackedFloatOperation.ExtractLow : Arm64PackedFloatOperation.ExtractHigh;
             return result;
@@ -1297,6 +1297,16 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                 if (instruction.Op0Arrangement == Arm64ArrangementSpecifier.TwoS
                     && instruction.Op1Arrangement == Arm64ArrangementSpecifier.TwoS)
                     negate.Arm64PackedFloat = Arm64PackedFloatOperation.Negate;
+                break;
+            case Arm64Mnemonic.FADDP when instruction.Op0Reg is >= Arm64Register.S0 and <= Arm64Register.S31
+                && instruction.Op1Arrangement == Arm64ArrangementSpecifier.TwoS:
+                // Scalar FADDP Sd, Vn.2S reduces the two lanes of Vn into Sd.
+                // These reductions are commonly emitted for Vector2.Length and
+                // ColorBlock equality calculations on ARM64.
+                Add(address, OpCode.Add, ConvertOperand(instruction, 0),
+                    ExtractLane(instruction.Op1Reg, 0, "TEMP_FADDP_LOW"),
+                    ExtractLane(instruction.Op1Reg, 1, "TEMP_FADDP_HIGH"),
+                    new FloatingPointPrecision(IsDouble: false));
                 break;
             case Arm64Mnemonic.FABS:
             case Arm64Mnemonic.FSQRT:
