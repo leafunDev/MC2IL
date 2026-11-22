@@ -319,8 +319,22 @@ internal static class Arm64FloatPairRecovery
                     var source = instruction.Operands[1];
                     if (source is Immediate bits)
                         source = new FloatLiteral(BitConverter.ToSingle(BitConverter.GetBytes(unchecked((int)bits.Value)), 0));
-                    instruction.SetOperand(1, source);
-                    Insert(new Instruction(index, OpCode.Move, second, source));
+                    if (mode == Arm64PackedFloatOperation.ReplicateBits
+                        && source is LocalVariable bitPattern && !IsScalarSingle(bitPattern))
+                    {
+                        // DUP Vd.2S, Wn broadcasts raw IEEE-754 bits. Treating
+                        // an integer register as a numeric float conversion
+                        // changes values such as 0x447A0000 (1000f).
+                        var reinterpret = new NumericConversion(NumericConversionKind.I32ReinterpretFloat32);
+                        instruction.OpCode = OpCode.Convert;
+                        instruction.SetOperands(low, bitPattern, reinterpret);
+                        Insert(new Instruction(index, OpCode.Move, second, low));
+                    }
+                    else
+                    {
+                        instruction.SetOperand(1, source);
+                        Insert(new Instruction(index, OpCode.Move, second, source));
+                    }
                 }
                 else if (mode is Arm64PackedFloatOperation.InsertLow or Arm64PackedFloatOperation.InsertHigh)
                 {

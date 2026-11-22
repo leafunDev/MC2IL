@@ -808,6 +808,15 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                 var duplicated = ExtractLane(instruction.Op1Reg, instruction.Op1VectorElement.Index);
                 Add(address, OpCode.Move, Reg(instruction.Op0Reg), duplicated).Arm64PackedFloat = Arm64PackedFloatOperation.Duplicate;
                 break;
+            case Arm64Mnemonic.DUP when instruction.Op0Arrangement == Arm64ArrangementSpecifier.TwoS
+                && instruction.Op1Kind == Arm64OperandKind.Register
+                && instruction.Op1Reg is >= Arm64Register.W0 and <= Arm64Register.W31:
+                // DUP Vd.2S, Wn copies the low 32 source bits to both lanes.
+                // Keep the bitwise form until float-pair recovery knows whether
+                // the consumers use these lanes as IEEE-754 values.
+                Add(address, OpCode.Move, Reg(instruction.Op0Reg), ConvertOperand(instruction, 1))
+                    .Arm64PackedFloat = Arm64PackedFloatOperation.ReplicateBits;
+                break;
             case Arm64Mnemonic.MOVI when instruction.Op0Arrangement == Arm64ArrangementSpecifier.TwoS
                 && TryGetPackedOrrImmediate(instruction, out var bits):
                 Add(address, OpCode.Move, Reg(instruction.Op0Reg), Imm(unchecked((int)bits)))
