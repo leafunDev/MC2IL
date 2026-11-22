@@ -116,7 +116,7 @@ public class Instruction : IOperand
             or OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess or OpCode.CheckNotEqual
             or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual or OpCode.CheckGreaterUnsigned
             or OpCode.CheckLessUnsigned or OpCode.CheckGreaterOrEqualUnsigned or OpCode.CheckLessOrEqualUnsigned
-            or OpCode.Newobj or OpCode.Box => 0,
+            or OpCode.Newobj or OpCode.Box or OpCode.IsInstance => 0,
         OpCode.Call or OpCode.IndirectCall when _operands.Count > 1 => 1,
         _ => -1
     };
@@ -147,7 +147,7 @@ public class Instruction : IOperand
                 or OpCode.Newobj
                 => [_operands[1]],
 
-            OpCode.Convert => [_operands[1]],
+            OpCode.Convert or OpCode.IsInstance => [_operands[1]],
 
             OpCode.PackFloatAggregate => _operands.Skip(2).ToList(),
 
