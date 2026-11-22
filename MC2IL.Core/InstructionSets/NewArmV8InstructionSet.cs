@@ -1184,9 +1184,21 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                     {
                         if (instruction.Mnemonic == Arm64Mnemonic.FABD)
                         {
+                            // Disarm can return Rn for both operands of scalar FABD.
+                            // Recover the three separate register fields from the encoding.
+                            if (!TryReadInstructionWord(context, address, out var word)
+                                || (word & 0xFFA0FC00u) != 0x7EA0D400u)
+                            {
+                                Add(address, OpCode.NotImplemented, new StringLiteral("Unsupported ARM64 FABD encoding."));
+                                break;
+                            }
+
                             var difference = new Register(null, "TEMP_FABD");
-                            Add(address, OpCode.Subtract, difference, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
-                            Add(address, OpCode.Call, mathMethod, ConvertOperand(instruction, 0), difference);
+                            var left = new Register(null, $"V{(word >> 5) & 31}");
+                            var right = new Register(null, $"V{(word >> 16) & 31}");
+                            Add(address, OpCode.Subtract, difference, left, right,
+                                new FloatingPointPrecision(IsDouble: (word & (1u << 22)) != 0));
+                            Add(address, OpCode.Call, mathMethod, new Register(null, $"V{word & 31}"), difference);
                         }
                         else if (parameterCount == 1)
                             Add(address, OpCode.Call, mathMethod, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1))
