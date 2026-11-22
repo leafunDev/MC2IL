@@ -187,7 +187,10 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                 void AddTableInstruction(OpCode code, params List<IOperand> operands)
                 {
                     addresses.Add(instruction.Address);
-                    instructions.Add(new Instruction(instructions.Count, code, operands));
+                    instructions.Add(new Instruction(instructions.Count, code, operands)
+                    {
+                        NativeAddress = instruction.Address
+                    });
                 }
             }
             else
@@ -265,6 +268,9 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
         {
             addresses.Add(address);
             var newInstruction = new Instruction(instructions.Count, opCode, operands);
+            // Keep the source machine instruction even when control-flow lowering uses
+            // a synthetic address for the alternate arm of a conditional select.
+            newInstruction.NativeAddress = instruction.Address;
             if (instruction.Op0Kind == Arm64OperandKind.Register
                 && instruction.Op0Reg is >= Arm64Register.W0 and <= Arm64Register.W31
                 && instruction.Mnemonic is not (Arm64Mnemonic.FMOV or Arm64Mnemonic.SXTB or Arm64Mnemonic.SXTH
@@ -489,6 +495,58 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
             return new MemoryOperand(Reg(baseReg), addend: offset);
         }
 
+        (Arm64ShiftType Type, long Amount) GetLogicalShift()
+        {
+            var type = instruction.FinalOpShiftType == Arm64ShiftType.NONE
+                ? instruction.Op2ShiftType
+                : instruction.FinalOpShiftType;
+            var amount = instruction.Op3Imm;
+            if (type == Arm64ShiftType.NONE && TryReadInstructionWord(context, address, out var word))
+            {
+                type = ((word >> 22) & 0b11) switch
+                {
+                    0 => Arm64ShiftType.LSL,
+                    1 => Arm64ShiftType.LSR,
+                    2 => Arm64ShiftType.ASR,
+                    _ => Arm64ShiftType.ROR
+                };
+                amount = (word >> 10) & 0b11_1111;
+            }
+            return (type, amount);
+        }
+
+        IOperand ConvertShiftedLogicalOperand()
+        {
+            var source = ConvertOperand(instruction, 2);
+            if (instruction.Op2Kind != Arm64OperandKind.Register || instruction.Op3Imm == 0)
+                return source;
+
+            var width = instruction.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X31 ? 64 : 32;
+            var (shiftType, shift) = GetLogicalShift();
+            var shifted = new Register(null, "TEMP_LOGICAL_SHIFT");
+            var shiftOp = shiftType switch
+            {
+                Arm64ShiftType.LSL => OpCode.ShiftLeft,
+                Arm64ShiftType.LSR => OpCode.ShiftRightUnsigned,
+                Arm64ShiftType.ASR => OpCode.ShiftRight,
+                Arm64ShiftType.ROR => (OpCode?)null,
+                _ => throw new NotSupportedException($"Unsupported ARM64 logical shift ({instruction.FinalOpShiftType}/{instruction.Op2ShiftType}, amount {shift}): {instruction}")
+            };
+
+            if (shiftOp is { } operation)
+            {
+                Add(address, operation, shifted, source, Imm(shift)).OperandWidth = width;
+                return shifted;
+            }
+
+            var right = new Register(null, "TEMP_LOGICAL_ROR_RIGHT");
+            var left = new Register(null, "TEMP_LOGICAL_ROR_LEFT");
+            Add(address, OpCode.ShiftRightUnsigned, right, source, Imm(shift)).OperandWidth = width;
+            Add(address, OpCode.ShiftLeft, left, source, Imm(width - shift)).OperandWidth = width;
+            Add(address, OpCode.Or, shifted, right, left).OperandWidth = width;
+            return shifted;
+        }
+
         var flagN = new Register(null, "N");
         var flagZ = new Register(null, "Z");
         var flagC = new Register(null, "C");
@@ -628,8 +686,12 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
         // dest = cond ? <emitTrueValue into dest> : <emitFalseValue into dest>
         void EmitConditionalAssign(Arm64ConditionCode condition, Action emitTrueValue, Action<ulong> emitFalseValue)
         {
-            var inverse = new Register(null, "TEMPCSEL");
-            Add(address, OpCode.Not, inverse, EmitCondition(condition));
+            var inverse = EmitInverseCondition(condition);
+            if (inverse == null)
+            {
+                inverse = new Register(null, "TEMPCSEL");
+                Add(address, OpCode.Not, inverse, EmitCondition(condition));
+            }
             Add(address, OpCode.ConditionalJump, Imm(address + 1), inverse);
             emitTrueValue();
             Add(address, OpCode.Jump, Imm(address + 2));
@@ -1084,7 +1146,7 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                     };
 
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
-                    Add(address, opCode, dest, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                    Add(address, opCode, dest, ConvertOperand(instruction, 1), ConvertShiftedLogicalOperand());
 
                     if (instruction.Mnemonic == Arm64Mnemonic.ANDS)
                         EmitResultFlags(dest);
@@ -1096,8 +1158,23 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
             case Arm64Mnemonic.ORN:
             case Arm64Mnemonic.EON:
                 {
+                    var width = instruction.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X31 ? 64 : 32;
+                    var (shiftType, shiftAmount) = GetLogicalShift();
+                    if (instruction.Mnemonic == Arm64Mnemonic.BIC
+                        && instruction.Op1Kind == Arm64OperandKind.Register
+                        && instruction.Op1Reg == instruction.Op2Reg
+                        && shiftType == Arm64ShiftType.ASR && shiftAmount == width - 1)
+                    {
+                        var value = ConvertOperand(instruction, 1);
+                        var negative = new Register(null, "TEMP_NEGATIVE");
+                        Add(address, OpCode.CheckLess, negative, value, Imm(0)).OperandWidth = width;
+                        var result = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
+                        Add(address, OpCode.Select, result, negative, Imm(0), value).OperandWidth = width;
+                        break;
+                    }
+
                     var temp = new Register(null, "TEMP");
-                    Add(address, OpCode.Not, temp, ConvertOperand(instruction, 2));
+                    Add(address, OpCode.Not, temp, ConvertShiftedLogicalOperand());
                     var opCode = instruction.Mnemonic switch
                     {
                         Arm64Mnemonic.ORN => OpCode.Or,

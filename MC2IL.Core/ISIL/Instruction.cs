@@ -32,6 +32,9 @@ public class Instruction : IOperand
     // A scalar native absolute value emitted as a managed math call.
     public bool IsLiftedFloatAbs;
 
+    // Native instruction address, retained through early analysis for architecture-specific recovery.
+    internal ulong? NativeAddress;
+
     // Scalar FMIN has native NaN semantics and can be part of an inlined clamp.
     public bool IsLiftedFloatMin;
 

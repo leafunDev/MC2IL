@@ -406,6 +406,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Create locals
         SsaForm.Build(this);
         LocalVariables.CreateAll(this);
+        PackedInt32PairArgumentRecovery.Run(this);
         Arm64FloatPairRecovery.Run(this);
         FloatLiteralRecovery.RecoverPackedFieldInitializers(this);
         FloatLiteralRecovery.RecoverNativeLoads(this);

@@ -665,6 +665,9 @@ public static class LocalVariables
                 case OpCode.Move:
                     changed |= PropagateMove(instruction, method.AppContext.Binary.PointerSizeBytes);
                     break;
+                case OpCode.Select:
+                    changed |= PropagateSelect(instruction);
+                    break;
                 case OpCode.Convert:
                     changed |= PropagateNumericConversion(instruction, method.AppContext.SystemTypes);
                     break;
@@ -689,6 +692,34 @@ public static class LocalVariables
         return changed;
     }
 
+    private static bool PropagateSelect(Instruction select)
+    {
+        if (select.Operands is not [LocalVariable { Type: null } destination, _, var whenTrue, var whenFalse])
+            return false;
+
+        var trueType = SelectValueType(whenTrue);
+        var falseType = SelectValueType(whenFalse);
+        if (trueType != null && falseType != null && trueType != falseType)
+            return false;
+
+        var resultType = trueType ?? falseType;
+        if (resultType == null
+            || trueType == null && whenTrue is not Immediate { Value: 0 }
+            || falseType == null && whenFalse is not Immediate { Value: 0 })
+            return false;
+
+        return SetTypeIfUnknown(destination, resultType);
+    }
+
+    private static TypeAnalysisContext? SelectValueType(IOperand value) => value switch
+    {
+        LocalVariable local => local.Type,
+        FieldReference field => field.Field.FieldType,
+        ArrayLength => null,
+        TypeAnalysisContext type => type,
+        _ => null,
+    };
+
     private static void SeedLiteralTypes(MethodAnalysisContext method, List<Instruction> instructions)
     {
         foreach (var instruction in instructions)
@@ -701,6 +732,8 @@ public static class LocalVariables
                 StringLiteral => method.AppContext.SystemTypes.SystemStringType,
                 FloatLiteral => method.AppContext.SystemTypes.SystemSingleType,
                 DoubleLiteral => method.AppContext.SystemTypes.SystemDoubleType,
+                Immediate when instruction.OperandWidth == 32 && destination.Type == null
+                    => method.AppContext.SystemTypes.SystemInt32Type,
                 _ => destination.Type,
             };
         }
