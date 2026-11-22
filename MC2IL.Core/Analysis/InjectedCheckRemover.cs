@@ -20,6 +20,7 @@ public static class InjectedCheckRemover
         IEnumerable<LocalVariable>? parameters = null)
     {
         var defOf = BuildDefMap(cfg, parameters, out var stableParameters, out var addressed);
+        var allDefs = removeBoundsChecks ? BuildAllDefinitionMap(cfg) : [];
         var ignoredExceptionConstructions = FindUnusedExceptionConstructions(cfg);
         var redundantLengthLoads = new HashSet<Instruction>();
         var removedAny = false;
@@ -56,7 +57,7 @@ public static class InjectedCheckRemover
 
             if (terminator.Operands[1] is not LocalVariable condition
                 || !TryGetDefinitionBefore(block, terminator, condition, defOf, out var definition)
-                || !IsInjectedCheck(block, definition, thrown, throwOnTrue, defOf, stableParameters, addressed, throwOnTrue ? falseTarget : trueTarget,
+                || !IsInjectedCheck(block, definition, thrown, throwOnTrue, defOf, allDefs, stableParameters, addressed, throwOnTrue ? falseTarget : trueTarget,
                     removeNullChecks, removeBoundsChecks, redundantLengthLoads))
                 continue;
 
@@ -83,7 +84,8 @@ public static class InjectedCheckRemover
     }
 
     private static bool IsInjectedCheck(Block checkedBlock, Instruction definition, InjectedThrow thrown, bool throwOnTrue,
-        Dictionary<LocalVariable, Instruction> defOf, HashSet<LocalVariable> stableParameters, HashSet<LocalVariable> addressed, Block continuation,
+        Dictionary<LocalVariable, Instruction> defOf, Dictionary<LocalVariable, List<Instruction>> allDefs,
+        HashSet<LocalVariable> stableParameters, HashSet<LocalVariable> addressed, Block continuation,
         bool removeNullChecks, bool removeBoundsChecks, HashSet<Instruction> redundantLengthLoads)
     {
         if (TryGetNullComparison(checkedBlock, definition, throwOnTrue, defOf,
@@ -113,7 +115,8 @@ public static class InjectedCheckRemover
         }
 
         return removeBoundsChecks && thrown.ExceptionType == "System.IndexOutOfRangeException"
-            && IsArrayBoundsCheck(checkedBlock, definition, throwOnTrue, continuation, defOf, removeNullChecks, redundantLengthLoads);
+            && IsArrayBoundsCheck(checkedBlock, definition, throwOnTrue, continuation, defOf, allDefs,
+                removeNullChecks, redundantLengthLoads);
     }
 
     private static bool HasImplicitNullCheckAfterGuardCopies(Block guard, Instruction comparison,
@@ -490,7 +493,7 @@ public static class InjectedCheckRemover
                     return true;
                 }
 
-                return IsImplicitNullCheckOperation(instruction, receiver, defOf, arraysOnly,
+                return IsImplicitNullCheckOperation(current, instruction, receiver, defOf, arraysOnly,
                     knownNonNullThis, pathInstructions, callsNeedingNullCheck);
             }
 
@@ -503,7 +506,7 @@ public static class InjectedCheckRemover
         return false;
     }
 
-    private static bool IsImplicitNullCheckOperation(Instruction operation, IOperand receiver,
+    private static bool IsImplicitNullCheckOperation(Block block, Instruction operation, IOperand receiver,
         Dictionary<LocalVariable, Instruction> defOf, bool arraysOnly, LocalVariable? knownNonNullThis,
         List<Instruction> pathInstructions, HashSet<Instruction> callsNeedingNullCheck)
     {
@@ -520,6 +523,14 @@ public static class InjectedCheckRemover
 
         if (arraysOnly)
             return false;
+
+        if (operand is MemoryOperand { Base: LocalVariable dereferenced, Index: null, Scale: 0,
+                Addend: 0, IsConstant: false }
+            && dereferenced.Type is { } dereferencedType && IlGenerator.IsManagedReference(dereferencedType)
+            && SameValueOnPath(receiver, dereferenced, pathInstructions, defOf)
+            && TryMatchNativeDispatchNullCheck(block, operation, receiver, defOf,
+                pathInstructions, callsNeedingNullCheck))
+            return true;
 
         if ((operand is AddressOf { Target: FieldReference addressedField } ? addressedField : operand)
             is FieldReference { Field.IsStatic: false } field
@@ -543,6 +554,100 @@ public static class InjectedCheckRemover
 
         if (!operation.NullCheckReceiver)
             callsNeedingNullCheck.Add(operation);
+        return true;
+    }
+
+    private static bool TryMatchNativeDispatchNullCheck(Block block, Instruction firstRead, IOperand receiver,
+        Dictionary<LocalVariable, Instruction> defOf, List<Instruction> pathInstructions,
+        HashSet<Instruction> callsNeedingNullCheck)
+    {
+        if (firstRead is not { OpCode: OpCode.Move, Operands: [LocalVariable, MemoryOperand firstMemory] }
+            || !IsNativeDispatchMemoryRead(firstMemory, receiver, pathInstructions, defOf, requireReceiver: true))
+            return false;
+
+        var index = block.Instructions.IndexOf(firstRead);
+        if (index < 0)
+            return false;
+
+        var path = new List<Instruction>(pathInstructions) { firstRead };
+        for (var i = index + 1; i < block.Instructions.Count; i++)
+        {
+            var instruction = block.Instructions[i];
+            if (instruction.OpCode is OpCode.Nop or OpCode.Jump)
+            {
+                path.Add(instruction);
+                continue;
+            }
+
+            if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, var simpleSource] }
+                && (IsSimpleValue(simpleSource) || simpleSource is RuntimeMethodInfoAnalysisContext or TypeAnalysisContext))
+            {
+                path.Add(instruction);
+                continue;
+            }
+
+            if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, MemoryOperand memory] }
+                && IsNativeDispatchMemoryRead(memory, receiver, path, defOf, requireReceiver: false))
+            {
+                path.Add(instruction);
+                continue;
+            }
+
+            if (IsIndirectDispatchCall(instruction, receiver, path, defOf))
+            {
+                path.Add(instruction);
+                continue;
+            }
+
+            if (instruction.IsCall && instruction.Operands[0] is MethodAnalysisContext
+                    { IsStatic: false, DeclaringType: { IsValueType: false } owner } target
+                && target.Name != ".ctor"
+                && (instruction.NullCheckReceiver || !target.IsVirtual || target.IsFinal || owner.IsSealed))
+            {
+                var receiverIndex = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
+                if (instruction.Operands.Count > receiverIndex
+                    && SameValueOnPath(receiver, instruction.Operands[receiverIndex], path, defOf)
+                    && instruction.Operands.Skip(receiverIndex + 1).Take(target.Parameters.Count)
+                        .All(argument => IsSimpleValue(argument)))
+                {
+                    instruction.NullCheckReceiver = true;
+                    callsNeedingNullCheck.Add(instruction);
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        return false;
+    }
+
+    private static bool IsNativeDispatchMemoryRead(MemoryOperand memory, IOperand receiver,
+        List<Instruction> pathInstructions, Dictionary<LocalVariable, Instruction> defOf, bool requireReceiver)
+    {
+        if (memory.IsConstant || memory.Index != null || memory.Scale != 0
+            || memory.Base is not LocalVariable baseLocal)
+            return false;
+
+        if (SameValueOnPath(receiver, baseLocal, pathInstructions, defOf))
+            return memory.Addend == 0 && baseLocal.Type is { } type && IlGenerator.IsManagedReference(type);
+
+        return !requireReceiver && baseLocal.Type is RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext;
+    }
+
+    private static bool IsIndirectDispatchCall(Instruction instruction, IOperand receiver,
+        List<Instruction> pathInstructions, Dictionary<LocalVariable, Instruction> defOf)
+    {
+        if (instruction.OpCode != OpCode.IndirectCall
+            || instruction.Destination == null
+            || instruction.Operands.Count < 3
+            || !SameValueOnPath(receiver, instruction.Operands[2], pathInstructions, defOf)
+            || instruction.Operands[0] is not LocalVariable target
+            || !defOf.TryGetValue(target, out var targetDefinition)
+            || targetDefinition is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand
+                { Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext }, Index: null, Scale: 0 }] })
+            return false;
+
         return true;
     }
 
@@ -714,7 +819,8 @@ public static class InjectedCheckRemover
     // corresponding element access. Otherwise the generated IL would have no operation left
     // to enforce the same bounds check.
     private static bool IsArrayBoundsCheck(Block guard, Instruction definition, bool throwOnTrue, Block continuation,
-        Dictionary<LocalVariable, Instruction> defOf, bool removeNullChecks, HashSet<Instruction> redundantLengthLoads)
+        Dictionary<LocalVariable, Instruction> defOf, Dictionary<LocalVariable, List<Instruction>> allDefs,
+        bool removeNullChecks, HashSet<Instruction> redundantLengthLoads)
     {
         if (definition.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqualUnsigned
             || definition.Operands.Count < 3)
@@ -730,11 +836,12 @@ public static class InjectedCheckRemover
         for (var lengthIndex = 1; lengthIndex <= 2; lengthIndex++)
         {
             var index = definition.Operands[3 - lengthIndex];
-            if (TryGetArrayLength(definition.Operands[lengthIndex], defOf, [], out var array)
-                && SameValue(access.Array, array, defOf, [])
-                && SameValue(access.Index, index, defOf, [])
-                && IsBoundsFailure(definition.OpCode, lengthIndex == 1, throwOnTrue,
-                    access.Index is Immediate { Value: 0 }))
+            var hasLength = TryGetArrayLength(definition.Operands[lengthIndex], defOf, allDefs, [], out var array);
+            var sameArray = hasLength && SameValue(access.Array, array, defOf, []);
+            var sameIndex = SameValue(access.Index, index, defOf, []);
+            var matchingCheck = IsBoundsFailure(definition.OpCode, lengthIndex == 1, throwOnTrue,
+                access.Index is Immediate { Value: 0 });
+            if (hasLength && sameArray && sameIndex && matchingCheck)
             {
                 // With no observable work between ldlen and the matched access, ldelem/stelem
                 // performs the same null and range checks. The old length load can die if unread.
@@ -829,17 +936,21 @@ public static class InjectedCheckRemover
         if (indexIsZero && comparison is OpCode.CheckEqual or OpCode.CheckNotEqual)
             return comparison == OpCode.CheckEqual ? throwOnTrue : !throwOnTrue;
 
+        // The exact matching ldelem/stelem below performs the same range check in CIL.
+        // A signed pre-check is also redundant: every valid index makes the signed and
+        // unsigned predicates agree, while a negative index that slips past a signed guard
+        // is still rejected by the managed array access itself.
         return (lengthOnLeft, throwOnTrue) switch
         {
-            (true, true) => comparison == OpCode.CheckLessOrEqualUnsigned,
-            (true, false) => comparison == OpCode.CheckGreaterUnsigned,
-            (false, true) => comparison == OpCode.CheckGreaterOrEqualUnsigned,
-            _ => comparison == OpCode.CheckLessUnsigned,
+            (true, true) => comparison is OpCode.CheckLessOrEqualUnsigned or OpCode.CheckLessOrEqual,
+            (true, false) => comparison is OpCode.CheckGreaterUnsigned or OpCode.CheckGreater,
+            (false, true) => comparison is OpCode.CheckGreaterOrEqualUnsigned or OpCode.CheckGreaterOrEqual,
+            _ => comparison is OpCode.CheckLessUnsigned or OpCode.CheckLess,
         };
     }
 
     private static bool TryGetArrayLength(IOperand operand, Dictionary<LocalVariable, Instruction> defOf,
-        HashSet<LocalVariable> seen, out LocalVariable array)
+        Dictionary<LocalVariable, List<Instruction>> allDefs, HashSet<LocalVariable> seen, out LocalVariable array)
     {
         if (operand is ArrayLength length)
         {
@@ -847,15 +958,57 @@ public static class InjectedCheckRemover
             return true;
         }
 
-        if (operand is LocalVariable local && seen.Add(local)
-            && defOf.TryGetValue(local, out var definition)
+        if (operand is LocalVariable local && defOf.TryGetValue(local, out var definition)
+            && seen.Add(local)
             && definition is { OpCode: OpCode.Move, Operands: [_, var source] }
             && source is IOperand sourceOperand
-            && TryGetArrayLength(sourceOperand, defOf, seen, out array))
+            && TryGetArrayLength(sourceOperand, defOf, allDefs, seen, out array))
             return true;
+
+        if (operand is LocalVariable ambiguousLocal && seen.Add(ambiguousLocal)
+            && allDefs.TryGetValue(ambiguousLocal, out var definitions)
+            && definitions.Count > 1)
+        {
+            LocalVariable? commonArray = null;
+            foreach (var candidate in definitions)
+            {
+                if (candidate is not { OpCode: OpCode.Move, Operands: [_, var candidateSource] }
+                    || candidateSource is not IOperand candidateOperand
+                    || !TryGetArrayLength(candidateOperand, defOf, allDefs, new HashSet<LocalVariable>(seen), out var candidateArray)
+                    || commonArray != null && !SameValue(commonArray, candidateArray, defOf, []))
+                {
+                    array = null!;
+                    return false;
+                }
+
+                commonArray ??= candidateArray;
+            }
+
+            if (commonArray != null)
+            {
+                array = commonArray;
+                return true;
+            }
+        }
 
         array = null!;
         return false;
+    }
+
+    private static Dictionary<LocalVariable, List<Instruction>> BuildAllDefinitionMap(ISILControlFlowGraph cfg)
+    {
+        var definitions = new Dictionary<LocalVariable, List<Instruction>>();
+        foreach (var instruction in cfg.Instructions)
+        {
+            if (instruction.Destination is not LocalVariable destination)
+                continue;
+
+            if (!definitions.TryGetValue(destination, out var writes))
+                definitions.Add(destination, writes = []);
+            writes.Add(instruction);
+        }
+
+        return definitions;
     }
 
     private static bool IsNullComparison(Instruction instruction, out IOperand testedOperand)

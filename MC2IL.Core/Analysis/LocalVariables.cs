@@ -657,6 +657,7 @@ public static class LocalVariables
     private static bool PropagateTypesOnce(MethodAnalysisContext method, List<Instruction> instructions)
     {
         var changed = false;
+        Dictionary<LocalVariable, Instruction?>? definitions = null;
 
         foreach (var instruction in instructions)
         {
@@ -672,7 +673,7 @@ public static class LocalVariables
                     changed |= PropagateNumericConversion(instruction, method.AppContext.SystemTypes);
                     break;
                 case OpCode.Phi:
-                    changed |= PropagatePhi(instruction);
+                    changed |= PropagatePhi(instruction, definitions ??= BuildUniqueDefinitionMap(instructions));
                     break;
                 case OpCode.Add or OpCode.Subtract or OpCode.Multiply:
                     changed |= PropagateArithmetic(instruction, method)
@@ -690,6 +691,23 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    private static Dictionary<LocalVariable, Instruction?> BuildUniqueDefinitionMap(List<Instruction> instructions)
+    {
+        var definitions = new Dictionary<LocalVariable, Instruction?>();
+        foreach (var instruction in instructions)
+        {
+            if (instruction.Destination is not LocalVariable destination)
+                continue;
+
+            if (definitions.ContainsKey(destination))
+                definitions[destination] = null;
+            else
+                definitions.Add(destination, instruction);
+        }
+
+        return definitions;
     }
 
     private static bool PropagateSelect(Instruction select)
@@ -1080,14 +1098,18 @@ public static class LocalVariables
     // A phi merges values from multiple predecessors. Keep value types exact, but use the nearest
     // common reference base when every input is known. Choosing the first input's concrete type
     // makes inference depend on predecessor order and can resolve fields or calls incorrectly.
-    private static bool PropagatePhi(Instruction phi)
+    private static bool PropagatePhi(Instruction phi, Dictionary<LocalVariable, Instruction?> definitions)
     {
         if (phi.Operands.Count < 2 || phi.Operands[0] is not LocalVariable destination)
             return false;
 
+        var changed = NormalizeNullPhiInputs(phi, definitions);
+        if (phi.Operands.Skip(1).Any(input => input is not LocalVariable and not Immediate { Value: 0 }))
+            return changed;
+
         var inputs = phi.Operands.Skip(1).OfType<LocalVariable>().ToArray();
-        if (inputs.Length != phi.Operands.Count - 1 || inputs.Length == 0)
-            return false;
+        if (inputs.Length == 0)
+            return changed;
 
         var knownInputs = inputs.Where(input => input.Type != null).ToArray();
 
@@ -1096,14 +1118,17 @@ public static class LocalVariables
         if (destination.Type == null)
         {
             if (knownInputs.Length != inputs.Length || knownInputs.Length == 0)
-                return false;
+                return changed;
 
             var inputType = knownInputs[0].Type!;
             if (knownInputs.All(input => ReferenceEquals(input.Type, inputType)))
-                return SetTypeIfUnknown(destination, inputType);
+                return SetTypeIfUnknown(destination, inputType) || changed;
+
+            if (knownInputs.All(input => SameRuntimeHandleType(inputType, input.Type!)))
+                return SetTypeIfUnknown(destination, inputType) || changed;
 
             if (knownInputs.Any(input => !CanJoinReferenceTypes(input.Type!)))
-                return false;
+                return changed;
 
             for (var candidate = inputType; candidate != null; candidate = candidate.BaseType)
             {
@@ -1111,32 +1136,79 @@ public static class LocalVariables
                     continue;
 
                 if (knownInputs.All(input => input.Type == candidate || input.Type!.IsAssignableTo(candidate)))
-                    return SetTypeIfUnknown(destination, candidate);
+                    return SetTypeIfUnknown(destination, candidate) || changed;
             }
 
-            return false;
+            return changed;
         }
 
         // Backward: a base/interface type on the result can safely type an unknown reference
         // input when every known input is assignable to it. Value and synthetic pointer types
         // still require an exact match to avoid conflating handles with managed objects.
         if (knownInputs.Length == 0)
-            return false;
+            return changed;
 
         var destinationType = destination.Type;
         var canPropagateToUnknowns = knownInputs.All(input =>
             ReferenceEquals(input.Type, destinationType)
+            || SameRuntimeHandleType(destinationType, input.Type!)
             || CanJoinReferenceTypes(input.Type!)
                 && CanJoinReferenceTypes(destinationType)
                 && input.Type!.IsAssignableTo(destinationType));
         if (!canPropagateToUnknowns)
-            return false;
+            return changed;
 
-        var changed = false;
         foreach (var input in inputs)
             changed |= SetTypeIfUnknown(input, destinationType);
         return changed;
     }
+
+    // A native metadata pointer can merge with integer zero in a shared IL2CPP body.
+    // Turn only proven zero-only local inputs into constants on that phi edge, then infer
+    // the merged type from its remaining typed inputs.
+    private static bool NormalizeNullPhiInputs(Instruction phi,
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        var hasReferenceInput = phi.Operands.Skip(1).OfType<LocalVariable>()
+            .Any(input => input.Type is { } type && (CanJoinReferenceTypes(type)
+                || type is RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext));
+        if (!hasReferenceInput)
+            return false;
+
+        var changed = false;
+        for (var i = 1; i < phi.Operands.Count; i++)
+        {
+            if (phi.Operands[i] is not LocalVariable local || !IsZeroValue(local, definitions, []))
+                continue;
+
+            phi.SetOperand(i, new Immediate(0));
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    private static bool IsZeroValue(IOperand operand, Dictionary<LocalVariable, Instruction?> definitions,
+        HashSet<LocalVariable> seen)
+    {
+        if (operand is Immediate { Value: 0 })
+            return true;
+
+        return operand is LocalVariable local && seen.Add(local)
+            && definitions.TryGetValue(local, out var definition)
+            && definition is { OpCode: OpCode.Move, Operands: [LocalVariable, var source] }
+            && IsZeroValue(source, definitions, seen);
+    }
+
+    private static bool SameRuntimeHandleType(TypeAnalysisContext left, TypeAnalysisContext right) =>
+        (left, right) switch
+        {
+            (RuntimeMethodInfoAnalysisContext a, RuntimeMethodInfoAnalysisContext b) =>
+                ReferenceEquals(a.RepresentedMethod, b.RepresentedMethod),
+            (RuntimeFieldInfoAnalysisContext a, RuntimeFieldInfoAnalysisContext b) =>
+                ReferenceEquals(a.RepresentedField, b.RepresentedField),
+            _ => false,
+        };
 
     private static bool CanJoinReferenceTypes(TypeAnalysisContext type) =>
         !type.IsValueType

@@ -137,6 +137,9 @@ public static class IlGenerator
         Dictionary<Block, CilInstruction> blockEntryMap = [];
         List<(CilInstruction BranchInstruction, Block TargetBlock)> pendingBlockBranchFixups = [];
         HashSet<LocalVariable>? fieldReadLocals = null;
+        var graphUsedLocals = new HashSet<LocalVariable>();
+        foreach (var graphInstruction in graph.Instructions)
+            graphUsedLocals.UnionWith(DeadCodeEliminator.UsedLocals(graphInstruction));
 
         var isIteratorMoveNext = context.Name == "MoveNext" && context.DeclaringType is { } declaringType
             && IteratorFactoryRecovery.IsIteratorType(declaringType);
@@ -150,7 +153,8 @@ public static class IlGenerator
 
             foreach (var instruction in block.Instructions)
             {
-                var generated = GenerateInstructions(instruction, context, definition, locals, writeLine, instructionMap);
+                var generated = GenerateInstructions(instruction, context, definition, locals, writeLine,
+                    instructionMap, graphUsedLocals);
                 instructionMap.Add(instruction, generated);
 
                 if (instruction is { OpCode: OpCode.Move, Operands:
@@ -287,6 +291,7 @@ public static class IlGenerator
         CilBranchCleanup.Run(body);
         // The expression passes can leave their original constant stack-slot initializer unread.
         RemoveUnreadSimpleLocalStores(body);
+        RemoveDeadLocalAssignments(body, instructionMap, locals);
         SetRecoveredMaxStack(body);
     }
 
@@ -310,6 +315,58 @@ public static class IlGenerator
         // are a safe upper bound throughout this pass.
         return locals.Where(pair => readOnce.Contains(pair.Value) && !ineligible.Contains(pair.Value))
             .ToDictionary(pair => pair.Key, pair => pair.Value);
+    }
+
+    private static void RemoveDeadLocalAssignments(CilMethodBody body,
+        Dictionary<Instruction, List<CilInstruction>> instructionMap,
+        Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        var readLocals = new HashSet<CilLocalVariable>();
+        foreach (var instruction in body.Instructions)
+        {
+            if (instruction.Operand is CilLocalVariable local
+                && instruction.OpCode.Code is CilCode.Ldloc or CilCode.Ldloc_S or CilCode.Ldloca or CilCode.Ldloca_S)
+                readLocals.Add(local);
+            else
+            {
+                var localIndex = instruction.OpCode.Code switch
+                {
+                    CilCode.Ldloc_0 => 0,
+                    CilCode.Ldloc_1 => 1,
+                    CilCode.Ldloc_2 => 2,
+                    CilCode.Ldloc_3 => 3,
+                    _ => -1,
+                };
+                if (localIndex >= 0 && localIndex < body.LocalVariables.Count)
+                    readLocals.Add(body.LocalVariables[localIndex]);
+            }
+        }
+
+        foreach (var pair in instructionMap)
+        {
+            var source = pair.Key;
+            var generated = pair.Value;
+            if (source is not { OpCode: OpCode.Move, Operands: [LocalVariable destination, var value] }
+                || !locals.TryGetValue(destination, out var cilLocal)
+                || readLocals.Contains(cilLocal))
+                continue;
+
+            var pureValue = value is LocalVariable or Immediate or StringLiteral or FloatLiteral or DoubleLiteral or TypeAnalysisContext;
+            var diagnosticCall = value is MemoryOperand
+                ? generated.FindLastIndex(emitted => emitted.OpCode.Code is CilCode.Call or CilCode.Callvirt)
+                : -1;
+            if (!pureValue && diagnosticCall < 0)
+                continue;
+
+            // Keep any unsupported-read diagnostic, but drop its dead typed placeholder. Pure
+            // native-only handle stores can be erased entirely; nops preserve branch labels.
+            var firstInstructionToRemove = diagnosticCall >= 0 ? diagnosticCall + 1 : 0;
+            for (var i = firstInstructionToRemove; i < generated.Count; i++)
+            {
+                generated[i].OpCode = CilOpCodes.Nop;
+                generated[i].Operand = null;
+            }
+        }
     }
 
     private static void InlineRepeatedFieldReads(ISILControlFlowGraph graph,
@@ -1528,7 +1585,7 @@ public static class IlGenerator
 
     private static List<CilInstruction> GenerateInstructions(Instruction instruction, MethodAnalysisContext context,
         MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
-        Dictionary<Instruction, List<CilInstruction>> instructionMap)
+        Dictionary<Instruction, List<CilInstruction>> instructionMap, HashSet<LocalVariable> graphUsedLocals)
     {
         var body = method.CilMethodBody!;
         var instructions = body.Instructions;
@@ -2053,7 +2110,7 @@ public static class IlGenerator
                 // Keep the IL stack and local assignment valid when the return register has a
                 // known destination but call-target recovery failed. Without this, callers can
                 // decompile to an unassigned local followed by a return or condition on that local.
-                if (instruction.Destination is LocalVariable indirectResult)
+                if (instruction.Destination is LocalVariable indirectResult && graphUsedLocals.Contains(indirectResult))
                 {
                     var resultType = indirectResult.Type ?? context.AppContext.SystemTypes.SystemObjectType;
                     PushDefaultOf(resultType, method);
@@ -2686,6 +2743,16 @@ public static class IlGenerator
 
         // A null reference reaches us as an integer zero, which would otherwise be emitted as a literal 0
         // and read back as a cast from a number.
+        if ((expectedType is RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
+                or RuntimeFieldInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext
+                or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext)
+            && IsZeroConstant(operand))
+        {
+            instructions.Add(CilOpCodes.Ldc_I4_0);
+            instructions.Add(CilOpCodes.Conv_I);
+            return;
+        }
+
         if (expectedType is { IsValueType: false } && IsZeroConstant(operand))
         {
             instructions.Add(CilOpCodes.Ldnull);
