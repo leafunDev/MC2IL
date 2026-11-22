@@ -789,7 +789,8 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                     {
                         var first = Add(address, OpCode.Move, MemOperand(), ConvertOperand(instruction, 0));
                         var second = Add(address, OpCode.Move, MemOperand(pairSize), ConvertOperand(instruction, 1));
-                        if (instruction.Op0Reg is >= Arm64Register.S0 and <= Arm64Register.S31
+                        if (instruction.Op0Reg is >= Arm64Register.V0 and <= Arm64Register.V31
+                            or >= Arm64Register.S0 and <= Arm64Register.S31
                             or >= Arm64Register.D0 and <= Arm64Register.D31)
                             first.MemoryAccessSize = second.MemoryAccessSize = pairSize;
                         else
@@ -805,7 +806,8 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                     {
                         // The two S/D destinations receive separate scalar loads. Keep
                         // their widths so offset zero resolves to the first nested field.
-                        int? scalarSize = instruction.Op0Reg is >= Arm64Register.S0 and <= Arm64Register.S31
+                        int? scalarSize = instruction.Op0Reg is >= Arm64Register.V0 and <= Arm64Register.V31
+                            or >= Arm64Register.S0 and <= Arm64Register.S31
                             or >= Arm64Register.D0 and <= Arm64Register.D31 ? pairSize : null;
                         if (instruction.Op0Kind == Arm64OperandKind.Register && IsReg31(instruction.Op0Reg))
                             Add(address, OpCode.Nop); // discard the first loaded value into WZR/XZR

@@ -395,6 +395,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Indirect jumps/calls should probably be resolved here before stack analysis
 
         StackAnalyzer.Analyze(this);
+        Arm64StackValueRecovery.Run(this);
         ValueTypeReceiverRecovery.BindStackConstructorReceivers(this);
 
         // Dominator info must be computed after stack analysis, which removes unreachable/empty

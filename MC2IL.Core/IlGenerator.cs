@@ -2268,6 +2268,14 @@ public static class IlGenerator
             return;
 
         var destination = move.Operands[0];
+        // A native word load/store can copy an entire small struct. Once both ends are
+        // typed as that struct, CIL must preserve the value without a numeric conversion.
+        if (OperandType(destination) is { IsValueType: true, IsEnumType: false } valueType
+            && valueType.Type is LibMC2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE
+                or LibMC2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST
+            && MetadataResolver.IsSameType(valueType, OperandType(move.Operands[1])))
+            return;
+
         // CIL uses the same stack width for both signed and unsigned 32-bit values.
         // An extra conv.u4 hides direct parameter and constant stores from iterator recovery.
         if (OperandType(destination)?.FullName is "System.Int32" or "System.UInt32"
