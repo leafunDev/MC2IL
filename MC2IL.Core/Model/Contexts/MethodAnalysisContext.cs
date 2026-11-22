@@ -506,6 +506,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         Simplifier.Simplify(this);
 
         Arm64ZeroStoreRecovery.Run(this);
+        // Zero-store recovery can finish typing constructor-inlined field initializers.
+        TrivialConstructorRecovery.RecoverInlinedFieldConstructors(this);
 
         // Fix float literals
         FloatLiteralRecovery.Run(this);

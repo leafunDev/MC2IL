@@ -271,9 +271,18 @@ public static class InjectedCheckRemover
 
         // The allocation helper ends its native basic block. The null test can be the
         // first operation of the next block, provided that edge has no alternate entry.
-        if (!ReferenceEquals(InstructionsBefore(checkedBlock, comparison)
-                .FirstOrDefault(instruction => instruction.OpCode is not (OpCode.Nop or OpCode.Jump)), allocation))
-            return false;
+        var preceding = InstructionsBefore(checkedBlock, comparison)
+            .Where(instruction => instruction.OpCode is not (OpCode.Nop or OpCode.Jump)).ToArray();
+        if (ReferenceEquals(preceding.FirstOrDefault(), allocation))
+            return true;
+
+        if (preceding.Length >= 2
+            && preceding[0] is { OpCode: OpCode.CallVoid, Operands: [MethodAnalysisContext
+                { Name: ".ctor", IsStatic: false, DeclaringType: { } calledType }, LocalVariable constructorReceiver, ..] }
+            && ReferenceEquals(constructorReceiver, local)
+            && MetadataResolver.IsSameType(calledType, allocatedType)
+            && ReferenceEquals(preceding[1], allocation))
+            return true;
 
         if (FirstManagedOperation(continuation, defOf, out var singleEntryPath) is not { } constructorCall
             || !singleEntryPath
