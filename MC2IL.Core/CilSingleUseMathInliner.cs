@@ -39,25 +39,42 @@ internal static class CilSingleUseMathInliner
 
         var starts = new bool[instructions.Count];
         starts[0] = true;
+        var successors = new int[instructions.Count][];
+        var predecessorCounts = new int[instructions.Count];
+        var branchTargetCounts = new int[instructions.Count];
         var addressedArguments = new HashSet<object>();
         for (var i = 0; i < instructions.Count; i++)
         {
             var instruction = instructions[i];
+            var next = i + 1 < instructions.Count ? i + 1 : -1;
             if (instruction.Operand is ICilLabel label)
             {
                 if (label is not CilInstructionLabel { Instruction: { } target }
                     || !position.TryGetValue(target, out var index))
                     return;
                 starts[index] = true;
+                branchTargetCounts[index]++;
+                successors[i] = instruction.OpCode.Code == CilCode.Br ? [index]
+                    : next < 0 ? [index] : [index, next];
             }
             else if (instruction.Operand is IEnumerable<ICilLabel>)
             {
                 return;
             }
+            else if (instruction.OpCode.FlowControl is CilFlowControl.Return or CilFlowControl.Throw)
+            {
+                successors[i] = [];
+            }
+            else
+            {
+                successors[i] = next < 0 ? [] : [next];
+            }
 
             if (instruction.OpCode.FlowControl is not (CilFlowControl.Next or CilFlowControl.Call)
                 && i + 1 < instructions.Count)
                 starts[i + 1] = true;
+            foreach (var successor in successors[i])
+                predecessorCounts[successor]++;
 
             if (instruction.OpCode.Code is CilCode.Ldarga or CilCode.Ldarga_S or CilCode.Starg or CilCode.Starg_S
                 && instruction.Operand is { } argument)
@@ -90,27 +107,34 @@ internal static class CilSingleUseMathInliner
 
         var suppressed = new bool[instructions.Count];
         var expansions = new Dictionary<int, List<CilInstruction>>();
-        var candidates = slots.Values.Where(slot => !slot.MultipleAccesses && slot.Store >= 0 && slot.Load > slot.Store)
+        var candidates = slots.Values.Where(slot => !slot.MultipleAccesses && slot.Store >= 0 && slot.Load >= 0)
             .OrderBy(slot => slot.Store);
         foreach (var slot in candidates)
         {
             var first = enclosingBlock[slot.Store];
-            // Do not move even pure arithmetic through branches, calls or writes to
-            // escaping storage. Both sides must be in the same straight-line region.
-            if (first != enclosingBlock[slot.Load] || slot.Load - slot.Store > 128)
-                continue;
-
             var scratchStores = new HashSet<CilLocalVariable>();
             var safe = true;
-            for (var i = slot.Store + 1; i < slot.Load; i++)
+            IEnumerable<int> gap;
+            if (first == enclosingBlock[slot.Load])
+            {
+                if (slot.Load <= slot.Store || slot.Load - slot.Store > 128)
+                    continue;
+                gap = Enumerable.Range(slot.Store + 1, slot.Load - slot.Store - 1);
+            }
+            else if (!TryGetStraightLineGap(slot.Store, slot.Load, out gap))
+            {
+                continue;
+            }
+
+            foreach (var i in gap)
             {
                 if (suppressed[i])
                     continue;
                 var instruction = instructions[i];
                 if (instruction.OpCode == CilOpCodes.Stloc && instruction.Operand is CilLocalVariable stored)
                     scratchStores.Add(stored);
-                // Producer loads are checked against those stores below. Calls and indirect
-                // writes are excluded because they can modify an input through an alias.
+                // Across blocks, follow only a unique chain of unconditional branches.
+                // Calls and other writes could change the inputs before the expression is used.
                 else if (!IsNonWriting(instruction.OpCode.Code))
                 {
                     safe = false;
@@ -154,6 +178,9 @@ internal static class CilSingleUseMathInliner
 
                 if (!IsFloatingExpression(expression))
                     break;
+                if (expression.Any(IsSingleFloatPropertyGetter)
+                    && gap.Any(index => instructions[index].OpCode.Code == CilCode.Ldfld))
+                    break;
 
                 expression.Insert(0, new CilInstruction(slot.StorageConversion));
                 expression.Reverse();
@@ -176,13 +203,39 @@ internal static class CilSingleUseMathInliner
                     && (instruction.Operand is not CilLocalVariable addressed || !addressed.VariableType.IsValueType
                         || scratchStores.Contains(addressed)))
                     return false;
-                var inputs = ScalarInputs(code);
+                var inputs = ScalarInputs(instruction);
                 if (inputs < 0)
                     return false;
                 depth += inputs - 1;
                 expression.Add(new CilInstruction(instruction.OpCode, instruction.Operand));
                 return depth >= 0;
             }
+        }
+
+        bool TryGetStraightLineGap(int storeIndex, int loadIndex, out IEnumerable<int> gap)
+        {
+            var path = new List<int>();
+            var visited = new HashSet<int>();
+            var current = storeIndex + 1;
+            while (current >= 0 && current < instructions.Count && path.Count <= 128)
+            {
+                if (current == loadIndex)
+                {
+                    gap = path;
+                    return predecessorCounts[current] == 1;
+                }
+                if (!visited.Add(current) || predecessorCounts[current] != 1)
+                    break;
+
+                path.Add(current);
+                if (successors[current].Length != 1
+                    || instructions[current].OpCode.Code == CilCode.Br && branchTargetCounts[successors[current][0]] != 1)
+                    break;
+                current = successors[current][0];
+            }
+
+            gap = [];
+            return false;
         }
 
         if (expansions.Count == 0)
@@ -228,7 +281,7 @@ internal static class CilSingleUseMathInliner
         {
             var instruction = reversed[i];
             var code = instruction.OpCode.Code;
-            switch (ScalarInputs(code))
+            switch (ScalarInputs(instruction))
             {
                 case 0:
                     types.Push(code == CilCode.Ldloca ? ValueKind.StructAddress
@@ -243,6 +296,12 @@ internal static class CilSingleUseMathInliner
                     {
                         if (value != ValueKind.StructAddress || instruction.Operand is not IFieldDescriptor
                             { Signature.FieldType.ElementType: ElementType.R4 or ElementType.R8 })
+                            return false;
+                        types.Push(ValueKind.Float);
+                    }
+                    else if (code is CilCode.Call or CilCode.Callvirt && IsSingleFloatPropertyGetter(instruction))
+                    {
+                        if (value == ValueKind.StructAddress)
                             return false;
                         types.Push(ValueKind.Float);
                     }
@@ -274,8 +333,31 @@ internal static class CilSingleUseMathInliner
 
     private enum ValueKind { Other, Float, StructAddress }
 
+    private static int ScalarInputs(CilInstruction instruction)
+    {
+        if (IsSingleFloatPropertyGetter(instruction))
+            return 1;
+
+        if (instruction.OpCode.Code == CilCode.Call && instruction.Operand is IMethodDescriptor method
+            && method.DeclaringType?.FullName == "UnityEngine.Mathf"
+            && method.Name is { } name
+            && method.Signature is { HasThis: false, ReturnType.ElementType: ElementType.R4 } signature
+            && signature.ParameterTypes.All(parameter => parameter.ElementType == ElementType.R4)
+            && (name.ToString() is "Abs" or "Sqrt" or "Clamp01" && signature.ParameterTypes.Count == 1
+                || name.ToString() is "Min" or "Max" && signature.ParameterTypes.Count == 2))
+            return signature.ParameterTypes.Count;
+
+        return ScalarInputs(instruction.OpCode.Code);
+    }
+
+    private static bool IsSingleFloatPropertyGetter(CilInstruction instruction) =>
+        instruction.OpCode.Code is CilCode.Call or CilCode.Callvirt
+        && instruction.Operand is IMethodDescriptor method
+        && method.Name is { } name && name.ToString().StartsWith("get_", StringComparison.Ordinal)
+        && method.Signature is { HasThis: true, ParameterTypes.Count: 0, ReturnType.ElementType: ElementType.R4 };
+
     private static bool IsNonWriting(CilCode code) => ScalarInputs(code) >= 0
-        || code is CilCode.Nop or CilCode.Ldfld or CilCode.Ldloca or CilCode.Ldarg_0 or CilCode.Ldarg_1
+        || code is CilCode.Nop or CilCode.Br or CilCode.Ldfld or CilCode.Ldloca or CilCode.Ldarg_0 or CilCode.Ldarg_1
             or CilCode.Ldarg_2 or CilCode.Ldarg_3 or CilCode.Ldarga or CilCode.Ldnull
             or CilCode.Ceq or CilCode.Cgt or CilCode.Cgt_Un or CilCode.Clt or CilCode.Clt_Un;
 
