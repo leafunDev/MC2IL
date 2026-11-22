@@ -325,6 +325,7 @@ public static class ArrayRecovery
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
         var int32 = method.AppContext.SystemTypes.SystemInt32Type;
+        var nonnegativeInductionValues = new HashSet<LocalVariable>();
         foreach (var guard in cfg.Blocks)
         {
             if (guard.Successors is not [var firstSuccessor, var secondSuccessor]
@@ -334,26 +335,14 @@ public static class ArrayRecovery
                 || !definitions.TryGetValue(condition, out var comparison)
                 || comparison is not { OpCode: OpCode.CheckGreaterOrEqual or OpCode.CheckLess
                     or OpCode.CheckGreaterOrEqualUnsigned or OpCode.CheckLessUnsigned,
-                    Operands: [_, LocalVariable { Type: null } index, var length] }
+                    Operands: [_, LocalVariable index, var length] }
+                || index.Type != null && index.Type != int32
                 || !definitions.TryGetValue(index, out var phi)
                 || phi is not { OpCode: OpCode.Phi, Operands: [_, var firstInput, var secondInput] }
                 || cfg.FindBlockByInstruction(phi) is not { Predecessors: [var firstPredecessor, var secondPredecessor] } header)
                 continue;
 
-            var array = length switch
-            {
-                ArrayLength direct => direct.Array,
-                LocalVariable local when definitions.TryGetValue(local, out var load) => load switch
-                {
-                    { OpCode: OpCode.Move, Operands: [_, ArrayLength arrayLength] } => arrayLength.Array,
-                    { OpCode: OpCode.Move, MemoryAccessSize: 4, Operands: [_, MemoryOperand
-                        { Base: LocalVariable arrayBase, Index: null, Scale: 0 } memory] }
-                        when memory.Addend == LengthOffset(pointerSize) => arrayBase,
-                    _ => null,
-                },
-                _ => null,
-            };
-            if (array == null || ResolveArrayType(array, definitions, [], 0) == null)
+            if (!IsNonnegativeInt32Value(length, pointerSize, definitions, nonnegativeInductionValues, [], 0))
                 continue;
 
             var inRange = comparison.OpCode is OpCode.CheckLess or OpCode.CheckLessUnsigned
@@ -367,15 +356,23 @@ public static class ArrayRecovery
             // The native counter remains in Int32 range even if it uses a 64-bit
             // register: the back-edge increments only after i < array.Length. The
             // array check can be inside a loop whose exit tests a different bound.
-            if (TryTypeIndex(firstInput, secondInput, firstPredecessor, secondPredecessor)
+            var hasNonnegativeInductionProof = TryTypeIndex(firstInput, secondInput, firstPredecessor, secondPredecessor)
                 || TryTypeIndex(secondInput, firstInput, secondPredecessor, firstPredecessor)
                 || HasPositiveCountBoundedIndex(index, firstInput, secondInput, header,
-                    cfg.Instructions, cfg, definitions, dominance))
+                    cfg.Instructions, cfg, definitions, dominance);
+            if (hasNonnegativeInductionProof)
+            {
                 index.Type = int32;
+            }
 
             bool TryTypeIndex(IOperand seed, IOperand backEdge, Block seedBlock, Block latch)
             {
-                if (seed is not Immediate { Value: >= 0 and <= int.MaxValue }
+                var hasNonnegativeSeed = seed is Immediate { Value: >= 0 and <= int.MaxValue }
+                    || seed is LocalVariable seedLocal
+                        && definitions.TryGetValue(seedLocal, out var seedDefinition)
+                        && seedDefinition is { OpCode: OpCode.Move,
+                            Operands: [_, Immediate { Value: >= 0 and <= int.MaxValue }] };
+                if (!hasNonnegativeSeed
                     || backEdge is not LocalVariable next || next.Type != null && next.Type != int32
                     || !definitions.TryGetValue(next, out var increment)
                     || increment is not { OpCode: OpCode.Add, Operands.Count: 3 }
@@ -386,9 +383,64 @@ public static class ArrayRecovery
                     return false;
 
                 next.Type = int32;
+                nonnegativeInductionValues.Add(index);
+                nonnegativeInductionValues.Add(next);
                 return true;
             }
         }
+
+        // Native code can repeat a bounds check after a branch or after reloading Length.
+        // Once the induction proof establishes the index and its increment as nonnegative,
+        // normalize every unsigned comparison whose other operand is nonnegative as well.
+        foreach (var comparison in cfg.Instructions)
+        {
+            if (comparison.OpCode is not (OpCode.CheckGreaterUnsigned or OpCode.CheckLessUnsigned
+                    or OpCode.CheckGreaterOrEqualUnsigned or OpCode.CheckLessOrEqualUnsigned)
+                || comparison.Operands.Count < 3
+                || !IsNonnegativeInt32Value(comparison.Operands[1], pointerSize, definitions,
+                    nonnegativeInductionValues, [], 0)
+                || !IsNonnegativeInt32Value(comparison.Operands[2], pointerSize, definitions,
+                    nonnegativeInductionValues, [], 0))
+                continue;
+
+            comparison.OpCode = comparison.OpCode switch
+            {
+                OpCode.CheckGreaterUnsigned => OpCode.CheckGreater,
+                OpCode.CheckLessUnsigned => OpCode.CheckLess,
+                OpCode.CheckGreaterOrEqualUnsigned => OpCode.CheckGreaterOrEqual,
+                OpCode.CheckLessOrEqualUnsigned => OpCode.CheckLessOrEqual,
+                _ => comparison.OpCode,
+            };
+        }
+    }
+
+    private static bool IsNonnegativeInt32Value(IOperand operand, int pointerSize,
+        Dictionary<LocalVariable, Instruction?> definitions, HashSet<LocalVariable> knownNonnegative,
+        HashSet<LocalVariable> seen, int depth)
+    {
+        if (depth > 12)
+            return false;
+        if (operand is Immediate immediate)
+            return immediate.Value is >= 0 and <= int.MaxValue;
+        if (operand is ArrayLength)
+            return true;
+        if (operand is MemoryOperand { Base: LocalVariable array, Index: null, Scale: 0, Addend: var offset })
+            return offset == LengthOffset(pointerSize) && ResolveArrayType(array, definitions, [], 0) != null;
+        if (operand is not LocalVariable local)
+            return false;
+        if (knownNonnegative.Contains(local))
+            return true;
+        if (!seen.Add(local) || !definitions.TryGetValue(local, out var definition) || definition == null)
+            return false;
+
+        if (definition is { OpCode: OpCode.Move, Operands: [_, var source] })
+            return IsNonnegativeInt32Value(source, pointerSize, definitions, knownNonnegative,
+                new HashSet<LocalVariable>(seen), depth + 1);
+        if (definition is not { OpCode: OpCode.Phi } || definition.Operands.Count < 2)
+            return false;
+
+        return definition.Operands.Skip(1).All(source => IsNonnegativeInt32Value(source, pointerSize,
+            definitions, knownNonnegative, new HashSet<LocalVariable>(seen), depth + 1));
     }
 
     private static bool HasPositiveCountBoundedIndex(LocalVariable index, IOperand firstInput, IOperand secondInput,
