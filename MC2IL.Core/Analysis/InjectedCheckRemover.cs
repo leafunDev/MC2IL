@@ -453,6 +453,15 @@ public static class InjectedCheckRemover
         {
             foreach (var instruction in current.Instructions)
             {
+                // A native null-check helper can be shared by several receivers in one
+                // method. If a later guard still throws the same NullReferenceException,
+                // that path preserves the observable outcome of this check too; requiring
+                // every path to dereference this exact receiver leaves redundant guards and
+                // turns the shared helper into a spurious source-level throw.
+                if (instruction is { OpCode: OpCode.Throw,
+                        Operands: [TypeAnalysisContext { FullName: "System.NullReferenceException" }] })
+                    return true;
+
                 if (instruction.OpCode is OpCode.Nop or OpCode.Jump)
                 {
                     pathInstructions.Add(instruction);
@@ -474,8 +483,22 @@ public static class InjectedCheckRemover
                 }
 
                 if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, var fieldSource] }
-                    && IsSafeFieldRead(fieldSource, knownNonNullThis))
+                    && (IsSafeFieldRead(fieldSource, knownNonNullThis) || IsDirectThisFieldRead(fieldSource)))
                 {
+                    pathInstructions.Add(instruction);
+                    continue;
+                }
+
+                if (instruction is { IsCall: true, Operands: [MethodAnalysisContext getter, ..] }
+                    && InlinedFieldGetterRecovery.IsVerifiedDirectGetter(getter))
+                {
+                    if (IsImplicitNullCheckOperation(instruction, receiver, defOf, arraysOnly,
+                            knownNonNullThis, pathInstructions, callsNeedingNullCheck))
+                        return true;
+
+                    // ARM64 may inline an auto-property's field load and then recover it as a
+                    // verified getter call. Crossing that read is safe: it has no side effects,
+                    // and a null getter receiver already raises the same exception.
                     pathInstructions.Add(instruction);
                     continue;
                 }
@@ -531,12 +554,12 @@ public static class InjectedCheckRemover
             && SameValueOnPath(receiver, field.Local, pathInstructions, defOf))
             return true;
 
-        // A direct CIL call can enter a nonvirtual instance method on a null receiver. Use
-        // callvirt for its null check only when it cannot change the method being invoked.
+        // The native guard was emitted for a source-level instance call. Marking the
+        // recovered call to retain its null check lets IL generation use callvirt, which
+        // also preserves virtual dispatch when the target is virtual.
         if (!operation.IsCall
-            || operation.Operands[0] is not MethodAnalysisContext { IsStatic: false, DeclaringType: { IsValueType: false } owner } target
-            || target.Name == ".ctor"
-            || !operation.NullCheckReceiver && target.IsVirtual && !target.IsFinal && !owner.IsSealed)
+            || operation.Operands[0] is not MethodAnalysisContext { IsStatic: false, DeclaringType.IsValueType: false } target
+            || target.Name == ".ctor")
             return false;
 
         var receiverIndex = operation.OpCode == OpCode.CallVoid ? 1 : 2;
@@ -683,6 +706,10 @@ public static class InjectedCheckRemover
         knownNonNullThis != null
         && operand is FieldReference { Parent: null, Field.IsStatic: false } field
         && ReferenceEquals(field.Local, knownNonNullThis)
+        && field.Field.FieldType is not CustomModifierTypeAnalysisContext;
+
+    private static bool IsDirectThisFieldRead(IOperand operand) =>
+        operand is FieldReference { Parent: null, Local.IsThis: true, Field.IsStatic: false } field
         && field.Field.FieldType is not CustomModifierTypeAnalysisContext;
 
     private static IOperand? FirstAccess(Instruction operation)
