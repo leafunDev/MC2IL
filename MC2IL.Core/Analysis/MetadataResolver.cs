@@ -499,7 +499,7 @@ public static class MetadataResolver
 
                 // ARM64 often computes the base of an inline struct once, then loads
                 // several fields through it. Recover the original object and byte offset.
-                if ((local.Type == null || local.Type.FullName is "System.IntPtr" or "System.UIntPtr")
+                if ((local.Type == null || local.Type.FullName is "System.IntPtr" or "System.UIntPtr" or "System.Int64" or "System.UInt64")
                     && method.AppContext.InstructionSet is NewArmV8InstructionSet)
                 {
                     fieldAddresses ??= FindFieldAddresses(instructions);
@@ -661,9 +661,7 @@ public static class MetadataResolver
                 return null;
 
             (LocalVariable Base, long Offset)? address = null;
-            if (local.Type is { } type && IlGenerator.IsManagedReference(type))
-                address = (local, 0);
-            else if (definitions.TryGetValue(local, out var definition) && definition.OperandWidth != 32)
+            if (definitions.TryGetValue(local, out var definition) && definition.OperandWidth != 32)
             {
                 if (definition is { OpCode: OpCode.Add, Operands: [_, LocalVariable baseLocal, Immediate offset] }
                     && offset.Value >= 0 && Resolve(baseLocal) is { } parent
@@ -685,6 +683,9 @@ public static class MetadataResolver
                     }
                 }
             }
+
+            if (address == null && local.Type is { } type && IlGenerator.IsManagedReference(type))
+                address = (local, 0);
 
             visited.Remove(local);
             if (address is { } found)

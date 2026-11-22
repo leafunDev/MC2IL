@@ -5,6 +5,7 @@ using System.Linq;
 using System.Reflection;
 using MC2IL.Core.Analysis;
 using MC2IL.Core.Graphs;
+using MC2IL.Core.InstructionSets;
 using MC2IL.Core.ISIL;
 using MC2IL.Core.Logging;
 using MC2IL.Core.Utils;
@@ -463,6 +464,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
         // make joins explicit, so forwarding a value is an unconditional global substitution.
         SsaSimplifier.Run(this);
+        if (AppContext.InstructionSet is NewArmV8InstructionSet)
+            MetadataResolver.ResolveFieldOffsets(this);
         FloatLiteralRecovery.RecoverTypedBitCopies(this);
         Arm64FloatFieldAddressRecovery.Run(this);
         ValueTypeReceiverRecovery.ResolveRefArgumentFieldAddresses(this);

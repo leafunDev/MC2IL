@@ -438,7 +438,8 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
             if (IsReg31(instruction.MemBase))
                 Add(address, OpCode.ShiftStack, Imm(instruction.MemOffset));
             else
-                Add(address, OpCode.Add, Reg(instruction.MemBase), Reg(instruction.MemBase), Imm(instruction.MemOffset));
+                // The writeback updates an X register even when the transferred data is a W register.
+                Add(address, OpCode.Add, Reg(instruction.MemBase), Reg(instruction.MemBase), Imm(instruction.MemOffset)).OperandWidth = 64;
         }
 
         // the memory operand for the current instruction's access, offset by extraOffset (for the second reg of a pair)
