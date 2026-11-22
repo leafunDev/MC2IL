@@ -987,8 +987,18 @@ public static class IlGenerator
                 && purePrefix;
             var canInlineDelegate = delegateParameter && producer.OpCode == OpCode.Newobj
                 && purePrefix && IsBoundDelegateExpression(producerIl);
+            // Moving an allocation to its sole call argument keeps its evaluation order when
+            // the producer is immediately before the call (as proven above) and the CIL stack
+            // prefix contains only loads. This avoids a throwaway local for `Try(new T(...))`.
+            var canInlineObjectCreation = !delegateParameter
+                && producer is { OpCode: OpCode.Newobj, Operands: [_, TypeAnalysisContext allocatedType] }
+                && argument.Type is { } argumentType
+                && MetadataResolver.IsSameType(argumentType, allocatedType)
+                && MetadataResolver.IsSameType(
+                    calledMethod.Parameters[operandIndex - firstArgument].ParameterType, allocatedType)
+                && purePrefix;
             if ((!canInlineCallResult && !canInlinePureExpression && !canInlineArrayElement
-                    && !canInlineValueField && !canInlineDelegate)
+                    && !canInlineValueField && !canInlineDelegate && !canInlineObjectCreation)
                 || !ProducesStandaloneStackValue(producerIl, body))
                 continue;
 
