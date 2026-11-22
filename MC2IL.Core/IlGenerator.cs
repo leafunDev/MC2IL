@@ -189,6 +189,7 @@ public static class IlGenerator
         // Recover direct field expressions when IL2CPP kept one field value alive across
         // a null guard and an immediate member read. Calls and writes form barriers.
         InlineRepeatedFieldReads(graph, instructionMap, locals, body);
+        RemoveDominatedStackSlotInitializers(graph, instructionMap);
         var inlineLocals = FindSingleUseCilLocals(body, locals);
         foreach (var block in graph.Blocks)
         {
@@ -284,6 +285,8 @@ public static class IlGenerator
 
         CilSingleUseMathInliner.Run(body, locals);
         CilBranchCleanup.Run(body);
+        // The expression passes can leave their original constant stack-slot initializer unread.
+        RemoveUnreadSimpleLocalStores(body);
         SetRecoveredMaxStack(body);
     }
 
@@ -780,9 +783,56 @@ public static class IlGenerator
             var isReceiver = consumer.IsCall && consumer.Operands[0] is MethodAnalysisContext { IsStatic: false }
                 && consumer.Operands.Count > ConstructorReceiverIndex(consumer)
                 && ReferenceEquals(consumer.Operands[ConstructorReceiverIndex(consumer)], localEntry.Key);
+            Func<Instruction, bool>? canCross = isReceiver
+                ? candidate => IsStackNeutralArgumentProducer(candidate, consumer, instructionMap, locals)
+                : candidate => IsStackNeutralThisFieldRead(candidate, instructionMap, locals);
             InlineSingleUseTemporary(block, consumerIndex, consumer, localEntry.Key, graph, instructionMap, locals,
-                isReceiver ? candidate => IsStackNeutralArgumentProducer(candidate, consumer, instructionMap, locals) : null);
+                canCross);
             return;
+        }
+    }
+
+    private static bool IsStackNeutralThisFieldRead(Instruction candidate,
+        Dictionary<Instruction, List<CilInstruction>> instructionMap,
+        Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        if (candidate is not { OpCode: OpCode.Move, Operands: [LocalVariable destination,
+                FieldReference { Field.IsStatic: false, Local.IsThis: true }] }
+            || !instructionMap.TryGetValue(candidate, out var emitted))
+            return false;
+
+        var meaningful = emitted.Where(instruction => instruction.OpCode != CilOpCodes.Nop).ToArray();
+        if (meaningful.Length == 0)
+            return true;
+
+        if (!locals.TryGetValue(destination, out var ilLocal))
+            return false;
+
+        return meaningful is
+            [{ OpCode: var receiverOpcode }, { OpCode: var fieldOpcode, Operand: var field },
+                { OpCode: var storeOpcode, Operand: var storedLocal }]
+            && receiverOpcode == CilOpCodes.Ldarg_0 && fieldOpcode == CilOpCodes.Ldfld
+            && field is IFieldDescriptor && storeOpcode == CilOpCodes.Stloc
+            && ReferenceEquals(storedLocal, ilLocal);
+    }
+
+    private static void RemoveDominatedStackSlotInitializers(ISILControlFlowGraph graph,
+        Dictionary<Instruction, List<CilInstruction>> instructionMap)
+    {
+        foreach (var initializer in graph.Instructions.ToArray())
+        {
+            if (initializer is not { OpCode: OpCode.Move, Operands:
+                    [LocalVariable { Register.Name: var name } local, Immediate { Value: 0 }] }
+                || !name.StartsWith("stack_", StringComparison.Ordinal))
+                continue;
+
+            var uses = graph.Instructions.Where(instruction => ReadsLocal(instruction, local)).ToArray();
+            if (!graph.Instructions.Any(definition => definition != initializer
+                    && ReferenceEquals(definition.Destination, local)
+                    && uses.All(use => InstructionDominates(graph, definition, use))))
+                continue;
+
+            SuppressGeneratedInstructions(initializer, instructionMap);
         }
     }
 
