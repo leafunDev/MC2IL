@@ -3,11 +3,13 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection.PortableExecutable;
+using System.Text.RegularExpressions;
 using AsmResolver.DotNet;
 using AssetRipper.CIL;
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.CSharp.ProjectDecompiler;
+using ICSharpCode.Decompiler.CSharp.Syntax;
 using ICSharpCode.Decompiler.Metadata;
 using MC2IL.Core.Api;
 using MC2IL.Core.Logging;
@@ -18,6 +20,33 @@ namespace MC2IL.ILanguageDecompiler;
 
 public sealed class CSharpOutputFormat : MC2ILOutputFormat
 {
+    private static readonly Regex CompilerGeneratedAttributeLine = new(
+        @"(?m)^[\t ]*\[(?:global::)?(?:System\.Runtime\.CompilerServices\.)?CompilerGenerated(?:Attribute)?\][\t ]*\r?\n",
+        RegexOptions.CultureInvariant);
+
+    private static readonly HashSet<string> InjectedAttributeNames = new(StringComparer.Ordinal)
+    {
+        "Attribute",
+        "Token",
+        "Address",
+        "FieldOffset",
+        "DeduplicatedMethod",
+        "ContainsInvalidInstructions",
+        "ContainsUnimplementedInstructions",
+        "CallAnalysisNotSupported",
+        "CallsDeduplicatedMethods",
+        "CallsUnknownMethods",
+        "CallerCount",
+        "Calls",
+        "CalledBy",
+    };
+
+    private static readonly HashSet<string> InjectedAttributeNamespaces = new(StringComparer.Ordinal)
+    {
+        "MC2ILInjected",
+        "MC2ILInjected.CallAnalysis",
+    };
+
     private readonly bool _keepDlls;
     private readonly string[] _assemblyNames;
 
@@ -167,10 +196,12 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
                 for (var suffix = 2; !usedPaths.Add(uniquePath); suffix++)
                     uniquePath = Path.Combine(directory, $"{stem}_{suffix}.cs");
 
-                var text = source.DecompileTypesAsString(new[] { handle });
+                var syntaxTree = source.DecompileTypes(new[] { handle });
+                RemoveInjectedAttributes(syntaxTree);
                 Directory.CreateDirectory(Path.Combine(outputDirectory, directory));
+                var sourceText = CompilerGeneratedLambdaRecovery.Rewrite(syntaxTree.ToString(settings.CSharpFormattingOptions));
                 File.WriteAllText(Path.Combine(outputDirectory, uniquePath),
-                    "// Scoped export: only selected method bodies were recovered." + Environment.NewLine + text);
+                    "// Scoped export: only selected method bodies were recovered." + Environment.NewLine + sourceText);
             }
 
             foreach (var type in remaining.OrderBy(type => type, StringComparer.Ordinal))
@@ -180,12 +211,64 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
 
         var decompiler = new SourceProjectDecompiler(settings, resolver);
         decompiler.DecompileProject(module, outputDirectory, TextWriter.Null);
+        RemoveCompilerGeneratedAttributes(outputDirectory);
 
         if (decompiler.Errors.Count > 0)
         {
             Logger.WarnNewline($"{module.Name}: {decompiler.Errors.Count} C# export errors. See the generated files or use --verbose for details.", "CSharpOutput");
             foreach (var error in decompiler.Errors)
                 Logger.VerboseNewline(error.ToString(), "CSharpOutput");
+        }
+    }
+
+    private static void RemoveInjectedAttributes(SyntaxTree syntaxTree)
+    {
+        var usingNamespaces = new HashSet<string>(syntaxTree.Descendants.OfType<UsingDeclaration>()
+            .Select(usingDirective => usingDirective.Import.ToString()), StringComparer.Ordinal);
+
+        foreach (var section in syntaxTree.Descendants.OfType<AttributeSection>().ToArray())
+        {
+            foreach (var attribute in section.Attributes.ToArray())
+            {
+                var typeName = attribute.Type.ToString();
+                var shortName = typeName.Split('.').Last();
+                var nameWithoutSuffix = shortName.EndsWith("Attribute", StringComparison.Ordinal)
+                    ? shortName.Substring(0, shortName.Length - "Attribute".Length)
+                    : shortName;
+                var namespaceName = typeName.Contains('.')
+                    ? typeName.Substring(0, typeName.LastIndexOf('.'))
+                    : null;
+
+                var isCompilerGenerated = nameWithoutSuffix == "CompilerGenerated"
+                    && (namespaceName == "System.Runtime.CompilerServices"
+                        || namespaceName == null && usingNamespaces.Contains("System.Runtime.CompilerServices"));
+                var isInjected = InjectedAttributeNames.Contains(nameWithoutSuffix)
+                    && (namespaceName != null
+                        ? InjectedAttributeNamespaces.Contains(namespaceName)
+                        : InjectedAttributeNamespaces.Overlaps(usingNamespaces));
+
+                if (isCompilerGenerated || isInjected)
+                    attribute.Remove();
+            }
+
+            if (section.Attributes.Count == 0)
+                section.Remove();
+        }
+
+        foreach (var usingDirective in syntaxTree.Descendants.OfType<UsingDeclaration>().ToArray())
+            if (InjectedAttributeNamespaces.Contains(usingDirective.Import.ToString()))
+                usingDirective.Remove();
+    }
+
+    private static void RemoveCompilerGeneratedAttributes(string outputDirectory)
+    {
+        foreach (var path in Directory.EnumerateFiles(outputDirectory, "*.cs", SearchOption.AllDirectories))
+        {
+            var source = File.ReadAllText(path);
+            var cleaned = CompilerGeneratedLambdaRecovery.Rewrite(source);
+            cleaned = CompilerGeneratedAttributeLine.Replace(cleaned, string.Empty);
+            if (!string.Equals(source, cleaned, StringComparison.Ordinal))
+                File.WriteAllText(path, cleaned);
         }
     }
 
@@ -211,3 +294,4 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
 
     public sealed class AssemblySelectionException(string message) : Exception(message);
 }
+
