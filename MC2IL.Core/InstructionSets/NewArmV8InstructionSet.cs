@@ -487,6 +487,34 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
             }
         }
 
+        IOperand ConvertLongMultiplySource(int operand, bool isSigned)
+        {
+            var sourceRegister = operand switch
+            {
+                1 => instruction.Op1Reg,
+                2 => instruction.Op2Reg,
+                _ => throw new ArgumentOutOfRangeException(nameof(operand)),
+            };
+            var source = ConvertOperand(instruction, operand);
+
+            // SMULL/UMULL and the long multiply-accumulate instructions consume W
+            // registers but produce an X-sized result. Preserve the distinction
+            // between sign and zero extension before the multiply.
+            if (sourceRegister is >= Arm64Register.W0 and <= Arm64Register.W30)
+            {
+                var extended = new Register(null, $"TEMP_LONG_MULTIPLY_EXTEND_{operand}");
+                var conversion = isSigned
+                    ? NumericConversionKind.I64ExtendI32Signed
+                    : NumericConversionKind.I64ExtendI32Unsigned;
+                Add(address, OpCode.Convert, extended, source, new NumericConversion(conversion));
+                return extended;
+            }
+
+            // WZR is represented as the immediate zero by ConvertOperand and
+            // needs no explicit conversion.
+            return source;
+        }
+
         Register ExtractLane(Arm64Register register, int lane)
         {
             var result = new Register(null, "TEMP_SIMD_EXTRACT");
@@ -1564,16 +1592,23 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                 }
             case Arm64Mnemonic.MUL:
             case Arm64Mnemonic.FMUL:
-            case Arm64Mnemonic.SMULL:
-            case Arm64Mnemonic.UMULL:
                 if (DiscardZeroRegisterDestination())
                     break;
 
                 AddFloatArithmetic(OpCode.Multiply);
                 break;
+            case Arm64Mnemonic.SMULL:
+            case Arm64Mnemonic.UMULL:
+                {
+                    if (DiscardZeroRegisterDestination())
+                        break;
+
+                    var isSigned = instruction.Mnemonic == Arm64Mnemonic.SMULL;
+                    Add(address, OpCode.Multiply, ConvertOperand(instruction, 0),
+                        ConvertLongMultiplySource(1, isSigned), ConvertLongMultiplySource(2, isSigned));
+                    break;
+                }
             case Arm64Mnemonic.MNEG:
-            case Arm64Mnemonic.SMNEGL:
-            case Arm64Mnemonic.UMNEGL:
             case Arm64Mnemonic.FNMUL:
                 {
                     if (DiscardZeroRegisterDestination())
@@ -1582,6 +1617,19 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
                     var dest = ConvertOperand(instruction, 0);
                     AddFloatArithmetic(OpCode.Multiply);
                     Add(address, OpCode.Negate, dest, dest);
+                    break;
+                }
+            case Arm64Mnemonic.SMNEGL:
+            case Arm64Mnemonic.UMNEGL:
+                {
+                    if (DiscardZeroRegisterDestination())
+                        break;
+
+                    var isSigned = instruction.Mnemonic == Arm64Mnemonic.SMNEGL;
+                    var product = new Register(null, "TEMP_LONG_NEGATE_PRODUCT");
+                    Add(address, OpCode.Multiply, product,
+                        ConvertLongMultiplySource(1, isSigned), ConvertLongMultiplySource(2, isSigned));
+                    Add(address, OpCode.Negate, ConvertOperand(instruction, 0), product);
                     break;
                 }
             case Arm64Mnemonic.MADD:
@@ -1596,8 +1644,13 @@ public class NewArmV8InstructionSet : MC2ILInstructionSet
 
                     // rd = ra +/- rn * rm
                     var isAdd = instruction.Mnemonic is Arm64Mnemonic.MADD or Arm64Mnemonic.SMADDL or Arm64Mnemonic.UMADDL;
+                    var isLong = instruction.Mnemonic is Arm64Mnemonic.SMADDL or Arm64Mnemonic.UMADDL
+                        or Arm64Mnemonic.SMSUBL or Arm64Mnemonic.UMSUBL;
+                    var isSigned = instruction.Mnemonic is Arm64Mnemonic.SMADDL or Arm64Mnemonic.SMSUBL;
                     var temp = new Register(null, "TEMP");
-                    Add(address, OpCode.Multiply, temp, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                    var left = isLong ? ConvertLongMultiplySource(1, isSigned) : ConvertOperand(instruction, 1);
+                    var right = isLong ? ConvertLongMultiplySource(2, isSigned) : ConvertOperand(instruction, 2);
+                    Add(address, OpCode.Multiply, temp, left, right);
                     Add(address, isAdd ? OpCode.Add : OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 3), temp);
                     break;
                 }
