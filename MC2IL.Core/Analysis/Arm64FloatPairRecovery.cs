@@ -29,6 +29,9 @@ internal static class Arm64FloatPairRecovery
                     uses.Add(local, readers = []);
                 readers.Add(instruction);
             }
+            // SSA merges do not access physical stack memory.
+            if (instruction.OpCode == OpCode.Phi)
+                continue;
             foreach (var operand in instruction.Operands)
             {
                 var slot = operand is AddressOf { Target: LocalVariable addressed } ? addressed : operand as LocalVariable;
@@ -103,8 +106,9 @@ internal static class Arm64FloatPairRecovery
                 if (value is not LocalVariable local)
                     return false;
                 if (FloatAggregateRecovery.TryGetStackOffset(local, out var offset)
-                    && (offset >= 0 || stackSlots[offset].Addressed || stackSlots.Any(other => other.Key != offset
-                        && other.Key < offset + stackSlots[offset].Width && other.Key + other.Value.Width > offset)))
+                    && (offset >= 0 || !stackSlots.TryGetValue(offset, out var slot) || slot.Addressed
+                        || stackSlots.Any(other => other.Key != offset && other.Key < offset + slot.Width
+                            && other.Key + other.Value.Width > offset)))
                     return false;
                 if (group.Add(local))
                     remaining.Enqueue(local);
