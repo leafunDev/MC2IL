@@ -186,9 +186,9 @@ public static class IlGenerator
 
         // Keep simple temporaries out of logging calls, conditions, and returns. Run this after
         // generating every block so a single-use value can also be traced across a call's fallthrough.
-        // Recover direct static Instance expressions when IL2CPP kept one field value alive
-        // across a null guard and one immediate member read. Calls and writes form barriers.
-        InlineRepeatedStaticInstanceReads(graph, instructionMap, locals, body);
+        // Recover direct field expressions when IL2CPP kept one field value alive across
+        // a null guard and an immediate member read. Calls and writes form barriers.
+        InlineRepeatedFieldReads(graph, instructionMap, locals, body);
         var inlineLocals = FindSingleUseCilLocals(body, locals);
         foreach (var block in graph.Blocks)
         {
@@ -309,15 +309,16 @@ public static class IlGenerator
             .ToDictionary(pair => pair.Key, pair => pair.Value);
     }
 
-    private static void InlineRepeatedStaticInstanceReads(ISILControlFlowGraph graph,
+    private static void InlineRepeatedFieldReads(ISILControlFlowGraph graph,
         Dictionary<Instruction, List<CilInstruction>> instructionMap,
         Dictionary<LocalVariable, CilLocalVariable> locals, CilMethodBody body)
     {
         foreach (var producer in graph.Instructions.ToArray())
         {
             if (producer is not { OpCode: OpCode.Move, Operands:
-                    [LocalVariable { Type: { } valueType } value,
-                        FieldReference { Parent: null, Field: { IsStatic: true, Name: "Instance" } } field] }
+                    [LocalVariable { Type: { } valueType } value, FieldReference { Parent: null } field] }
+                || !(field.Field.IsStatic && field.Field.Name == "Instance"
+                    || !field.Field.IsStatic && field.Local.IsThis)
                 || !IsManagedReference(valueType)
                 || !MetadataResolver.IsSameType(valueType, field.Field.FieldType)
                 || CountLocalUses(graph, value) != 2
@@ -327,7 +328,7 @@ public static class IlGenerator
                 continue;
 
             var uses = graph.Instructions.Where(instruction => ReadsLocal(instruction, value)).ToArray();
-            if (uses.Length != 2)
+            if (uses.Length < 2)
                 continue;
 
             var nullChecks = uses.Where(instruction => instruction is
@@ -341,34 +342,69 @@ public static class IlGenerator
 
             var nullCheck = nullChecks[0];
             var memberRead = memberReads[0];
-            if (nullCheck == memberRead
-                || !InstructionDominates(graph, nullCheck, memberRead)
-                || !CanRepeatStaticFieldReadBetween(graph, producer, nullCheck)
-                || !CanRepeatStaticFieldReadBetween(graph, nullCheck, memberRead))
+            var hiddenReads = uses.Where(instruction => instruction != nullCheck && instruction != memberRead).ToArray();
+            var dominates = InstructionDominates(graph, nullCheck, memberRead);
+            var safeProducer = CanRepeatFieldReadBetween(graph, producer, nullCheck);
+            var safeUse = CanRepeatFieldReadBetween(graph, nullCheck, memberRead);
+            if (nullCheck == memberRead || !dominates || !safeProducer || !safeUse
+                || hiddenReads.Any(instruction => !IsDiscardableInstanceHeaderRead(graph, instruction, value)))
                 continue;
 
             if (!locals.TryGetValue(value, out var ilLocal)
                 || !instructionMap.TryGetValue(producer, out var producerIl)
-                || producerIl.Where(instruction => instruction.OpCode != CilOpCodes.Nop).ToArray() is not
-                    [{ OpCode: var loadOpcode, Operand: var loadField }, { OpCode: var storeOpcode, Operand: var storedLocal }]
-                || loadOpcode != CilOpCodes.Ldsfld || loadField != field.Field.ToFieldDescriptor()
-                || storeOpcode != CilOpCodes.Stloc || storedLocal != ilLocal)
+                || !TryGetFieldLoadExpression(field, producerIl, ilLocal, out var fieldLoads))
                 continue;
 
-            var localLoads = body.Instructions.Where(instruction => instruction.OpCode is var opcode
+            var sourceUses = new[] { nullCheck, memberRead };
+            var localLoads = sourceUses.SelectMany(use => instructionMap.TryGetValue(use, out var useIl)
+                    ? useIl.Select((instruction, index) => (UseIl: useIl, Index: index, Instruction: instruction))
+                    : [])
+                .Where(item => item.Instruction.OpCode is var opcode
                     && (opcode == CilOpCodes.Ldloc || opcode == CilOpCodes.Ldloc_S)
-                    && ReferenceEquals(instruction.Operand, ilLocal))
+                    && ReferenceEquals(item.Instruction.Operand, ilLocal))
                 .ToArray();
-            if (localLoads.Length != 2)
+            if (localLoads.Length != sourceUses.Sum(use => CountInstructionLocalReads(use, value)))
                 continue;
 
-            foreach (var load in localLoads)
+            foreach (var item in localLoads)
             {
-                load.OpCode = CilOpCodes.Ldsfld;
-                load.Operand = loadField;
+                var bodyIndex = body.Instructions.IndexOf(item.Instruction);
+                if (bodyIndex < 0)
+                    continue;
+
+                item.Instruction.OpCode = fieldLoads[0].OpCode;
+                item.Instruction.Operand = fieldLoads[0].Operand;
+                for (var i = 1; i < fieldLoads.Length; i++)
+                {
+                    var additionalLoad = new CilInstruction(fieldLoads[i].OpCode, fieldLoads[i].Operand);
+                    body.Instructions.Insert(bodyIndex + i, additionalLoad);
+                    item.UseIl.Insert(item.Index + i, additionalLoad);
+                }
             }
+            // A resolved ARM64 virtual call may leave an unused class-header read. It has no
+            // managed consumer after its dispatch loads have been removed by analysis.
+            foreach (var hiddenRead in hiddenReads)
+                SuppressGeneratedInstructions(hiddenRead, instructionMap);
             SuppressGeneratedInstructions(producer, instructionMap);
         }
+    }
+
+    private static bool TryGetFieldLoadExpression(FieldReference field, List<CilInstruction> producerIl,
+        CilLocalVariable ilLocal, out CilInstruction[] fieldLoads)
+    {
+        var fieldDescriptor = field.Field.ToFieldDescriptor();
+        fieldLoads = field.Field.IsStatic
+            ? [new CilInstruction(CilOpCodes.Ldsfld, fieldDescriptor)]
+            : [new CilInstruction(CilOpCodes.Ldarg_0), new CilInstruction(CilOpCodes.Ldfld, fieldDescriptor)];
+        var emitted = producerIl.Where(instruction => instruction.OpCode != CilOpCodes.Nop).ToArray();
+        if (emitted.Length != fieldLoads.Length + 1
+            || emitted[^1].OpCode != CilOpCodes.Stloc || emitted[^1].Operand != ilLocal)
+            return false;
+
+        for (var i = 0; i < fieldLoads.Length; i++)
+            if (emitted[i].OpCode != fieldLoads[i].OpCode || emitted[i].Operand != fieldLoads[i].Operand)
+                return false;
+        return true;
     }
 
     private static bool ReadsLocal(Instruction instruction, LocalVariable local)
@@ -385,6 +421,25 @@ public static class IlGenerator
         return false;
     }
 
+    private static int CountInstructionLocalReads(Instruction instruction, LocalVariable local)
+    {
+        var destinationIndex = instruction.DestinationOperandIndex;
+        var count = 0;
+        for (var i = 0; i < instruction.Operands.Count; i++)
+        {
+            var operand = instruction.Operands[i];
+            if (i != destinationIndex || operand is not LocalVariable)
+                count += CountLocalReads(operand, local);
+        }
+        return count;
+    }
+
+    private static bool IsDiscardableInstanceHeaderRead(ISILControlFlowGraph graph, Instruction instruction,
+        LocalVariable local) => instruction is
+        { OpCode: OpCode.Move, Operands: [LocalVariable { Type: RuntimeClassTypeAnalysisContext } header,
+            MemoryOperand { Base: LocalVariable receiver, Index: null, Scale: 0, Addend: 0 }] }
+        && receiver == local && CountLocalUses(graph, header) == 0;
+
     private static bool IsInstanceMemberRead(Instruction instruction, LocalVariable local) => instruction switch
     {
         { OpCode: OpCode.Call, Operands: [MethodAnalysisContext { IsStatic: false }, _, LocalVariable receiver, ..] }
@@ -396,7 +451,7 @@ public static class IlGenerator
         _ => false
     };
 
-    private static bool CanRepeatStaticFieldReadBetween(ISILControlFlowGraph graph, Instruction producer,
+    private static bool CanRepeatFieldReadBetween(ISILControlFlowGraph graph, Instruction producer,
         Instruction use)
     {
         Block? producerBlock = null;
@@ -435,13 +490,13 @@ public static class IlGenerator
             if (block == useBlock)
                 return useIndex >= startIndex
                     && block.Instructions.Skip(startIndex).Take(useIndex - startIndex)
-                        .All(IsSafeBetweenStaticFieldReads);
+                        .All(IsSafeBetweenFieldReads);
             if (completed.Contains(block))
                 return true;
             if (!active.Add(block))
                 return false;
 
-            if (block.Instructions.Skip(startIndex).Any(instruction => !IsSafeBetweenStaticFieldReads(instruction)))
+            if (block.Instructions.Skip(startIndex).Any(instruction => !IsSafeBetweenFieldReads(instruction)))
                 return false;
 
             var successors = block.Successors.Where(canReachUse.Contains).ToArray();
@@ -477,17 +532,33 @@ public static class IlGenerator
             : new DominatorInfo(graph).Dominates(firstBlock, secondBlock);
     }
 
-    private static bool IsSafeBetweenStaticFieldReads(Instruction instruction)
+    private static bool IsSafeBetweenFieldReads(Instruction instruction)
     {
-        if (instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall
-            or OpCode.Newobj or OpCode.NewArr or OpCode.Throw or OpCode.Return or OpCode.IndirectJump
-            or OpCode.Divide or OpCode.DivideUnsigned or OpCode.Modulo or OpCode.ModuloUnsigned
+        if (instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall)
+        {
+            if (instruction.OpCode != OpCode.Call
+                || instruction.Operands.FirstOrDefault() is not MethodAnalysisContext method
+                || !InlinedFieldGetterRecovery.IsVerifiedDirectGetter(method)
+                    && !IsPrimitiveToString(method))
+                return false;
+        }
+
+        if (instruction.OpCode is OpCode.Newobj or OpCode.NewArr or OpCode.Throw or OpCode.Return or OpCode.IndirectJump
+            or OpCode.DivideUnsigned or OpCode.Modulo or OpCode.ModuloUnsigned
+            || instruction.OpCode == OpCode.Divide && !IsNonThrowingFloatDivision(instruction)
             || instruction.Destination is FieldReference or ArrayAccess or MemoryOperand
             || instruction.Operands.Any(operand => operand is ArrayAccess))
             return false;
 
         return true;
     }
+
+    private static bool IsPrimitiveToString(MethodAnalysisContext method) =>
+        !method.IsStatic && method.Name == "ToString" && method.Parameters.Count == 0
+        && method.DeclaringType?.FullName == "System.Int32";
+
+    private static bool IsNonThrowingFloatDivision(Instruction instruction) =>
+        instruction.Destination is LocalVariable { Type.FullName: "System.Single" or "System.Double" };
 
     private static void SetRecoveredMaxStack(CilMethodBody body)
     {

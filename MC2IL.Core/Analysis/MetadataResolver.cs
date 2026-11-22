@@ -1661,11 +1661,23 @@ public static class MetadataResolver
                 var candidate = block.Instructions[i];
                 if (candidate == targetRead || candidate == methodInfoRead || candidate.OpCode == OpCode.Nop
                     || candidate is { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable or Immediate] }
+                    || candidate is { OpCode: OpCode.Move, Operands: [LocalVariable, MemoryOperand] }
                     || checkedReceiver && candidate.OpCode == OpCode.PackFloatAggregate
                         && candidate.Operands.Skip(2).All(operand => operand is LocalVariable or FloatLiteral or DoubleLiteral)
                     || checkedReceiver && candidate is { OpCode: OpCode.Move, Operands: [LocalVariable,
                         FieldReference { Field.IsStatic: false, Field.FieldType: not CustomModifierTypeAnalysisContext }] })
                     continue;
+
+                // A resolved call can leave its vtable method-pointer and MethodInfo loads
+                // unused when the +8 entry was not matched as a hidden argument. Once a direct
+                // non-null guard dominates the call, these exact pointer-sized vtable reads are
+                // redundant; removing them also lets the class-header load die.
+                if (checkedReceiver && IsDeadVTableEntryLoad(candidate, klassRead.Destination as LocalVariable))
+                {
+                    discardableDispatchLoads.Add(candidate);
+                    continue;
+                }
+
                 return;
             }
 
@@ -1674,6 +1686,24 @@ public static class MetadataResolver
                 discardableDispatchLoads.Add(targetRead);
             if (methodInfoRead != null && homeBlocks.TryGetValue(methodInfoRead, out var methodInfoBlock) && methodInfoBlock == block)
                 discardableDispatchLoads.Add(methodInfoRead);
+        }
+
+        bool IsDeadVTableEntryLoad(Instruction candidate, LocalVariable? klassLocal)
+        {
+            if (klassLocal == null || candidate is not
+                { OpCode: OpCode.Move, Operands: [LocalVariable value, MemoryOperand
+                    { Base: LocalVariable baseLocal, Index: null, Scale: 0 } memory] }
+                || baseLocal != klassLocal
+                || candidate.MemoryAccessSize is int accessSize && accessSize != pointerSize)
+                return false;
+
+            var entryOffset = memory.Addend - vtableOffset;
+            var fieldOffset = entryOffset % invokeDataSize;
+            if (entryOffset < 0 || fieldOffset != 0 && fieldOffset != pointerSize)
+                return false;
+
+            return !instructions.Any(instruction => instruction != candidate
+                && DeadCodeEliminator.UsedLocals(instruction).Any(local => local == value));
         }
 
         bool HasDirectNonNullEdge(Block block, LocalVariable receiver)
