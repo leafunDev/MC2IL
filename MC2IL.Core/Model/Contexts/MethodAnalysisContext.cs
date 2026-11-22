@@ -527,6 +527,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ArrayRecovery.MergeReloadedLoopArrayLengths(ControlFlowGraph!);
 
         LocalVariables.TypeAddressedLocals(this);
+        BooleanFlagSimplifier.FoldTypedBitwiseOperations(this);
 
         ConstantBranchFolder.Run(this);
         Arm64ClampRecovery.Run(this);

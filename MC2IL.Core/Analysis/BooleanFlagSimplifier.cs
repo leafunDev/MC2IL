@@ -20,6 +20,8 @@ public static class BooleanFlagSimplifier
             if (instruction.Destination is LocalVariable destination)
                 definitions[destination] = instruction;
 
+        FoldTypedBitwiseOperations(method);
+
         foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
             if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual) || instruction.Operands.Count < 3)
@@ -42,6 +44,79 @@ public static class BooleanFlagSimplifier
             instruction.OpCode = inverted ? OpCode.Not : OpCode.Move;
             instruction.SetOperands(instruction.Operands[0], booleanValue);
         }
+    }
+
+    // This can also run after SSA removal: it relies only on the operation's resolved bool type
+    // and immediate mask, not on which definition reaches a particular use.
+    internal static void FoldTypedBitwiseOperations(MethodAnalysisContext method)
+    {
+        var booleanType = method.AppContext.SystemTypes.SystemBooleanType;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            TryFoldBooleanBitwiseIdentity(instruction, booleanType);
+    }
+
+    private static bool TryFoldBooleanBitwiseIdentity(Instruction instruction, TypeAnalysisContext booleanType)
+    {
+        if (instruction.Operands is not [LocalVariable { Type: { } resultType } destination, var left, var right]
+            || resultType != booleanType)
+            return false;
+
+        if (instruction.OpCode == OpCode.And)
+        {
+            if (IsZeroConstant(left) || IsZeroConstant(right))
+                return ToBooleanConstant(instruction, destination, 0);
+            if (IsBoolean(left, booleanType) && IsOne(right))
+                return ToBooleanMove(instruction, destination, left);
+            if (IsBoolean(right, booleanType) && IsOne(left))
+                return ToBooleanMove(instruction, destination, right);
+        }
+        else if (instruction.OpCode == OpCode.Or)
+        {
+            if (IsBoolean(left, booleanType) && IsZeroConstant(right))
+                return ToBooleanMove(instruction, destination, left);
+            if (IsBoolean(right, booleanType) && IsZeroConstant(left))
+                return ToBooleanMove(instruction, destination, right);
+            if (IsBoolean(left, booleanType) && IsOne(right)
+                || IsBoolean(right, booleanType) && IsOne(left))
+                return ToBooleanConstant(instruction, destination, 1);
+        }
+        else if (instruction.OpCode == OpCode.Xor)
+        {
+            if (IsBoolean(left, booleanType) && IsZeroConstant(right))
+                return ToBooleanMove(instruction, destination, left);
+            if (IsBoolean(right, booleanType) && IsZeroConstant(left))
+                return ToBooleanMove(instruction, destination, right);
+            if (IsBoolean(left, booleanType) && IsOne(right))
+                return ToBooleanNot(instruction, destination, left);
+            if (IsBoolean(right, booleanType) && IsOne(left))
+                return ToBooleanNot(instruction, destination, right);
+        }
+
+        return false;
+    }
+
+    private static bool IsBoolean(IOperand operand, TypeAnalysisContext booleanType)
+        => operand is LocalVariable { Type: { } type } && type == booleanType;
+
+    private static bool ToBooleanMove(Instruction instruction, IOperand destination, IOperand value)
+    {
+        instruction.OpCode = OpCode.Move;
+        instruction.SetOperands(destination, value);
+        return true;
+    }
+
+    private static bool ToBooleanNot(Instruction instruction, IOperand destination, IOperand value)
+    {
+        instruction.OpCode = OpCode.Not;
+        instruction.SetOperands(destination, value);
+        return true;
+    }
+
+    private static bool ToBooleanConstant(Instruction instruction, IOperand destination, long value)
+    {
+        instruction.OpCode = OpCode.Move;
+        instruction.SetOperands(destination, new Immediate(value));
+        return true;
     }
 
     private static bool TryGetBooleanBit(LocalVariable value,
