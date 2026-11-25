@@ -1287,7 +1287,10 @@ public static class LocalVariables
             if (!calledMethod.IsStatic
                 && instruction.Operands[thisParamIndex] is LocalVariable thisParam)
             {
-                changed |= SetTypeIfUnknown(thisParam, calledMethod.DeclaringType);
+                // A resolved instance target constrains its receiver even when an earlier
+                // control-flow merge widened that local to System.Object. Refine only when
+                // the target type is assignable to the inferred reference type.
+                changed |= PropagateProducedType(thisParam, calledMethod.DeclaringType);
             }
 
             // Value type instance method, first arg is address of value, but we need to type the value
