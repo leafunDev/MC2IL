@@ -42,8 +42,8 @@ public static class InjectedCheckRemover
             if (falseTarget == null)
                 continue;
 
-            var trueThrow = GetInjectedThrow(trueTarget, ignoredExceptionConstructions);
-            var falseThrow = GetInjectedThrow(falseTarget, ignoredExceptionConstructions);
+            var trueThrow = GetInjectedThrowThroughSplitEdge(trueTarget, ignoredExceptionConstructions);
+            var falseThrow = GetInjectedThrowThroughSplitEdge(falseTarget, ignoredExceptionConstructions);
 
             // The same null guard can branch to the throw on either the true edge or the
             // fallthrough edge, depending on how the native compare/branch pair was lifted.
@@ -547,10 +547,27 @@ public static class InjectedCheckRemover
 
         var receiverIndex = operation.OpCode == OpCode.CallVoid ? 1 : 2;
         if (operation.Operands.Count <= receiverIndex
-            || !SameValueOnPath(receiver, operation.Operands[receiverIndex], pathInstructions, defOf)
-            || operation.Operands.Skip(receiverIndex + 1).Take(target.Parameters.Count)
-                .Any(arg => !IsSimpleValue(arg) && !IsSafeFieldRead(arg, knownNonNullThis)))
+            || !SameValueOnPath(receiver, operation.Operands[receiverIndex], pathInstructions, defOf))
             return false;
+
+        for (var parameterIndex = 0; parameterIndex < target.Parameters.Count; parameterIndex++)
+        {
+            var operandIndex = receiverIndex + 1 + parameterIndex;
+            if (operandIndex >= operation.Operands.Count)
+                break;
+
+            var argument = operation.Operands[operandIndex];
+            if (IsSimpleValue(argument) || IsSafeFieldRead(argument, knownNonNullThis))
+                continue;
+
+            // Taking the address of a local for ref/out does not dereference
+            // anything before callvirt checks the receiver. Fields and array
+            // elements can throw while their addresses are evaluated.
+            if (argument is not AddressOf { Target: LocalVariable { Type: { } localType } }
+                || target.Parameters[parameterIndex].ParameterType is not ByRefTypeAnalysisContext byRef
+                || !MetadataResolver.IsSameType(localType, byRef.ElementType))
+                return false;
+        }
 
         if (!operation.NullCheckReceiver)
             callsNeedingNullCheck.Add(operation);
@@ -1130,6 +1147,40 @@ public static class InjectedCheckRemover
         }
 
         return ignored;
+    }
+
+    private static InjectedThrow? GetInjectedThrowThroughSplitEdge(Block block,
+        HashSet<Instruction> ignoredExceptionConstructions)
+    {
+        // Phi lowering can split an edge to the shared null-failure block and
+        // initialize a local along the edge. The throw does not read that local.
+        for (var depth = 0; depth < 16; depth++)
+        {
+            if (GetInjectedThrow(block, ignoredExceptionConstructions) is { } thrown)
+                return depth == 0 || thrown.ExceptionType == "System.NullReferenceException" ? thrown : null;
+
+            var instructions = block.Instructions;
+            if (block.Successors is not [var next] || instructions.Count == 0
+                || instructions[^1] is not { Index: -1, OpCode: OpCode.Jump, Operands: [Block target] }
+                || target != next)
+                return null;
+
+            for (var i = 0; i < instructions.Count - 1; i++)
+            {
+                var instruction = instructions[i];
+                if (instruction.OpCode == OpCode.Nop)
+                    continue;
+                if (instruction is not { Index: -1, OpCode: OpCode.Move, Operands:
+                        [LocalVariable { Type: { } type } local, Immediate { Value: 0 }] }
+                    || !IlGenerator.IsManagedReference(type)
+                    || !local.Register.Name.StartsWith("stack_", System.StringComparison.Ordinal))
+                    return null;
+            }
+
+            block = next;
+        }
+
+        return null;
     }
 
     // Describes the throw performed by a block containing no other observable operation.
