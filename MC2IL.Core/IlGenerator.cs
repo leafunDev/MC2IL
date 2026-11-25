@@ -2974,7 +2974,12 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Conv_I);
                 break;
             case TypeAnalysisContext type:
-                //typeof(T)
+                instructions.Add(CilOpCodes.Ldtoken, type.ToTypeSignature().ToTypeDefOrRef());
+                // A recovered call such as Type.GetTypeFromHandle consumes the token itself.
+                if (expectedType is { IsValueType: true, FullName: "System.RuntimeTypeHandle" })
+                    break;
+
+                // A managed Type value (typeof(T)) requires resolving the token.
                 var corLibScope = module.CorLibTypeFactory.CorLibScope;
                 var typeFromHandle = corLibScope
                     .CreateTypeReference("System", "Type")
@@ -2982,7 +2987,6 @@ public static class IlGenerator
                         corLibScope.CreateTypeReference("System", "Type").ToTypeSignature(false),
                         [corLibScope.CreateTypeReference("System", "RuntimeTypeHandle").ToTypeSignature(true)]));
 
-                instructions.Add(CilOpCodes.Ldtoken, type.ToTypeSignature().ToTypeDefOrRef());
                 instructions.Add(CilOpCodes.Call, typeFromHandle);
                 break;
             default:
