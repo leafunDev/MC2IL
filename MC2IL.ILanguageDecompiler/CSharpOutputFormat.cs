@@ -8,6 +8,7 @@ using AssetRipper.CIL;
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.CSharp.ProjectDecompiler;
+using ICSharpCode.Decompiler.CSharp.Transforms;
 using ICSharpCode.Decompiler.Metadata;
 using MC2IL.Core.Api;
 using MC2IL.Core.Logging;
@@ -146,6 +147,8 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
         {
             var remaining = new HashSet<string>(selectedTypes, StringComparer.Ordinal);
             var source = new CSharpDecompiler(module, resolver, settings);
+            // Match WholeProjectDecompiler so references and declarations use the same C# names.
+            source.AstTransforms.Add(new EscapeInvalidIdentifiers());
             var usedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var metadata = module.Metadata;
             foreach (var handle in metadata.TypeDefinitions)
