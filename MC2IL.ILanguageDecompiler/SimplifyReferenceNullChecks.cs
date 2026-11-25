@@ -5,6 +5,8 @@ using ICSharpCode.Decompiler.CSharp.Syntax;
 using ICSharpCode.Decompiler.CSharp.Transforms;
 using ICSharpCode.Decompiler.Semantics;
 using ICSharpCode.Decompiler.TypeSystem;
+using ILFunction = ICSharpCode.Decompiler.IL.ILFunction;
+using ILFunctionKind = ICSharpCode.Decompiler.IL.ILFunctionKind;
 
 namespace MC2IL.ILanguageDecompiler;
 
@@ -40,6 +42,11 @@ internal sealed class SimplifyReferenceNullChecks : IAstTransform
     private static void Simplify(Expression original, Expression value, bool isNotNull, CSharpResolver resolver)
     {
         if (value is NullReferenceExpression || value.GetResolveResult().Type is not { IsReferenceType: true } type)
+            return;
+
+        // Expression trees preserve the operation as data and cannot contain a null pattern.
+        if (original.Ancestors.Any(node => node.Annotations.OfType<ILFunction>()
+                .Any(function => function.Kind == ILFunctionKind.ExpressionTree)))
             return;
 
         if (original.Parent is UnaryOperatorExpression { Operator: UnaryOperatorType.Not } negation)
