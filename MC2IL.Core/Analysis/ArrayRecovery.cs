@@ -115,8 +115,19 @@ public static class ArrayRecovery
     // another. Resolve that address in SSA, while its array and index still denote single values.
     public static void RecoverSplitElementAccesses(MethodAnalysisContext method)
     {
-        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
         var cfg = method.ControlFlowGraph!;
+        while (RecoverSplitElementAccessesOnce(method, cfg))
+        {
+            DeadCodeEliminator.Run(cfg);
+            // An outer array element can reveal the type of the inner array used by a later
+            // access. Resolve fields before repeating the address recovery pass.
+            LocalVariables.ResolveTypesAndFields(method);
+        }
+    }
+
+    private static bool RecoverSplitElementAccessesOnce(MethodAnalysisContext method, ISILControlFlowGraph cfg)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
         var instructions = cfg.Instructions;
         var definitions = SingleDefinitions(instructions);
         DominatorInfo? dominators = null;
@@ -222,11 +233,9 @@ public static class ArrayRecovery
         }
 
         if (!changed)
-            return;
+            return false;
 
-        DeadCodeEliminator.Run(cfg);
-        // Element types can be the missing input for field and virtual-call resolution.
-        LocalVariables.ResolveTypesAndFields(method);
+        return true;
     }
 
     private static ArrayAccess? TryRecoverShiftedLoopArrayAccess(MethodAnalysisContext method,
