@@ -188,6 +188,63 @@ public static class BooleanFlagSimplifier
 
     private static bool IsOne(IOperand operand) => operand is Immediate { Value: 1 };
 
+    // Machine registers carry Boolean branch results as 0 or 1. Recover their type
+    // before phi lowering, when every incoming value and use is still visible.
+    internal static void TypeBooleanConsumerMerges(MethodAnalysisContext method)
+    {
+        var booleanType = method.AppContext.SystemTypes.SystemBooleanType;
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var candidates = new Dictionary<LocalVariable, Instruction>();
+        foreach (var instruction in instructions)
+        {
+            if (instruction is { OpCode: OpCode.Phi, Destination: LocalVariable result }
+                && result.Type is null or { FullName: "System.Int32" or "System.UInt32" }
+                && instruction.Operands.Count > 2
+                && instruction.Operands.Skip(1).All(input =>
+                    input is Immediate { Value: 0 or 1 } || IsBoolean(input, booleanType)))
+                candidates[result] = instruction;
+        }
+
+        if (candidates.Count == 0)
+            return;
+
+        var accepted = new HashSet<LocalVariable>();
+        foreach (var instruction in instructions)
+        {
+            if (instruction.Destination is LocalVariable destination
+                && candidates.TryGetValue(destination, out var phi) && instruction != phi)
+                candidates.Remove(destination);
+
+            foreach (var uses in DeadCodeEliminator.UsedLocals(instruction).Where(candidates.ContainsKey).GroupBy(local => local).ToArray())
+            {
+                if (BooleanArgumentUses(instruction, uses.Key) == uses.Count())
+                    accepted.Add(uses.Key);
+                else
+                    candidates.Remove(uses.Key);
+            }
+        }
+
+        foreach (var local in accepted)
+            if (candidates.ContainsKey(local))
+                local.Type = booleanType;
+
+        int BooleanArgumentUses(Instruction instruction, LocalVariable local)
+        {
+            if (instruction is { OpCode: OpCode.Return, Operands: [LocalVariable returned] })
+                return ReferenceEquals(returned, local) && method.ReturnType == booleanType ? 1 : 0;
+            if (!instruction.IsCall || instruction.Operands[0] is not MethodAnalysisContext target)
+                return 0;
+
+            var firstArgument = (instruction.OpCode == OpCode.Call ? 2 : 1) + (target.IsStatic ? 0 : 1);
+            var count = 0;
+            for (var i = 0; i < target.Parameters.Count && firstArgument + i < instruction.Operands.Count; i++)
+                if (ReferenceEquals(instruction.Operands[firstArgument + i], local)
+                    && target.Parameters[i].ParameterType == booleanType)
+                    count++;
+            return count;
+        }
+    }
+
     // After SSA propagation a boolean return can have the form (phi(flag, 1) & 1).
     // The untyped merge would otherwise become an object local when the phi is lowered.
     internal static void TypeMaskedReturnMerges(MethodAnalysisContext method)

@@ -493,6 +493,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Array and call recovery can finish typing boolean flag expressions only after the
         // earlier cleanup pass. Simplify them while locals are still in SSA form, so the
         // definition chain stays unambiguous and dead numeric mask operations can be removed.
+        BooleanFlagSimplifier.TypeBooleanConsumerMerges(this);
         BooleanFlagSimplifier.Run(this);
         SsaForm.Remove(this);
 
