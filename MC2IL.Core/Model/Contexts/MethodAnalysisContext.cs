@@ -512,6 +512,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Fix float literals
         FloatLiteralRecovery.Run(this);
+        TrivialConstructorRecovery.RecoverInlinedBaseConstructor(this);
 
         // Runs late so the array type and length reach the allocation call as operands after copy propagation has inlined them
         // Revisit split native array addresses after SSA/phi copies have been simplified; ARM64

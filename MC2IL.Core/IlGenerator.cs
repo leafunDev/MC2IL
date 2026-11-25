@@ -2439,7 +2439,20 @@ public static class IlGenerator
                 LocalVariable { IsThis: true } => true,
                 AddressOf { Target: LocalVariable { IsThis: true } } => true,
                 _ => false
-            });
+            })
+            // Field initializers followed by a direct base call are normal constructor IL.
+            // Keep the call in the recovered DLL and let ILSpy render it as implicit C#.
+            && !HasFieldInitializerConstructorBody(context, instruction, declaringType);
+    }
+
+    private static bool HasFieldInitializerConstructorBody(MethodAnalysisContext context,
+        Instruction baseCall, TypeAnalysisContext declaringType)
+    {
+        var body = context.ControlFlowGraph!.Instructions.Where(instruction => instruction.OpCode != OpCode.Nop).ToArray();
+        return body is [.., var call, { OpCode: OpCode.Return, Operands.Count: 0 }]
+            && call == baseCall
+            && body.Take(body.Length - 2).All(instruction => TrivialConstructorRecovery.InitializerField(instruction) is { } field
+                && SameType(field.DeclaringType, declaringType));
     }
 
     private static bool SameType(TypeAnalysisContext first, TypeAnalysisContext second) =>

@@ -16,6 +16,79 @@ internal static class TrivialConstructorRecovery
         && type.Name.StartsWith("<>c__DisplayClass", StringComparison.Ordinal)
         && type.BaseType == type.AppContext.SystemTypes.SystemObjectType;
 
+    // Derived constructors can contain the complete inlined body of their direct base
+    // constructor, including its stores and a tail call to an earlier ancestor.
+    internal static void RecoverInlinedBaseConstructor(MethodAnalysisContext method)
+    {
+        if (method is not { Name: ".ctor", IsStatic: false, Parameters.Count: 0,
+                DeclaringType: { IsValueType: false, BaseType: { } baseType } }
+            || method.AppContext.InstructionSet is not NewArmV8InstructionSet instructionSet
+            || method.RawBytes.Length is 0 or > 32)
+            return;
+
+        var body = method.ControlFlowGraph!.Instructions.Where(i => i.OpCode != OpCode.Nop).ToArray();
+        if (body is not
+            [.., { OpCode: OpCode.CallVoid, Operands: [MethodAnalysisContext
+                { Name: ".ctor", IsStatic: false, Parameters.Count: 0, DeclaringType: { } ancestor } target,
+                LocalVariable { IsThis: true } receiver, ..] } tail, { OpCode: OpCode.Return, Operands.Count: 0 }]
+            || !IsBaseOf(ancestor, baseType.BaseType))
+            return;
+
+        var stores = body.Take(body.Length - 2);
+        if (!stores.All(store => InitializerField(store) is { } field && IsBaseOf(field.DeclaringType, baseType)))
+            return;
+
+        var constructors = baseType.Methods.Where(candidate =>
+            candidate is { Name: ".ctor", IsStatic: false, Parameters.Count: 0 }).Take(2).ToArray();
+        if (constructors is not [var baseCtor] || baseCtor.UnderlyingPointer == 0
+            || !(baseCtor.Visibility is MethodAttributes.Family or MethodAttributes.FamORAssem
+                || IsAccessible(baseCtor, method, baseType)))
+            return;
+
+        baseCtor.EnsureRawBytes();
+        if (baseCtor.RawBytes.Length != method.RawBytes.Length)
+            return;
+
+        var derivedNative = instructionSet.GetIsilFromMethod(method).ToArray();
+        var baseNative = instructionSet.GetIsilFromMethod(baseCtor).ToArray();
+        if (derivedNative is not
+            [.., { OpCode: OpCode.CallVoid,
+                Operands: [Immediate address, Register { Name: "X0" }, ..] } nativeTail,
+                { OpCode: OpCode.Return, Operands.Count: 0 } nativeReturn]
+            || address.UnsignedValue != target.UnderlyingPointer
+            || nativeTail.NativeAddress != nativeReturn.NativeAddress
+            || !derivedNative.Take(derivedNative.Length - 2).All(IsConstantInitializationStep)
+            || derivedNative.Length != baseNative.Length
+            || derivedNative.Where((instruction, i) => !instruction.IsStructurallyEqualTo(baseNative[i])
+                || instruction.OperandWidth != baseNative[i].OperandWidth
+                || instruction.MemoryAccessSize != baseNative[i].MemoryAccessSize).Any())
+            return;
+
+        tail.SetOperands(baseCtor, receiver);
+        foreach (var store in stores)
+        {
+            store.OpCode = OpCode.Nop;
+            store.SetOperands();
+        }
+    }
+
+    private static bool IsBaseOf(TypeAnalysisContext ancestor, TypeAnalysisContext? current)
+    {
+        for (; current != null; current = current.BaseType)
+            if (MetadataResolver.IsSameType(current, ancestor))
+                return true;
+        return false;
+    }
+
+    private static bool IsConstantInitializationStep(Instruction instruction) => instruction is
+        { OpCode: OpCode.Move, Operands: [Register { Name: not ("X0" or "SP" or "X31") }, Immediate] }
+        or { OpCode: OpCode.Move, Operands: [MemoryOperand
+            { Base: Register { Name: "X0" }, Index: null, Scale: 0, Addend: >= 16 }, Register or Immediate] };
+
+    internal static FieldAnalysisContext? InitializerField(Instruction instruction) => instruction is
+        { OpCode: OpCode.Move, Operands: [FieldReference { Parent: null, Field.IsStatic: false, Local.IsThis: true } field,
+            Immediate or FloatLiteral or DoubleLiteral or StringLiteral] } ? field.Field : null;
+
     // IL2CPP can inline a trivial constructor down to its call to Object..ctor.
     // Restore the constructor of the allocated type before lowering the allocation to CIL.
     public static void Run(MethodAnalysisContext method)
