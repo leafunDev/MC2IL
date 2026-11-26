@@ -21,9 +21,15 @@ internal static class StructArgumentFieldRecovery
             return;
 
         var reads = new Dictionary<LocalVariable, int>();
+        var addressed = new HashSet<LocalVariable>();
         foreach (var instruction in instructions)
-        foreach (var local in DeadCodeEliminator.UsedLocals(instruction))
-            reads[local] = reads.TryGetValue(local, out var count) ? count + 1 : 1;
+        {
+            foreach (var local in DeadCodeEliminator.UsedLocals(instruction))
+                reads[local] = reads.TryGetValue(local, out var count) ? count + 1 : 1;
+            foreach (var operand in instruction.Operands)
+                if (operand is AddressOf { Target: LocalVariable local })
+                    addressed.Add(local);
+        }
 
         foreach (var block in graph.Blocks)
         for (var index = 0; index < block.Instructions.Count; index++)
@@ -32,7 +38,7 @@ internal static class StructArgumentFieldRecovery
                     Operands: [LocalVariable result, TypeAnalysisContext type, ..] } pack
                 && Arm64CallingConventionResolver.GetFloatAggregateFields(type) is { Length: >= 2 } fields
                 && result.Type == type && fields.Length + 2 == pack.Operands.Count)
-                TryFoldPack(method, block, index, pack, result, type, fields, reads);
+                TryFoldPack(method, block, index, pack, result, type, fields, reads, addressed);
         }
     }
 
@@ -44,13 +50,14 @@ internal static class StructArgumentFieldRecovery
             && method.ParameterLocals.Contains(local));
 
     private static void TryFoldPack(MethodAnalysisContext method, Block block, int index, Instruction pack,
-        LocalVariable result, TypeAnalysisContext type, FieldAnalysisContext[] fields, Dictionary<LocalVariable, int> reads)
+        LocalVariable result, TypeAnalysisContext type, FieldAnalysisContext[] fields,
+        Dictionary<LocalVariable, int> reads, HashSet<LocalVariable> addressed)
     {
         var lanes = new Dictionary<LocalVariable, FieldAnalysisContext>();
         for (var i = 0; i < fields.Length; i++)
         {
             if (pack.Operands[i + 2] is not LocalVariable value || value.Type != fields[i].FieldType
-                || !reads.TryGetValue(value, out var count) || count != 1 || lanes.ContainsKey(value))
+                || addressed.Contains(value) || !reads.ContainsKey(value) || lanes.ContainsKey(value))
                 return;
             lanes.Add(value, fields[i]);
         }
@@ -86,6 +93,12 @@ internal static class StructArgumentFieldRecovery
                 loads.Add(load);
                 if (lanes.Count == 0)
                 {
+                    // Phi lowering may have coalesced lanes from different branches.
+                    // A use of a new definition on another path does not use this load.
+                    if (pack.Operands.Skip(2).OfType<LocalVariable>().Any(component =>
+                            reads[component] != 1 && HasLaterRead(block, index + 1, component)))
+                        return;
+
                     pack.OpCode = OpCode.Move;
                     pack.SetOperands(result, source);
                     foreach (var scalarLoad in loads)
@@ -106,5 +119,33 @@ internal static class StructArgumentFieldRecovery
                 position--;
             current = predecessor;
         }
+    }
+
+    private static bool HasLaterRead(Block block, int start, LocalVariable lane)
+    {
+        var seen = new HashSet<Block>();
+        var pending = new Stack<(Block Block, int Start)>();
+        pending.Push((block, start));
+        while (pending.Count != 0)
+        {
+            var (current, position) = pending.Pop();
+            for (; position < current.Instructions.Count; position++)
+            {
+                var instruction = current.Instructions[position];
+                // Unresolved direct calls emit a diagnostic and an optional default
+                // result. Their guessed register arguments are never read in CIL.
+                if ((!instruction.IsCall || instruction.Operands[0] is MethodAnalysisContext)
+                    && DeadCodeEliminator.UsedLocals(instruction).Contains(lane))
+                    return true;
+                if (ReferenceEquals(instruction.Destination, lane))
+                    break;
+            }
+            if (position != current.Instructions.Count)
+                continue;
+            foreach (var successor in current.Successors)
+                if (seen.Add(successor))
+                    pending.Push((successor, 0));
+        }
+        return false;
     }
 }

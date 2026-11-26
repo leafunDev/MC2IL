@@ -396,6 +396,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Indirect jumps/calls should probably be resolved here before stack analysis
 
         StackAnalyzer.Analyze(this);
+        Arm64SharedVirtualDispatchRecovery.Run(this);
         Arm64StackValueRecovery.Run(this);
         ValueTypeReceiverRecovery.BindStackConstructorReceivers(this);
 
