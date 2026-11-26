@@ -9,6 +9,7 @@ using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.CSharp.ProjectDecompiler;
 using ICSharpCode.Decompiler.Metadata;
+using ICSharpCode.Decompiler.TypeSystem;
 using MC2IL.Core.Api;
 using MC2IL.Core.Logging;
 using MC2IL.Core.Model.Contexts;
@@ -146,6 +147,8 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
         {
             var remaining = new HashSet<string>(selectedTypes, StringComparer.Ordinal);
             var source = new CSharpDecompiler(module, resolver, settings);
+            // Inline pure single-use arithmetic locals produced by machine-code lowering.
+            source.AstTransforms.Add(new InlineArithmeticTemporaries());
             var usedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var metadata = module.Metadata;
             foreach (var handle in metadata.TypeDefinitions)
@@ -193,6 +196,12 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
     private sealed class SourceProjectDecompiler(DecompilerSettings settings, UniversalAssemblyResolver resolver)
         : WholeProjectDecompiler(settings, resolver, projectWriter: null, assemblyReferenceClassifier: resolver, debugInfoProvider: null)
     {
+        protected override CSharpDecompiler CreateDecompiler(DecompilerTypeSystem typeSystem)
+        {
+            var decompiler = base.CreateDecompiler(typeSystem);
+            decompiler.AstTransforms.Add(new InlineArithmeticTemporaries());
+            return decompiler;
+        }
         protected override IEnumerable<ProjectItemInfo> WriteResourceFilesInProject(MetadataFile module) => Enumerable.Empty<ProjectItemInfo>();
 
         protected override IEnumerable<ProjectItemInfo> WriteMiscellaneousFilesInProject(PEFile module) => Enumerable.Empty<ProjectItemInfo>();

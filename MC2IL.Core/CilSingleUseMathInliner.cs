@@ -4,6 +4,7 @@ using System.Linq;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Collections;
+using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Metadata.Tables;
 using AsmResolver.PE.DotNet.Cil;
 using MC2IL.Core.ISIL;
@@ -139,6 +140,21 @@ internal static class CilSingleUseMathInliner
                 var instruction = instructions[i];
                 if (instruction.OpCode == CilOpCodes.Stloc && instruction.Operand is CilLocalVariable stored)
                     scratchStores.Add(stored);
+                else if (instruction.OpCode.Code == CilCode.Initobj)
+                {
+                    // Struct object-initializer lowering clears a local between computing a
+                    // component and storing it. Moving pure scalar arithmetic past that clear
+                    // is safe unless the cleared local is also one of the expression inputs.
+                    var address = i > 0 ? instructions[i - 1] : null;
+                    if (address?.OpCode.Code is not (CilCode.Ldloca or CilCode.Ldloca_S)
+                        || address.Operand is not CilLocalVariable initialized
+                        || !initialized.VariableType.IsValueType)
+                    {
+                        safe = false;
+                        break;
+                    }
+                    scratchStores.Add(initialized);
+                }
                 else if (conditionalBranches.Contains(i))
                     continue;
                 // Across blocks, follow only a unique chain of unconditional branches.
@@ -319,17 +335,18 @@ internal static class CilSingleUseMathInliner
             {
                 case 0:
                     types.Push(code == CilCode.Ldloca ? ValueKind.StructAddress
-                        : code is CilCode.Ldc_R4 or CilCode.Ldc_R8
-                          || instruction.Operand is CilLocalVariable { VariableType.ElementType: ElementType.R4 or ElementType.R8 }
-                          || instruction.Operand is Parameter { ParameterType.ElementType: ElementType.R4 or ElementType.R8 }
-                            ? ValueKind.Float : ValueKind.Other);
+                        : IsFloatingValue(instruction) ? ValueKind.Float
+                        : IsValueTypeValue(instruction) ? ValueKind.StructValue
+                        : ValueKind.Other);
                     break;
                 case 1 when types.Count >= 1:
                     var value = types.Pop();
                     if (code == CilCode.Ldfld)
                     {
-                        if (value != ValueKind.StructAddress || instruction.Operand is not IFieldDescriptor
-                            { Signature.FieldType.ElementType: ElementType.R4 or ElementType.R8 })
+                        if (value is not (ValueKind.StructAddress or ValueKind.StructValue)
+                            || instruction.Operand is not IFieldDescriptor field
+                            || field.Signature is not { FieldType: { } fieldType }
+                            || !IsFloatingType(fieldType))
                             return false;
                         types.Push(ValueKind.Float);
                     }
@@ -365,12 +382,53 @@ internal static class CilSingleUseMathInliner
         return types.Count == 1 && types.Peek() == ValueKind.Float;
     }
 
-    private enum ValueKind { Other, Float, StructAddress }
+    private enum ValueKind { Other, Float, StructAddress, StructValue }
+
+    private static bool IsFloatingValue(CilInstruction instruction) => instruction.OpCode.Code is CilCode.Ldc_R4 or CilCode.Ldc_R8
+        || instruction.Operand switch
+        {
+            CilLocalVariable local => IsFloatingType(local.VariableType),
+            Parameter parameter => IsFloatingType(parameter.ParameterType),
+            _ => false
+        };
+
+    private static bool IsValueTypeValue(CilInstruction instruction)
+    {
+        if (IsKnownVector3ValueGetter(instruction))
+            return true;
+
+        return instruction.Operand switch
+        {
+            CilLocalVariable local when instruction.OpCode.Code == CilCode.Ldloc => local.VariableType.IsValueType,
+            Parameter parameter when instruction.OpCode.Code == CilCode.Ldarg => parameter.ParameterType.IsValueType,
+            IFieldDescriptor field when instruction.OpCode.Code == CilCode.Ldsfld => IsKnownVector3Field(field),
+            _ => false
+        };
+    }
+
+    private static bool IsFloatingType(TypeSignature type) => type.ElementType is ElementType.R4 or ElementType.R8;
+
+    private static bool IsKnownVector3ValueGetter(CilInstruction instruction) =>
+        instruction.OpCode.Code == CilCode.Call
+        && instruction.Operand is IMethodDescriptor method
+        && method.DeclaringType?.FullName == "UnityEngine.Vector3"
+        && method.Name is { } name
+        && name.ToString() is "get_oneVector" or "get_zeroVector"
+        && method.Signature is { HasThis: false, ParameterTypes.Count: 0 }
+        && method.Signature.ReturnType.FullName == "UnityEngine.Vector3";
+
+    private static bool IsKnownVector3Field(IFieldDescriptor field) =>
+        field.DeclaringType?.FullName == "UnityEngine.Vector3"
+        && field.Name is { } name
+        && name.ToString() is "oneVector" or "zeroVector";
 
     private static int ScalarInputs(CilInstruction instruction)
     {
         if (IsSingleFloatPropertyGetter(instruction))
             return 1;
+
+        if (IsKnownVector3ValueGetter(instruction))
+            return 0;
 
         if (instruction.OpCode.Code == CilCode.Call && instruction.Operand is IMethodDescriptor method
             && method.DeclaringType?.FullName == "UnityEngine.Mathf"
@@ -397,7 +455,7 @@ internal static class CilSingleUseMathInliner
 
     private static int ScalarInputs(CilCode code) => code switch
     {
-        CilCode.Ldloc or CilCode.Ldloca or CilCode.Ldarg or CilCode.Ldc_R4 or CilCode.Ldc_R8
+        CilCode.Ldloc or CilCode.Ldloca or CilCode.Ldarg or CilCode.Ldsfld or CilCode.Ldc_R4 or CilCode.Ldc_R8
             or CilCode.Ldc_I4 or CilCode.Ldc_I4_M1 or CilCode.Ldc_I4_0 or CilCode.Ldc_I4_1
             or CilCode.Ldc_I4_2 or CilCode.Ldc_I4_3 or CilCode.Ldc_I4_4 or CilCode.Ldc_I4_5
             or CilCode.Ldc_I4_6 or CilCode.Ldc_I4_7 or CilCode.Ldc_I4_8 or CilCode.Ldc_I8 => 0,
