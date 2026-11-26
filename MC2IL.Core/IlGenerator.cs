@@ -195,6 +195,12 @@ public static class IlGenerator
         InlineRepeatedFieldReads(graph, instructionMap, locals, body);
         RemoveDominatedStackSlotInitializers(graph, instructionMap);
         var inlineLocals = FindSingleUseCilLocals(body, locals);
+        // Inline an index while its producer still has its own Boolean input load.
+        // Later stack forwarding can fold that input into the select.
+        foreach (var block in graph.Blocks)
+        for (var i = 0; i < block.Instructions.Count; i++)
+            InlineSingleUseSelectedArrayIndex(block, i, graph, instructionMap, inlineLocals, body);
+
         foreach (var block in graph.Blocks)
         {
             if (block == graph.EntryBlock || block == graph.ExitBlock)
@@ -599,7 +605,7 @@ public static class IlGenerator
             if (instruction.OpCode != OpCode.Call
                 || instruction.Operands.FirstOrDefault() is not MethodAnalysisContext method
                 || !InlinedFieldGetterRecovery.IsVerifiedDirectGetter(method)
-                    && !IsPrimitiveToString(method))
+                    && !PrimitiveFormatReceiverRecovery.IsInt32ToString(method))
                 return false;
         }
 
@@ -612,10 +618,6 @@ public static class IlGenerator
 
         return true;
     }
-
-    private static bool IsPrimitiveToString(MethodAnalysisContext method) =>
-        !method.IsStatic && method.Name == "ToString" && method.Parameters.Count == 0
-        && method.DeclaringType?.FullName == "System.Int32";
 
     private static bool IsNonThrowingFloatDivision(Instruction instruction) =>
         instruction.Destination is LocalVariable { Type.FullName: "System.Single" or "System.Double" };
@@ -1095,6 +1097,29 @@ public static class IlGenerator
             return;
 
         RelocateSingleUseExpression(producer, producerIl, consumerIl, index - 1, instructionMap, body);
+    }
+
+    private static void InlineSingleUseSelectedArrayIndex(Block block, int consumerIndex, ISILControlFlowGraph graph,
+        Dictionary<Instruction, List<CilInstruction>> instructionMap,
+        Dictionary<LocalVariable, CilLocalVariable> locals, CilMethodBody body)
+    {
+        var access = block.Instructions[consumerIndex];
+        if (access is not { OpCode: OpCode.Move, Operands: [LocalVariable, ArrayAccess { Index: LocalVariable index }] }
+            || !locals.TryGetValue(index, out var slot) || CountLocalUses(graph, index) != 1
+            || !TryFindSingleUseProducer(block, consumerIndex, index, out _, out _, out var producer)
+            || producer.OpCode != OpCode.Select
+            || !instructionMap.TryGetValue(producer, out var producerIl)
+            || producerIl.Count < 2 || producerIl[^1].OpCode != CilOpCodes.Stloc
+            || !ReferenceEquals(producerIl[^1].Operand, slot)
+            || !instructionMap.TryGetValue(access, out var accessIl))
+            return;
+
+        var loadIndex = accessIl.FindIndex(il => il.OpCode == CilOpCodes.Ldloc && ReferenceEquals(il.Operand, slot));
+        if (loadIndex < 0 || !HasOnlyPureLoadsBefore(accessIl, loadIndex)
+            || !ProducesStandaloneStackValue(producerIl, body))
+            return;
+
+        RelocateSingleUseExpression(producer, producerIl, accessIl, loadIndex, instructionMap, body);
     }
 
     private static void InlineSingleUseFieldReceiver(Block block, int consumerIndex, ISILControlFlowGraph graph,
@@ -2340,6 +2365,19 @@ public static class IlGenerator
 
             case OpCode.Select:
             {
+                if (instruction.Operands is [LocalVariable { Type.FullName: "System.Int32" } destination,
+                        LocalVariable { Type.FullName: "System.Boolean" } test,
+                        Immediate { Value: 0 or 1 } whenTrue, Immediate { Value: 0 or 1 } whenFalse]
+                    && whenTrue.Value != whenFalse.Value)
+                {
+                    // Normalize any nonzero Boolean representation before using it as an index.
+                    LoadOperand(test, method, locals, writeLine);
+                    instructions.Add(CilOpCodes.Ldc_I4_0);
+                    instructions.Add(whenTrue.Value == 1 ? CilOpCodes.Cgt_Un : CilOpCodes.Ceq);
+                    StoreToOperand(destination, method, locals, writeLine);
+                    break;
+                }
+
                 var startFalse = new CilInstruction(CilOpCodes.Nop);
                 var store = new CilInstruction(CilOpCodes.Nop);
                 var type = OperandType(instruction.Operands[0]);
