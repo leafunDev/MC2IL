@@ -581,6 +581,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         StructReturnFieldRecovery.Run(this);
         StructArgumentFieldRecovery.Run(this);
         FloatAggregateRecovery.RecoverComputedInstanceStores(this);
+        UnityVectorArithmeticRecovery.Run(this);
         DeadCodeEliminator.Run(ControlFlowGraph!, MetadataResolver.FindMethodMetadataReads(this),
             discardUnusedCallResults: true);
 
