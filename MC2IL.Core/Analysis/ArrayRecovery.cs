@@ -915,8 +915,22 @@ public static class ArrayRecovery
                     continue;
                 }
 
-                if (ElementIndex(memory, arrayType, pointerSize) is { } index)
+                // A folded aggregate load carries the exact byte width of the value.
+                // A lifted address calculation has no access size and is handled separately.
+                var elementType = arrayType.ElementType;
+                var scalarSize = ElementSize(elementType, pointerSize);
+                var elementSize = scalarSize;
+                if (scalarSize == 0 && elementType is { IsValueType: true } and not GenericParameterTypeAnalysisContext
+                    && instruction is { OpCode: OpCode.Move, OperandWidth: null, MemoryAccessSize: > 0 and var width }
+                    && MetadataElementSize(elementType, pointerSize) == width)
+                    elementSize = width;
+
+                if (ElementIndex(memory, elementSize, pointerSize) is { } index)
+                {
                     instruction.SetOperand(i, new ArrayAccess(array, index));
+                    if (scalarSize == 0 && i == 1 && instruction.Destination is LocalVariable loaded)
+                        LocalVariables.PropagateProducedType(loaded, elementType);
+                }
             }
         }
     }
@@ -1075,9 +1089,8 @@ public static class ArrayRecovery
         _ => null,
     };
 
-    private static IOperand? ElementIndex(MemoryOperand memory, SzArrayTypeAnalysisContext arrayType, int pointerSize)
+    private static IOperand? ElementIndex(MemoryOperand memory, long elementSize, int pointerSize)
     {
-        var elementSize = ElementSize(arrayType.ElementType, pointerSize);
         long offset;
         try
         {
@@ -1118,7 +1131,7 @@ public static class ArrayRecovery
         };
     }
 
-    // Recovers &array[i] over struct arrays. Struct elements are never loaded outright, the compiler
+    // Recovers &array[i] over struct arrays when the compiler
     // computes their address via lea chains and calls through it. We solve the index as a linear function
     // of a local and demand an exact hit on the metadata stride, so a real load can't match by accident.
     private static void RecoverStructElementAddresses(MethodAnalysisContext method, List<Instruction> instructions)
@@ -1141,8 +1154,9 @@ public static class ArrayRecovery
                 continue;
             }
 
-            // a Move from memory could be a load or a lifted lea, and only the uses tell them apart
-            if (instruction is not { OpCode: OpCode.Move, Operands: [LocalVariable destination, MemoryOperand] })
+            // An actual load must never be rewritten as a pointer.
+            if (instruction is not { OpCode: OpCode.Move, MemoryAccessSize: null,
+                    Operands: [LocalVariable destination, MemoryOperand] })
                 continue;
 
             if (definitions.TryGetValue(destination, out var single) && single == null)

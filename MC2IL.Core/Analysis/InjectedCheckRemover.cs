@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using MC2IL.Core.Graphs;
@@ -23,6 +24,7 @@ public static class InjectedCheckRemover
         var allDefs = removeBoundsChecks ? BuildAllDefinitionMap(cfg) : [];
         var ignoredExceptionConstructions = FindUnusedExceptionConstructions(cfg);
         var redundantLengthLoads = new HashSet<Instruction>();
+        DominatorInfo? dominance = null;
         var removedAny = false;
 
         foreach (var block in cfg.Blocks)
@@ -58,7 +60,7 @@ public static class InjectedCheckRemover
             if (terminator.Operands[1] is not LocalVariable condition
                 || !TryGetDefinitionBefore(block, terminator, condition, defOf, out var definition)
                 || !IsInjectedCheck(block, definition, thrown, throwOnTrue, defOf, allDefs, stableParameters, addressed, throwOnTrue ? falseTarget : trueTarget,
-                    removeNullChecks, removeBoundsChecks, redundantLengthLoads))
+                    removeNullChecks, removeBoundsChecks, redundantLengthLoads, HasDominatingDereference))
                 continue;
 
             RemoveThrowEdge(block, throwTarget, throwOnTrue ? falseTarget : trueTarget);
@@ -70,7 +72,35 @@ public static class InjectedCheckRemover
 
         // delete any throw blocks
         cfg.RemoveUnreachableBlocks();
+        redundantLengthLoads.RemoveWhere(load => load.Operands[1] is not ArrayLength { Array: var array }
+            || cfg.FindBlockByInstruction(load) is not { } block
+            || !HasImplicitNullCheckOnEveryPath(block, array, defOf, arraysOnly: true,
+                allowNonThrowingComputations: true, GetCheckedReceiverOwner(block, load, array, defOf),
+                [], [], [], [], startIndex: block.Instructions.IndexOf(load) + 1));
         DeadCodeEliminator.Run(cfg, redundantLengthLoads);
+
+        bool HasDominatingDereference(Block guard, Instruction before, LocalVariable receiver)
+        {
+            if (!stableParameters.Contains(receiver))
+                return false;
+
+            if (!(dominance ??= new DominatorInfo(cfg)).Dominators.TryGetValue(guard, out var dominators))
+                return false;
+
+            foreach (var block in dominators)
+            {
+                foreach (var instruction in block.Instructions)
+                {
+                    if (instruction == before)
+                        break;
+                    if (instruction is { OpCode: OpCode.Call, NullCheckReceiver: true,
+                            Operands: [MethodAnalysisContext { IsStatic: false, DeclaringType.IsValueType: false }, _, var owner, ..] }
+                        && ReferenceEquals(receiver, owner))
+                        return true;
+                }
+            }
+            return false;
+        }
     }
 
     private static void RemoveThrowEdge(Block block, Block throwTarget, Block continuation)
@@ -86,7 +116,8 @@ public static class InjectedCheckRemover
     private static bool IsInjectedCheck(Block checkedBlock, Instruction definition, InjectedThrow thrown, bool throwOnTrue,
         Dictionary<LocalVariable, Instruction> defOf, Dictionary<LocalVariable, List<Instruction>> allDefs,
         HashSet<LocalVariable> stableParameters, HashSet<LocalVariable> addressed, Block continuation,
-        bool removeNullChecks, bool removeBoundsChecks, HashSet<Instruction> redundantLengthLoads)
+        bool removeNullChecks, bool removeBoundsChecks, HashSet<Instruction> redundantLengthLoads,
+        Func<Block, Instruction, LocalVariable, bool> hasDominatingDereference)
     {
         if (TryGetNullComparison(checkedBlock, definition, throwOnTrue, defOf,
                 out var nullComparison, out var comparisonBranchOnTrue, out var receiver)
@@ -104,7 +135,12 @@ public static class InjectedCheckRemover
                 && (HasImplicitNullCheck(continuation, receiver, defOf,
                         arraysOnly: thrown.ExceptionType == "System.IndexOutOfRangeException",
                         allowNonThrowingComputations: thrown.ExceptionType == "System.NullReferenceException" && receiver is LocalVariable,
-                        knownNonNullThis: knownNonNullThis)
+                        knownNonNullThis: knownNonNullThis,
+                        canSkipGetter: instruction => instruction is { OpCode: OpCode.Call,
+                            Operands: [MethodAnalysisContext getter, LocalVariable, LocalVariable owner] }
+                            && !ReferenceEquals(owner, receiver) && stableParameters.Contains(owner)
+                            && InlinedFieldGetterRecovery.IsVerifiedDirectGetter(getter)
+                            && hasDominatingDereference(checkedBlock, definition, owner))
                     || thrown.ExceptionType == "System.NullReferenceException"
                     && (IsObjectAllocationCheck(checkedBlock, definition, continuation, receiver, defOf)
                         || HasImplicitNullCheckAfterGuardCopies(checkedBlock, nullComparison, continuation, receiver, addressed)
@@ -115,7 +151,7 @@ public static class InjectedCheckRemover
         }
 
         return removeBoundsChecks && thrown.ExceptionType == "System.IndexOutOfRangeException"
-            && IsArrayBoundsCheck(checkedBlock, definition, throwOnTrue, continuation, defOf, allDefs,
+            && IsArrayBoundsCheck(definition, throwOnTrue, continuation, defOf, allDefs,
                 removeNullChecks, redundantLengthLoads);
     }
 
@@ -427,12 +463,13 @@ public static class InjectedCheckRemover
 
     private static bool HasImplicitNullCheck(Block continuation, IOperand receiver,
         Dictionary<LocalVariable, Instruction> defOf, bool arraysOnly, bool allowNonThrowingComputations,
-        LocalVariable? knownNonNullThis)
+        LocalVariable? knownNonNullThis, Func<Instruction, bool>? canSkipGetter = null)
     {
         var callsNeedingNullCheck = new HashSet<Instruction>();
         var argumentComputations = new HashSet<Instruction>();
         if (!HasImplicitNullCheckOnEveryPath(continuation, receiver, defOf, arraysOnly,
-                allowNonThrowingComputations, knownNonNullThis, [], [], callsNeedingNullCheck, argumentComputations))
+                allowNonThrowingComputations, knownNonNullThis, [], [], callsNeedingNullCheck, argumentComputations,
+                canSkipGetter))
             return false;
 
         foreach (var call in callsNeedingNullCheck)
@@ -443,15 +480,17 @@ public static class InjectedCheckRemover
     private static bool HasImplicitNullCheckOnEveryPath(Block start, IOperand receiver,
         Dictionary<LocalVariable, Instruction> defOf, bool arraysOnly, bool allowNonThrowingComputations,
         LocalVariable? knownNonNullThis, List<Instruction> pathInstructions, HashSet<Block> visitedPath,
-        HashSet<Instruction> callsNeedingNullCheck, HashSet<Instruction> argumentComputations)
+        HashSet<Instruction> callsNeedingNullCheck, HashSet<Instruction> argumentComputations,
+        Func<Instruction, bool>? canSkipGetter = null, int startIndex = 0)
     {
         // A native null guard can precede a conditional whose separate branches both
         // dereference the same value. Remove it only when every branch proves that use.
         var current = start;
         while (visitedPath.Count < 32 && visitedPath.Add(current))
         {
-            foreach (var instruction in current.Instructions)
+            for (var i = startIndex; i < current.Instructions.Count; i++)
             {
+                var instruction = current.Instructions[i];
                 if (instruction.OpCode is OpCode.Nop or OpCode.Jump)
                 {
                     pathInstructions.Add(instruction);
@@ -473,7 +512,8 @@ public static class InjectedCheckRemover
                 }
 
                 if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, var fieldSource] }
-                    && IsSafeFieldRead(fieldSource, knownNonNullThis))
+                    && IsSafeFieldRead(fieldSource, knownNonNullThis)
+                    || canSkipGetter?.Invoke(instruction) == true)
                 {
                     pathInstructions.Add(instruction);
                     continue;
@@ -488,7 +528,7 @@ public static class InjectedCheckRemover
                     {
                         if (!HasImplicitNullCheckOnEveryPath(successor, receiver, defOf, arraysOnly,
                                 allowNonThrowingComputations, knownNonNullThis, [.. pathInstructions],
-                                [.. visitedPath], callsNeedingNullCheck, [.. argumentComputations]))
+                                [.. visitedPath], callsNeedingNullCheck, [.. argumentComputations], canSkipGetter))
                             return false;
                     }
                     return true;
@@ -511,6 +551,7 @@ public static class InjectedCheckRemover
             if (current.Successors is not [var next])
                 return false;
             current = next;
+            startIndex = 0;
         }
 
         // Cycles and long, unresolved paths are not proof that every route checks this value.
@@ -933,7 +974,7 @@ public static class InjectedCheckRemover
     // Only erase a bounds guard after array recovery has produced both its length and the
     // corresponding element access. Otherwise the generated IL would have no operation left
     // to enforce the same bounds check.
-    private static bool IsArrayBoundsCheck(Block guard, Instruction definition, bool throwOnTrue, Block continuation,
+    private static bool IsArrayBoundsCheck(Instruction definition, bool throwOnTrue, Block continuation,
         Dictionary<LocalVariable, Instruction> defOf, Dictionary<LocalVariable, List<Instruction>> allDefs,
         bool removeNullChecks, HashSet<Instruction> redundantLengthLoads)
     {
@@ -958,14 +999,12 @@ public static class InjectedCheckRemover
                 access.Index is Immediate { Value: 0 });
             if (hasLength && sameArray && sameIndex && matchingCheck)
             {
-                // With no observable work between ldlen and the matched access, ldelem/stelem
-                // performs the same null and range checks. The old length load can die if unread.
-                if (receiverGuard == null
-                    && definition.Operands[lengthIndex] is LocalVariable length
+                // Check all paths from the length load after the bounds edges are removed.
+                // The load can be shared across branches that use different indices.
+                if (definition.Operands[lengthIndex] is LocalVariable length
                     && defOf.TryGetValue(length, out var load)
                     && load is { OpCode: OpCode.Move, Operands: [_, ArrayLength { Array: var lengthArray }] }
-                    && ReferenceEquals(lengthArray, access.Array) && operation != null
-                    && IsImmediatelyBeforeBoundsBranch(guard, load, definition, continuation, operation, lengthArray))
+                    && ReferenceEquals(lengthArray, access.Array))
                     redundantLengthLoads.Add(load);
 
                 if (receiverGuard is { } receiver)
@@ -980,48 +1019,26 @@ public static class InjectedCheckRemover
         return false;
     }
 
-    private static bool IsImmediatelyBeforeBoundsBranch(Block guard, Instruction load, Instruction comparison,
-        Block continuation, Instruction access, LocalVariable array)
-    {
-        var index = guard.Instructions.IndexOf(load);
-        if (index < 0 || guard.Instructions.IndexOf(comparison) <= index)
-            return false;
-        for (var i = index + 1; i < guard.Instructions.Count - 1; i++)
-            if (guard.Instructions[i] != comparison && guard.Instructions[i].OpCode != OpCode.Nop)
-                return false;
-
-        var seen = new HashSet<Block>();
-        for (var block = continuation; seen.Add(block);)
-        {
-            foreach (var instruction in block.Instructions)
-            {
-                if (instruction == access)
-                    return true;
-                if (ReferenceEquals(instruction.Destination, array))
-                    return false;
-            }
-            if (block.Successors is not [var next])
-                break;
-            block = next;
-        }
-        return false;
-    }
-
     private sealed record GuardedArrayArgument(ArrayAccess Access, Instruction Call, Block Failure, Block Continuation);
 
     private static GuardedArrayArgument? MatchGuardedArrayArgument(Block guard)
     {
-        // IL2CPP can check the array bounds, load a receiver from this, check the receiver,
-        // and only then load the previously checked element. The equivalent CIL loads the
-        // argument first (checking bounds), then saves the receiver null check in callvirt.
-        if (guard.Predecessors.Count != 1 || guard.Successors.Count != 2
-            || guard.Instructions.Where(i => i.OpCode != OpCode.Nop).ToArray() is not
-                [ { OpCode: OpCode.Move, Operands: [LocalVariable receiver,
-                      FieldReference { Parent: null, Local.IsThis: true, Field.IsStatic: false }] },
-                  var comparison,
-                  { OpCode: OpCode.ConditionalJump, Operands: [Block taken, LocalVariable condition] } ]
-            || !ReferenceEquals(comparison.Destination, condition)
-            || !IsNullComparison(comparison, out var tested) || !ReferenceEquals(receiver, tested))
+        // The bounds check runs before the receiver check. Loading the argument for
+        // a callvirt enforces the same order, including when the receiver was loaded earlier.
+        if (guard.Predecessors.Count != 1 || guard.Successors.Count != 2)
+            return null;
+
+        var operations = guard.Instructions.Where(i => i.OpCode != OpCode.Nop).ToArray();
+        if (operations.Length is < 2 or > 3
+            || operations[^1] is not { OpCode: OpCode.ConditionalJump, Operands: [Block taken, LocalVariable condition] })
+            return null;
+
+        var comparison = operations[^2];
+        if (!ReferenceEquals(comparison.Destination, condition)
+            || !IsNullComparison(comparison, out var tested) || tested is not LocalVariable receiver
+            || operations.Length == 3 && (operations[0] is not { OpCode: OpCode.Move, Operands:
+                    [LocalVariable loaded, FieldReference { Parent: null, Local.IsThis: true, Field.IsStatic: false }] }
+                || !ReferenceEquals(receiver, loaded)))
             return null;
 
         var other = guard.Successors.FirstOrDefault(block => block != taken);
@@ -1029,7 +1046,7 @@ public static class InjectedCheckRemover
             return null;
         var failure = comparison.OpCode == OpCode.CheckEqual ? taken : other;
         var continuation = failure == taken ? other : taken;
-        if (GetInjectedThrow(failure, []) is not { ExceptionType: "System.NullReferenceException" }
+        if (GetInjectedThrowThroughSplitEdge(failure, []) is not { ExceptionType: "System.NullReferenceException" }
             || continuation.Predecessors.Count != 1
             || continuation.Instructions.Where(i => i.OpCode != OpCode.Nop).Take(2).ToArray() is not
                 [ { OpCode: OpCode.Move, Operands: [LocalVariable argument, ArrayAccess access] }, var call ]
@@ -1252,10 +1269,11 @@ public static class InjectedCheckRemover
     {
         // Phi lowering can split an edge to the shared null-failure block and
         // initialize a local along the edge. The throw does not read that local.
+        var writesStackSlot = false;
         for (var depth = 0; depth < 16; depth++)
         {
             if (GetInjectedThrow(block, ignoredExceptionConstructions) is { } thrown)
-                return depth == 0 || thrown.ExceptionType == "System.NullReferenceException" ? thrown : null;
+                return !writesStackSlot || thrown.ExceptionType == "System.NullReferenceException" ? thrown : null;
 
             var instructions = block.Instructions;
             if (block.Successors is not [var next] || instructions.Count == 0
@@ -1273,6 +1291,7 @@ public static class InjectedCheckRemover
                     || !IlGenerator.IsManagedReference(type)
                     || !local.Register.Name.StartsWith("stack_", System.StringComparison.Ordinal))
                     return null;
+                writesStackSlot = true;
             }
 
             block = next;

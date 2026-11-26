@@ -1662,6 +1662,7 @@ public static class MetadataResolver
                 if (candidate == targetRead || candidate == methodInfoRead || candidate.OpCode == OpCode.Nop
                     || candidate is { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable or Immediate] }
                     || candidate is { OpCode: OpCode.Move, Operands: [LocalVariable, MemoryOperand] }
+                    || checkedReceiver && IsAddressComputation(candidate)
                     || checkedReceiver && candidate.OpCode == OpCode.PackFloatAggregate
                         && candidate.Operands.Skip(2).All(operand => operand is LocalVariable or FloatLiteral or DoubleLiteral)
                     || checkedReceiver && candidate is { OpCode: OpCode.Move, Operands: [LocalVariable,
@@ -1687,6 +1688,15 @@ public static class MetadataResolver
             if (methodInfoRead != null && homeBlocks.TryGetValue(methodInfoRead, out var methodInfoBlock) && methodInfoBlock == block)
                 discardableDispatchLoads.Add(methodInfoRead);
         }
+
+        static bool IsAddressComputation(Instruction instruction) => instruction switch
+        {
+            { OpCode: OpCode.Add or OpCode.Subtract or OpCode.ShiftLeft,
+                Operands: [LocalVariable, LocalVariable or Immediate, LocalVariable or Immediate] } => true,
+            { OpCode: OpCode.Convert, Operands: [LocalVariable, LocalVariable,
+                NumericConversion { Kind: NumericConversionKind.I64ExtendI32Signed or NumericConversionKind.I64ExtendI32Unsigned }] } => true,
+            _ => false
+        };
 
         bool IsDeadVTableEntryLoad(Instruction candidate, LocalVariable? klassLocal)
         {
