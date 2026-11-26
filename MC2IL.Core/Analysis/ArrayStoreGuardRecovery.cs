@@ -32,11 +32,14 @@ internal static class ArrayStoreGuardRecovery
                 continue;
             if (typeCheck.Predecessors is not [var entry] || entry != guard)
                 continue;
-            if (MatchTypeCheck(typeCheck, value) is not { } check)
+            if (MatchTypeCheck(typeCheck) is not { } check)
                 continue;
             if (GetExclusiveThrowPath(typeCheck, check.Failure) is not { } failurePath)
                 continue;
-            if (GetExclusiveThrowPath(guard, nullPath) == null)
+            // Null is also a valid element of a reference array. Some builds skip
+            // the type test on that edge and join directly at the same store.
+            if (!(value == check.Value && nullPath == check.Pass
+                    || value == check.Array && GetExclusiveThrowPath(guard, nullPath) != null))
                 continue;
             if (check.Pass.Instructions.Any(instruction => instruction.OpCode == OpCode.Phi))
                 continue;
@@ -93,13 +96,12 @@ internal static class ArrayStoreGuardRecovery
     private sealed record TypeCheck(LocalVariable Array, LocalVariable Value, ulong Target, long ElementClassOffset,
         Block Failure, Block Pass);
 
-    private static TypeCheck? MatchTypeCheck(Block block, LocalVariable array)
+    private static TypeCheck? MatchTypeCheck(Block block)
     {
         var instructions = block.Instructions.Where(i => i.OpCode != OpCode.Nop).ToArray();
         if (instructions is not [var classLoad, .., var call, var comparison, var branch]
             || classLoad is not { OpCode: OpCode.Move, MemoryAccessSize: 8,
                 Operands: [LocalVariable klass, MemoryOperand { Base: LocalVariable sourceArray, Index: null, Scale: 0, Addend: 0 }] }
-            || sourceArray != array
             || call is not { OpCode: OpCode.Call, Operands: [Immediate { Value: > 0 } target, LocalVariable result,
                 LocalVariable candidate, var elementClass, ..] }
             || !TryGetNullEdges(block, comparison, branch, out var checkedResult, out var fail, out var pass)
@@ -114,7 +116,7 @@ internal static class ArrayStoreGuardRecovery
             _ => null,
         };
         return classField is MemoryOperand { Index: null, Scale: 0 } memory && memory.Base == klass
-            ? new TypeCheck(array, candidate, (ulong)target.Value, memory.Addend, fail, pass)
+            ? new TypeCheck(sourceArray, candidate, (ulong)target.Value, memory.Addend, fail, pass)
             : null;
     }
 
