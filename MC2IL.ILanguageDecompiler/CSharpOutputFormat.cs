@@ -173,6 +173,8 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
             var source = new CSharpDecompiler(module, resolver, settings);
             source.AstTransforms.Add(new SimplifyReferenceNullChecks());
             source.AstTransforms.Add(new InlineTerminalThrowGotos());
+            // Inline pure single-use arithmetic locals produced by machine-code lowering.
+            source.AstTransforms.Add(new InlineArithmeticTemporaries());
             var usedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var metadata = module.Metadata;
             foreach (var handle in metadata.TypeDefinitions)
@@ -266,9 +268,9 @@ public sealed class CSharpOutputFormat : MC2ILOutputFormat
             var decompiler = base.CreateDecompiler(typeSystem);
             decompiler.AstTransforms.Add(new SimplifyReferenceNullChecks());
             decompiler.AstTransforms.Add(new InlineTerminalThrowGotos());
+            decompiler.AstTransforms.Add(new InlineArithmeticTemporaries());
             return decompiler;
         }
-
         protected override IEnumerable<ProjectItemInfo> WriteResourceFilesInProject(MetadataFile module) => Enumerable.Empty<ProjectItemInfo>();
 
         protected override IEnumerable<ProjectItemInfo> WriteMiscellaneousFilesInProject(PEFile module) => Enumerable.Empty<ProjectItemInfo>();
