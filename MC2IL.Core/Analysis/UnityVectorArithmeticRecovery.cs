@@ -151,6 +151,11 @@ internal static class UnityVectorArithmeticRecovery
                 block.Instructions.Insert(insertAt, operation);
                 definitions.Add(result, operation);
                 homes.Add(operation, block);
+                foreach (var component in left.Concat(right).OfType<LocalVariable>().Distinct())
+                    if (reads[component].Count() == 1 && definitions.TryGetValue(component, out var componentRead)
+                        && componentRead is { OpCode: OpCode.Move, OperandWidth: null,
+                            Operands: [LocalVariable, FieldReference] })
+                        Remove(componentRead);
                 var fields = GetFields(vectorType);
                 for (var lane = 0; lane < 3; lane++)
                 {
@@ -232,7 +237,7 @@ internal static class UnityVectorArithmeticRecovery
             var join = homes[consumer];
             var visited = new HashSet<Block>();
             while (visited.Count < 12 && visited.Add(join) && join.Predecessors is [var previous]
-                   && previous.Successors is [var next] && next == join)
+                   && previous != join)
                 join = previous;
             if (join.Predecessors.Count != 2 || operands.OfType<LocalVariable>().Count() != 3)
                 return null;
