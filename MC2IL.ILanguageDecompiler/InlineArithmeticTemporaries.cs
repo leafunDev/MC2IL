@@ -29,7 +29,7 @@ internal sealed class InlineArithmeticTemporaries : IAstTransform
 
                     var variable = declaration.Variables.Single();
                     if (variable.Initializer is not { } initializer
-                        || initializer.GetResolveResult().Type.FullName is not ("System.Single" or "System.Double")
+                        || initializer.GetResolveResult().Type.FullName is not ("System.Single" or "System.Double" or "System.Int32")
                         || !IsPureArithmetic(initializer))
                         continue;
 
@@ -115,9 +115,11 @@ internal sealed class InlineArithmeticTemporaries : IAstTransform
     {
         foreach (var ancestor in node.Ancestors)
         {
-            if (ancestor is ConditionalExpression)
+            if (ancestor is ConditionalExpression conditional
+                && (IsDescendantOf(node, conditional.TrueExpression) || IsDescendantOf(node, conditional.FalseExpression)))
                 return true;
-            if (ancestor is BinaryOperatorExpression { Operator: BinaryOperatorType.ConditionalAnd or BinaryOperatorType.ConditionalOr,
+            if (ancestor is BinaryOperatorExpression
+                { Operator: BinaryOperatorType.ConditionalAnd or BinaryOperatorType.ConditionalOr or BinaryOperatorType.NullCoalescing,
                     Right: { } right } && IsDescendantOf(node, right))
                 return true;
         }
