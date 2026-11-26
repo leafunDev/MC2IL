@@ -430,8 +430,9 @@ public static class InjectedCheckRemover
         LocalVariable? knownNonNullThis)
     {
         var callsNeedingNullCheck = new HashSet<Instruction>();
+        var argumentComputations = new HashSet<Instruction>();
         if (!HasImplicitNullCheckOnEveryPath(continuation, receiver, defOf, arraysOnly,
-                allowNonThrowingComputations, knownNonNullThis, [], [], callsNeedingNullCheck))
+                allowNonThrowingComputations, knownNonNullThis, [], [], callsNeedingNullCheck, argumentComputations))
             return false;
 
         foreach (var call in callsNeedingNullCheck)
@@ -442,7 +443,7 @@ public static class InjectedCheckRemover
     private static bool HasImplicitNullCheckOnEveryPath(Block start, IOperand receiver,
         Dictionary<LocalVariable, Instruction> defOf, bool arraysOnly, bool allowNonThrowingComputations,
         LocalVariable? knownNonNullThis, List<Instruction> pathInstructions, HashSet<Block> visitedPath,
-        HashSet<Instruction> callsNeedingNullCheck)
+        HashSet<Instruction> callsNeedingNullCheck, HashSet<Instruction> argumentComputations)
     {
         // A native null guard can precede a conditional whose separate branches both
         // dereference the same value. Remove it only when every branch proves that use.
@@ -487,14 +488,24 @@ public static class InjectedCheckRemover
                     {
                         if (!HasImplicitNullCheckOnEveryPath(successor, receiver, defOf, arraysOnly,
                                 allowNonThrowingComputations, knownNonNullThis, [.. pathInstructions],
-                                [.. visitedPath], callsNeedingNullCheck))
+                                [.. visitedPath], callsNeedingNullCheck, [.. argumentComputations]))
                             return false;
                     }
                     return true;
                 }
 
-                return IsImplicitNullCheckOperation(current, instruction, receiver, defOf, arraysOnly,
-                    knownNonNullThis, pathInstructions, callsNeedingNullCheck);
+                if (IsImplicitNullCheckOperation(current, instruction, receiver, defOf, arraysOnly,
+                        pathInstructions, callsNeedingNullCheck, argumentComputations))
+                    return true;
+
+                if (!arraysOnly && IsArgumentValueComputation(instruction, receiver, pathInstructions, defOf))
+                {
+                    pathInstructions.Add(instruction);
+                    argumentComputations.Add(instruction);
+                    continue;
+                }
+
+                return false;
             }
 
             if (current.Successors is not [var next])
@@ -507,8 +518,9 @@ public static class InjectedCheckRemover
     }
 
     private static bool IsImplicitNullCheckOperation(Block block, Instruction operation, IOperand receiver,
-        Dictionary<LocalVariable, Instruction> defOf, bool arraysOnly, LocalVariable? knownNonNullThis,
-        List<Instruction> pathInstructions, HashSet<Instruction> callsNeedingNullCheck)
+        Dictionary<LocalVariable, Instruction> defOf, bool arraysOnly,
+        List<Instruction> pathInstructions, HashSet<Instruction> callsNeedingNullCheck,
+        HashSet<Instruction> argumentComputations)
     {
         // A check proves the value held at the branch, not a later value written to
         // the same local while evaluating the surviving path.
@@ -519,7 +531,7 @@ public static class InjectedCheckRemover
         var operand = FirstAccess(operation);
         if (operand is ArrayLength length && SameValueOnPath(receiver, length.Array, pathInstructions, defOf)
             || AsArrayAccess(operand) is { } access && SameValueOnPath(receiver, access.Array, pathInstructions, defOf))
-            return true;
+            return argumentComputations.Count == 0;
 
         if (arraysOnly)
             return false;
@@ -529,13 +541,13 @@ public static class InjectedCheckRemover
             && dereferenced.Type is { } dereferencedType && IlGenerator.IsManagedReference(dereferencedType)
             && SameValueOnPath(receiver, dereferenced, pathInstructions, defOf)
             && TryMatchNativeDispatchNullCheck(block, operation, receiver, defOf,
-                pathInstructions, callsNeedingNullCheck))
+                pathInstructions, callsNeedingNullCheck, argumentComputations))
             return true;
 
         if ((operand is AddressOf { Target: FieldReference addressedField } ? addressedField : operand)
             is FieldReference { Field.IsStatic: false } field
             && SameValueOnPath(receiver, field.Local, pathInstructions, defOf))
-            return true;
+            return argumentComputations.Count == 0;
 
         // A direct CIL call can enter a nonvirtual instance method on a null receiver. Use
         // callvirt for its null check only when it cannot change the method being invoked.
@@ -547,36 +559,122 @@ public static class InjectedCheckRemover
 
         var receiverIndex = operation.OpCode == OpCode.CallVoid ? 1 : 2;
         if (operation.Operands.Count <= receiverIndex
-            || !SameValueOnPath(receiver, operation.Operands[receiverIndex], pathInstructions, defOf))
+            || !SameValueOnPath(receiver, operation.Operands[receiverIndex], pathInstructions, defOf)
+            || !AreArgumentComputationsUsedByCall(pathInstructions, argumentComputations, operation, target))
             return false;
-
-        for (var parameterIndex = 0; parameterIndex < target.Parameters.Count; parameterIndex++)
-        {
-            var operandIndex = receiverIndex + 1 + parameterIndex;
-            if (operandIndex >= operation.Operands.Count)
-                break;
-
-            var argument = operation.Operands[operandIndex];
-            if (IsSimpleValue(argument) || IsSafeFieldRead(argument, knownNonNullThis))
-                continue;
-
-            // Taking the address of a local for ref/out does not dereference
-            // anything before callvirt checks the receiver. Fields and array
-            // elements can throw while their addresses are evaluated.
-            if (argument is not AddressOf { Target: LocalVariable { Type: { } localType } }
-                || target.Parameters[parameterIndex].ParameterType is not ByRefTypeAnalysisContext byRef
-                || !MetadataResolver.IsSameType(localType, byRef.ElementType))
-                return false;
-        }
 
         if (!operation.NullCheckReceiver)
             callsNeedingNullCheck.Add(operation);
         return true;
     }
 
+    private static bool IsArgumentValueComputation(Instruction instruction, IOperand receiver,
+        List<Instruction> pathInstructions, Dictionary<LocalVariable, Instruction> defOf)
+    {
+        if (instruction.Destination is not LocalVariable destination
+            || ReferenceEquals(destination, receiver))
+            return false;
+
+        if (instruction is { OpCode: OpCode.Call, Operands: [MethodAnalysisContext target, LocalVariable result, ..] }
+            && ReferenceEquals(destination, result)
+            && !target.Parameters.Any(parameter => parameter.ParameterType is ByRefTypeAnalysisContext))
+        {
+            // CIL performs the callvirt null check after argument evaluation. Preserve
+            // these potentially throwing operations in place, and validate at the eventual
+            // call that each computed value really participates in its arguments.
+            // A separate call can be part of a later call's argument expression. Do not
+            // skip a call on the checked object itself: that call must provide the null check.
+            var receiverIndex = 2;
+            return target.IsStatic || instruction.Operands.Count > receiverIndex
+                && !SameValueOnPath(receiver, instruction.Operands[receiverIndex], pathInstructions, defOf);
+        }
+
+        return instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, FieldReference or ArrayAccess
+            or ArrayLength or AddressOf { Target: FieldReference or ArrayAccess }] };
+    }
+
+    private static bool AreArgumentComputationsUsedByCall(List<Instruction> pathInstructions,
+        HashSet<Instruction> argumentComputations, Instruction call, MethodAnalysisContext target)
+    {
+        if (argumentComputations.Count == 0)
+            return true;
+
+        var argumentIndex = call.OpCode == OpCode.CallVoid ? 1 : 2;
+        if (!target.IsStatic)
+            argumentIndex++;
+
+        var needed = new HashSet<LocalVariable>();
+        for (var i = 0; i < target.Parameters.Count; i++)
+        {
+            if (argumentIndex + i >= call.Operands.Count)
+                return false;
+            AddOperandLocals(call.Operands[argumentIndex + i], needed);
+        }
+
+        for (var i = pathInstructions.Count - 1; i >= 0; i--)
+        {
+            var instruction = pathInstructions[i];
+            if (instruction.Destination is not LocalVariable destination)
+            {
+                if (argumentComputations.Contains(instruction))
+                    return false;
+                continue;
+            }
+
+            if (!needed.Remove(destination))
+            {
+                if (argumentComputations.Contains(instruction))
+                    return false;
+                continue;
+            }
+
+            foreach (var local in DeadCodeEliminator.UsedLocals(instruction))
+                needed.Add(local);
+        }
+
+        return true;
+    }
+
+    private static void AddOperandLocals(IOperand operand, HashSet<LocalVariable> locals)
+    {
+        switch (operand)
+        {
+            case LocalVariable local:
+                locals.Add(local);
+                break;
+            case FieldReference field when !IsStaticFieldPath(field):
+                locals.Add(field.Local);
+                break;
+            case ArrayAccess access:
+                AddOperandLocals(access.Array, locals);
+                AddOperandLocals(access.Index, locals);
+                break;
+            case ArrayLength length:
+                locals.Add(length.Array);
+                break;
+            case AddressOf address:
+                AddOperandLocals(address.Target, locals);
+                break;
+            case MemoryOperand memory:
+                if (memory.Base is { } memoryBase)
+                    AddOperandLocals(memoryBase, locals);
+                if (memory.Index is { } memoryIndex)
+                    AddOperandLocals(memoryIndex, locals);
+                break;
+        }
+    }
+
+    private static bool IsStaticFieldPath(FieldReference field)
+    {
+        for (var current = field; current != null; current = current.Parent)
+            if (current.Field.IsStatic)
+                return true;
+        return false;
+    }
+
     private static bool TryMatchNativeDispatchNullCheck(Block block, Instruction firstRead, IOperand receiver,
         Dictionary<LocalVariable, Instruction> defOf, List<Instruction> pathInstructions,
-        HashSet<Instruction> callsNeedingNullCheck)
+        HashSet<Instruction> callsNeedingNullCheck, HashSet<Instruction> argumentComputations)
     {
         if (firstRead is not { OpCode: OpCode.Move, Operands: [LocalVariable, MemoryOperand firstMemory] }
             || !IsNativeDispatchMemoryRead(firstMemory, receiver, pathInstructions, defOf, requireReceiver: true))
@@ -624,8 +722,8 @@ public static class InjectedCheckRemover
                 var receiverIndex = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
                 if (instruction.Operands.Count > receiverIndex
                     && SameValueOnPath(receiver, instruction.Operands[receiverIndex], path, defOf)
-                    && instruction.Operands.Skip(receiverIndex + 1).Take(target.Parameters.Count)
-                        .All(argument => IsSimpleValue(argument)))
+                    && instruction.Operands.Count >= receiverIndex + 1 + target.Parameters.Count
+                    && AreArgumentComputationsUsedByCall(path, argumentComputations, instruction, target))
                 {
                     instruction.NullCheckReceiver = true;
                     callsNeedingNullCheck.Add(instruction);
