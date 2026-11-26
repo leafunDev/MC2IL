@@ -102,7 +102,7 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
         string.Join("\n", ArmV7Utils.Decode(context.AppContext, context.UnderlyingPointer, context.RawBytes)
             .Select(i => $"0x{i.Address:X} {i.Mnemonic} {i.Operand}"));
 
-    private sealed class Lifter(MethodAnalysisContext method, List<ArmInstruction> native)
+    internal sealed class Lifter(MethodAnalysisContext method, List<ArmInstruction> native)
     {
         private readonly List<Instruction> _result = [];
         private readonly Dictionary<long, Instruction> _labels = new();
@@ -158,11 +158,42 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
             var ops = instruction.Details.Operands;
             var pc = unchecked((uint)((instruction.Address + (_thumb ? 4 : 8)) & (_thumb ? ~3L : ~0L)));
             var id = instruction.Id;
-            IOperand? Read(int i) => i < ops.Length ? ReadOperand(ops[i], pc) : null;
+            var readsShifterCarry = instruction.Details.UpdateFlags
+                && id is (ArmInstructionId.ARM_INS_MOV or ArmInstructionId.ARM_INS_MVN
+                    or ArmInstructionId.ARM_INS_AND or ArmInstructionId.ARM_INS_BIC
+                    or ArmInstructionId.ARM_INS_ORR or ArmInstructionId.ARM_INS_EOR
+                    or ArmInstructionId.ARM_INS_TST or ArmInstructionId.ARM_INS_TEQ);
+            IOperand? Read(int i) => i < ops.Length
+                ? ReadOperand(ops[i], pc, readsShifterCarry && i > 0)
+                : null;
             Register? Dest(int i = 0) => i < ops.Length && ops[i].Type == ArmOperandType.Register ? Reg(ops[i].Register.Name) : null;
 
             switch (id)
             {
+                case ArmInstructionId.ARM_INS_VSQRT:
+                case ArmInstructionId.ARM_INS_VABS:
+                {
+                    if (ops.Length != 2 || Dest() is not { } floatResult || Read(1) is not Register floatSource)
+                        break;
+
+                    var isDouble = floatResult.Name.StartsWith("d", StringComparison.Ordinal)
+                        && floatSource.Name.StartsWith("d", StringComparison.Ordinal)
+                        && instruction.Mnemonic.EndsWith(".f64", StringComparison.Ordinal);
+                    var isSingle = floatResult.Name.StartsWith("s", StringComparison.Ordinal)
+                        && floatSource.Name.StartsWith("s", StringComparison.Ordinal)
+                        && instruction.Mnemonic.EndsWith(".f32", StringComparison.Ordinal);
+                    if (!isDouble && !isSingle)
+                        break;
+
+                    var isAbs = id == ArmInstructionId.ARM_INS_VABS;
+                    if (NewArmV8InstructionSet.FindFloatMathMethod(method.AppContext,
+                            isDouble ? "System.Double" : "System.Single", isAbs ? "Abs" : "Sqrt", 1) is { } mathMethod)
+                    {
+                        Add(OpCode.Call, mathMethod, floatResult, floatSource).IsLiftedFloatAbs = isAbs;
+                        return;
+                    }
+                    break;
+                }
                 case ArmInstructionId.ARM_INS_NOP:
                 case ArmInstructionId.ARM_INS_IT: // Capstone attaches the condition to each covered instruction.
                     return;
@@ -263,6 +294,17 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                         && LiftMemory(instruction, data, Read(1)))
                         return;
                     break;
+                case ArmInstructionId.ARM_INS_LDM:
+                case ArmInstructionId.ARM_INS_LDMIB:
+                case ArmInstructionId.ARM_INS_LDMDA:
+                case ArmInstructionId.ARM_INS_LDMDB:
+                case ArmInstructionId.ARM_INS_STM:
+                case ArmInstructionId.ARM_INS_STMIB:
+                case ArmInstructionId.ARM_INS_STMDA:
+                case ArmInstructionId.ARM_INS_STMDB:
+                    if (LiftBlockTransfer(instruction))
+                        return;
+                    break;
                 case ArmInstructionId.ARM_INS_CMP:
                 case ArmInstructionId.ARM_INS_CMN:
                 case ArmInstructionId.ARM_INS_TST:
@@ -277,6 +319,18 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                             Integer(id == ArmInstructionId.ARM_INS_TST ? OpCode.And : OpCode.Xor, bits, a, b);
                             LogicalFlags(bits);
                         }
+                        return;
+                    }
+                    break;
+                case ArmInstructionId.ARM_INS_ADC:
+                case ArmInstructionId.ARM_INS_SBC:
+                case ArmInstructionId.ARM_INS_RSC:
+                    if (Dest() is { } carryResult && Read(1) is { } carryLeft && Read(2) is { } carryRight)
+                    {
+                        var subtract = id is ArmInstructionId.ARM_INS_SBC or ArmInstructionId.ARM_INS_RSC;
+                        if (id == ArmInstructionId.ARM_INS_RSC)
+                            (carryLeft, carryRight) = (carryRight, carryLeft);
+                        AddWithCarry(carryResult, carryLeft, carryRight, subtract, instruction.Details.UpdateFlags);
                         return;
                     }
                     break;
@@ -354,6 +408,63 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                         var shifted = Reg("armExtract");
                         Integer(OpCode.ShiftRightUnsigned, shifted, word, shift);
                         Integer(OpCode.And, extract, shifted, new Immediate((1L << (int)count.Value) - 1));
+                        return;
+                    }
+                    break;
+                case ArmInstructionId.ARM_INS_ROR:
+                    if (Dest() is { } rotateDestination && Read(1) is { } rotateSource && Read(2) is { } rotateAmount)
+                    {
+                        Move(rotateDestination, RotateRight(rotateSource, rotateAmount, instruction.Details.UpdateFlags));
+                        if (instruction.Details.UpdateFlags) LogicalFlags(rotateDestination);
+                        return;
+                    }
+                    break;
+                case ArmInstructionId.ARM_INS_RRX:
+                    if (Dest() is { } rotateExtendedDestination && Read(1) is { } rotateExtendedSource)
+                    {
+                        Move(rotateExtendedDestination, RotateRightExtended(rotateExtendedSource, instruction.Details.UpdateFlags));
+                        if (instruction.Details.UpdateFlags) LogicalFlags(rotateExtendedDestination);
+                        return;
+                    }
+                    break;
+                case ArmInstructionId.ARM_INS_SBFX:
+                    if (Dest() is { } signedExtract && Read(1) is { } signedWord
+                        && Read(2) is Immediate { Value: >= 0 and < 32 } signedLsb
+                        && Read(3) is Immediate { Value: > 0 and <= 32 } signedWidth
+                        && signedLsb.Value + signedWidth.Value <= 32)
+                    {
+                        var shiftLeft = new Immediate(32 - signedLsb.Value - signedWidth.Value);
+                        var shiftRight = new Immediate(32 - signedWidth.Value);
+                        var aligned = Reg("armSignedExtract");
+                        Integer(OpCode.ShiftLeft, aligned, signedWord, shiftLeft);
+                        Integer(OpCode.ShiftRight, signedExtract, aligned, shiftRight);
+                        return;
+                    }
+                    break;
+                case ArmInstructionId.ARM_INS_BFI:
+                    if (Dest() is { } insertDestination && Read(1) is { } insertSource
+                        && Read(2) is Immediate { Value: >= 0 and < 32 } insertLsb
+                        && Read(3) is Immediate { Value: > 0 and <= 32 } insertWidth
+                        && insertLsb.Value + insertWidth.Value <= 32)
+                    {
+                        var insertMask = ((1UL << (int)insertWidth.Value) - 1) << (int)insertLsb.Value;
+                        var retained = Reg("armBitfieldRetained");
+                        var shiftedSource = Reg("armBitfieldSource");
+                        Integer(OpCode.And, retained, insertDestination, new Immediate(unchecked((uint)~insertMask)));
+                        Integer(OpCode.ShiftLeft, shiftedSource, insertSource, insertLsb);
+                        Integer(OpCode.And, shiftedSource, shiftedSource, new Immediate(unchecked((uint)insertMask)));
+                        Integer(OpCode.Or, insertDestination, retained, shiftedSource);
+                        return;
+                    }
+                    break;
+                case ArmInstructionId.ARM_INS_BFC:
+                    if (Dest() is { } clearDestination
+                        && Read(1) is Immediate { Value: >= 0 and < 32 } clearLsb
+                        && Read(2) is Immediate { Value: > 0 and <= 32 } clearWidth
+                        && clearLsb.Value + clearWidth.Value <= 32)
+                    {
+                        var clearMask = ((1UL << (int)clearWidth.Value) - 1) << (int)clearLsb.Value;
+                        Integer(OpCode.And, clearDestination, clearDestination, new Immediate(unchecked((uint)~clearMask)));
                         return;
                     }
                     break;
@@ -453,6 +564,63 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
             Unsupported(instruction);
         }
 
+        private bool LiftBlockTransfer(ArmInstruction instruction)
+        {
+            var details = instruction.Details;
+            var operands = details.Operands;
+            // A transfer involving PC or user-mode registers has semantics beyond a series of word moves.
+            if (details.IsUserMode || operands.Length < 2
+                || operands[0] is not { Type: ArmOperandType.Register, Register.Name: { } baseName }
+                || baseName is "pc" or "invalid" or "")
+                return false;
+
+            var id = instruction.Id;
+            var load = id is ArmInstructionId.ARM_INS_LDM or ArmInstructionId.ARM_INS_LDMIB
+                or ArmInstructionId.ARM_INS_LDMDA or ArmInstructionId.ARM_INS_LDMDB;
+            // Register-based transfers of packed value types need field recovery as well.
+            // Direct stack transfers already have distinct ISIL slots.
+            if (baseName != "sp")
+                return false;
+
+            var registers = new Register[operands.Length - 1];
+            for (var i = 0; i < registers.Length; i++)
+            {
+                if (operands[i + 1] is not { Type: ArmOperandType.Register, Register.Name: { } name }
+                    || name is "pc" or "sp" or "invalid" or ""
+                    || details.WriteBack && name == baseName)
+                    return false;
+                registers[i] = Reg(name);
+            }
+
+            const int wordSize = 4;
+            var byteCount = registers.Length * wordSize;
+            // The lowest-numbered register always transfers at the lowest address, even for DA and DB.
+            var firstOffset = id switch
+            {
+                ArmInstructionId.ARM_INS_LDMIB or ArmInstructionId.ARM_INS_STMIB => wordSize,
+                ArmInstructionId.ARM_INS_LDMDA or ArmInstructionId.ARM_INS_STMDA => wordSize - byteCount,
+                ArmInstructionId.ARM_INS_LDMDB or ArmInstructionId.ARM_INS_STMDB => -byteCount,
+                _ => 0
+            };
+
+            for (var i = 0; i < registers.Length; i++)
+            {
+                var offset = firstOffset + i * wordSize;
+                IOperand address = new StackOffset(offset);
+                var transfer = load ? Move(registers[i], address) : Add(OpCode.Move, address, registers[i]);
+                transfer.MemoryAccessSize = wordSize;
+            }
+
+            if (details.WriteBack)
+            {
+                var decrement = id is ArmInstructionId.ARM_INS_LDMDA or ArmInstructionId.ARM_INS_STMDA
+                    or ArmInstructionId.ARM_INS_LDMDB or ArmInstructionId.ARM_INS_STMDB;
+                var delta = decrement ? -byteCount : byteCount;
+                Add(OpCode.ShiftStack, new Immediate(delta));
+            }
+            return true;
+        }
+
         private bool LiftMemory(ArmInstruction instruction, Register reg, IOperand? address)
         {
             if (address == null)
@@ -512,7 +680,7 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
             return true;
         }
 
-        private IOperand? ReadOperand(ArmOperand operand, uint pc)
+        private IOperand? ReadOperand(ArmOperand operand, uint pc, bool updateShifterCarry = false)
         {
             if (operand.Type == ArmOperandType.Immediate) return new Immediate(operand.Immediate);
             if (operand.Type == ArmOperandType.FloatingPoint) return new FloatLiteral((float)operand.FloatingPoint);
@@ -520,6 +688,16 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
             {
                 IOperand value = operand.Register.Name == "pc" ? new Immediate(pc) : Reg(operand.Register.Name);
                 if (operand.ShiftOperation == ArmShiftOperation.Invalid) return value;
+                if (operand.ShiftOperation is ArmShiftOperation.ARM_SFT_RRX or ArmShiftOperation.ARM_SFT_RRX_REG)
+                    return RotateRightExtended(value, updateShifterCarry);
+                if (operand.ShiftOperation == ArmShiftOperation.ARM_SFT_ROR_REG)
+                {
+                    var shiftRegister = operand.ShiftRegister.Name;
+                    return string.IsNullOrEmpty(shiftRegister) || shiftRegister == "invalid"
+                        ? null : RotateRight(value, Reg(shiftRegister), updateShifterCarry);
+                }
+                if (operand.ShiftOperation == ArmShiftOperation.ARM_SFT_ROR)
+                    return RotateRight(value, new Immediate(operand.ShiftValue), updateShifterCarry);
                 var shift = operand.ShiftOperation switch
                 {
                     ArmShiftOperation.ARM_SFT_LSL => OpCode.ShiftLeft,
@@ -527,7 +705,8 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
                     ArmShiftOperation.ARM_SFT_ASR => OpCode.ShiftRight,
                     _ => (OpCode?)null
                 };
-                if (shift == null || operand.ShiftValue >= 32) return null;
+                if (shift == null || operand.ShiftValue >= 32)
+                    return null;
                 var shifted = Reg("armShift" + _result.Count);
                 Integer(shift.Value, shifted, value, new Immediate(operand.ShiftValue));
                 return shifted;
@@ -574,6 +753,77 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
             if (width != 4) return null;
             var word = binary.IsLittleEndian ? BinaryPrimitives.ReadUInt32LittleEndian(data) : BinaryPrimitives.ReadUInt32BigEndian(data);
             return floating ? new FloatLiteral(BitConverter.ToSingle(BitConverter.GetBytes(word), 0)) : new Immediate(word);
+        }
+
+        private IOperand RotateRight(IOperand value, IOperand amount, bool updateCarry)
+        {
+            if (amount is Immediate immediate)
+            {
+                var count = unchecked((uint)immediate.Value) & 31;
+                if (count == 0)
+                    return RotateRightExtended(value, updateCarry);
+
+                var right = Reg("armRotateRight");
+                var left = Reg("armRotateLeft");
+                var result = Reg("armRotateResult");
+                Integer(OpCode.ShiftRightUnsigned, right, value, new Immediate(count));
+                Integer(OpCode.ShiftLeft, left, value, new Immediate(32 - count));
+                Integer(OpCode.Or, result, right, left);
+                if (updateCarry)
+                    Add(OpCode.CheckLess, Carry, result, new Immediate(0)).OperandWidth = 32;
+                return result;
+            }
+
+            // ARM register shifts use the low byte of the count. The rotation result
+            // uses its low five bits; a multiple of 32 therefore leaves the word intact.
+            var byteCount = Reg("armRotateByteCount");
+            var rotateCount = Reg("armRotateCount");
+            Integer(OpCode.And, byteCount, amount, new Immediate(255));
+            Integer(OpCode.And, rotateCount, byteCount, new Immediate(31));
+            var dynamicRight = Reg("armRotateRight");
+            var inverseCount = Reg("armRotateInverseCount");
+            var dynamicLeft = Reg("armRotateLeft");
+            var dynamicResult = Reg("armRotateResult");
+            Integer(OpCode.ShiftRightUnsigned, dynamicRight, value, rotateCount);
+            Integer(OpCode.Subtract, inverseCount, new Immediate(32), rotateCount);
+            Integer(OpCode.ShiftLeft, dynamicLeft, value, inverseCount);
+            Integer(OpCode.Or, dynamicResult, dynamicRight, dynamicLeft);
+            if (updateCarry)
+            {
+                var carryIn = Reg("armRotateCarryIn");
+                Move(carryIn, Carry);
+                var zeroCount = Reg("armRotateZeroCount");
+                Add(OpCode.CheckEqual, zeroCount, byteCount, new Immediate(0)).OperandWidth = 32;
+                var rotatedCarry = Reg("armRotateCarryOut");
+                Add(OpCode.CheckLess, rotatedCarry, dynamicResult, new Immediate(0)).OperandWidth = 32;
+                var preserveCarry = Reg("armRotatePreserveCarry");
+                Add(OpCode.And, preserveCarry, zeroCount, carryIn);
+                var updateCarryValue = Reg("armRotateUpdateCarry");
+                var nonzeroCount = Reg("armRotateNonzeroCount");
+                Add(OpCode.Not, nonzeroCount, zeroCount);
+                Add(OpCode.And, updateCarryValue, nonzeroCount, rotatedCarry);
+                Add(OpCode.Or, Carry, preserveCarry, updateCarryValue);
+            }
+            return dynamicResult;
+        }
+
+        private Register RotateRightExtended(IOperand value, bool updateCarry)
+        {
+            var carryIn = Reg("armRotateExtendedCarryIn");
+            Move(carryIn, Carry);
+            var shiftedValue = Reg("armRotateExtendedValue");
+            var shiftedCarry = Reg("armRotateExtendedBit");
+            var result = Reg("armRotateExtendedResult");
+            Integer(OpCode.ShiftRightUnsigned, shiftedValue, value, new Immediate(1));
+            Integer(OpCode.ShiftLeft, shiftedCarry, carryIn, new Immediate(31));
+            Integer(OpCode.Or, result, shiftedValue, shiftedCarry);
+            if (updateCarry)
+            {
+                var lowBit = Reg("armRotateExtendedCarryOut");
+                Integer(OpCode.And, lowBit, value, new Immediate(1));
+                Add(OpCode.CheckNotEqual, Carry, lowBit, new Immediate(0)).OperandWidth = 32;
+            }
+            return result;
         }
 
         private void Call(ulong address)
@@ -636,6 +886,62 @@ public class ArmV7InstructionSet : MC2ILInstructionSet
             if (subtract)
                 Add(OpCode.CheckGreaterOrEqualUnsigned, Carry, left, right).OperandWidth = 32;
             else Add(OpCode.CheckLessUnsigned, Carry, result, left).OperandWidth = 32;
+        }
+
+        private void AddWithCarry(Register destination, IOperand left, IOperand right, bool subtract, bool updateFlags)
+        {
+            // Snapshot C before emitting the result or any updated flags. Carry is a 0/1
+            // boolean from the previous flag-setting instruction and is the third addend
+            // for ADC, or the inverse borrow for SBC/RSC.
+            var carryIn = Reg("armCarryIn" + _result.Count);
+            Move(carryIn, Carry);
+
+            var partial = Reg("armCarryPartial" + _result.Count);
+            if (subtract)
+            {
+                var borrow = Reg("armBorrow" + _result.Count);
+                Add(OpCode.Not, borrow, carryIn);
+                Integer(OpCode.Subtract, partial, left, right);
+                Integer(OpCode.Subtract, destination, partial, borrow);
+            }
+            else
+            {
+                Integer(OpCode.Add, partial, left, right);
+                Integer(OpCode.Add, destination, partial, carryIn);
+            }
+
+            if (!updateFlags)
+                return;
+
+            Add(OpCode.CheckEqual, Zero, destination, new Immediate(0)).OperandWidth = 32;
+            Add(OpCode.CheckLess, Negative, destination, new Immediate(0)).OperandWidth = 32;
+
+            var xor1 = Reg("armCarryFlagXor1" + _result.Count);
+            var xor2 = Reg("armCarryFlagXor2" + _result.Count);
+            var overflow = Reg("armCarryOverflow" + _result.Count);
+            Integer(OpCode.Xor, xor1, left, subtract ? right : destination);
+            Integer(OpCode.Xor, xor2, subtract ? left : right, destination);
+            Integer(OpCode.And, overflow, xor1, xor2);
+            Add(OpCode.CheckLess, Overflow, overflow, new Immediate(0)).OperandWidth = 32;
+
+            if (subtract)
+            {
+                var greater = Reg("armCarryGreater" + _result.Count);
+                var equal = Reg("armCarryEqual" + _result.Count);
+                var equalWithCarry = Reg("armCarryEqualWithCarry" + _result.Count);
+                Add(OpCode.CheckGreaterUnsigned, greater, left, right).OperandWidth = 32;
+                Add(OpCode.CheckEqual, equal, left, right).OperandWidth = 32;
+                Add(OpCode.And, equalWithCarry, equal, carryIn);
+                Add(OpCode.Or, Carry, greater, equalWithCarry);
+            }
+            else
+            {
+                var carryFromAdd = Reg("armCarryFromAdd" + _result.Count);
+                var carryFromInput = Reg("armCarryFromInput" + _result.Count);
+                Add(OpCode.CheckLessUnsigned, carryFromAdd, partial, left).OperandWidth = 32;
+                Add(OpCode.CheckLessUnsigned, carryFromInput, destination, partial).OperandWidth = 32;
+                Add(OpCode.Or, Carry, carryFromAdd, carryFromInput);
+            }
         }
 
         private void FloatFlags(IOperand left, IOperand right, bool wide)

@@ -148,6 +148,12 @@ public static class BooleanFlagSimplifier
                 inverted = !inverted;
                 return true;
 
+            case { OpCode: OpCode.Select, Operands: [_, LocalVariable condition, Immediate whenTrue, Immediate whenFalse] }
+                when whenTrue.Value is 0 or 1 && whenFalse.Value is 0 or 1 && whenTrue.Value != whenFalse.Value:
+                if (!TryGetBooleanBit(condition, definitions, booleanType, out booleanValue, out inverted, depth + 1))
+                    return false;
+                inverted ^= whenTrue.Value == 0;
+                return true;
             case { OpCode: OpCode.Xor, Operands: [_, var left, var right] }
                 when IsOne(right) && left is LocalVariable leftLocal:
                 if (!TryGetBooleanBit(leftLocal, definitions, booleanType, out booleanValue, out inverted, depth + 1))

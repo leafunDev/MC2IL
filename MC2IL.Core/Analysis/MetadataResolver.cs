@@ -478,7 +478,8 @@ public static class MetadataResolver
 
     internal static bool ResolveFieldOffsets(MethodAnalysisContext method, List<Instruction> instructions)
     {
-        var changed = false;
+        var changed = ResolvePhiIndexedFieldLoads(method, instructions);
+        Dictionary<LocalVariable, (LocalVariable Base, long Offset)>? fieldAddresses = null;
 
         foreach (var instruction in instructions)
         {
@@ -493,7 +494,23 @@ public static class MetadataResolver
                 if (memory.Index != null || memory.Scale != 0)
                     continue;
 
-                if (memory.Base is not LocalVariable local || local?.Type == null)
+                if (memory.Base is not LocalVariable local)
+                    continue;
+
+                // ARM64 often computes the base of an inline struct once, then loads
+                // several fields through it. Recover the original object and byte offset.
+                if ((local.Type == null || local.Type.FullName is "System.IntPtr" or "System.UIntPtr" or "System.Int64" or "System.UInt64")
+                    && method.AppContext.InstructionSet is NewArmV8InstructionSet)
+                {
+                    fieldAddresses ??= FindFieldAddresses(instructions);
+                    if (fieldAddresses.TryGetValue(local, out var fieldAddress))
+                    {
+                        local = fieldAddress.Base;
+                        memory.Addend = unchecked(memory.Addend + fieldAddress.Offset);
+                    }
+                }
+
+                if (local.Type == null)
                     continue;
 
                 // check if static field access
@@ -522,11 +539,14 @@ public static class MetadataResolver
                 var genericLookupOffset = valueTypeBase ? lookupOffset + 2L * pointerSize : lookupOffset;
 
                 FieldAnalysisContext? field;
+                var offsetWithinField = 0L;
                 if (genericOwner != null && staticOwner == null)
                 {
                     // Metadata has all-0 offsets for generic definitions, so recompute layout
                     // using the closed instance where the generic arguments are known.
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner, genericLookupOffset);
+                    field = instruction.MemoryAccessSize != null
+                        ? GenericInstanceFieldLayout.FindContainingField(genericOwner, genericLookupOffset, out offsetWithinField)
+                        : GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner, genericLookupOffset);
                 }
                 else if (staticOwner == null && owner.GenericParameters.Count > 0)
                 {
@@ -562,13 +582,14 @@ public static class MetadataResolver
                     if (instruction.MemoryAccessSize is { } accessSize
                         && field.FieldType.IsValueType
                         && accessSize < TypeSizes.UnboxedSize(field.FieldType, pointerSize)
-                        && field.BackingData?.FieldOffset is { } fieldOffset
-                        && FindInlineValueFieldPath(field.FieldType, lookupOffset - fieldOffset, pointerSize,
+                        && FindInlineValueFieldPath(field.FieldType, offsetWithinField, pointerSize,
                             new HashSet<TypeAnalysisContext>()) is { } nestedPath
                         && TypeSizes.UnboxedSize(nestedPath[^1].FieldType, pointerSize) == accessSize)
                     {
                         fieldPath.AddRange(nestedPath);
                     }
+                    else if (offsetWithinField != 0)
+                        continue;
                 }
                 else if (staticOwner != null
                          && instruction.MemoryAccessSize is { } staticAccessSize
@@ -608,6 +629,196 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    // ARM64 can select between two field offsets with CSEL and then load through [this + offset].
+    // Keep that as a normal managed field selection: resolving only constant offsets leaves an
+    // unrepresentable managed-pointer read in the C# output and loses the selected value.
+    private static bool ResolvePhiIndexedFieldLoads(MethodAnalysisContext method, List<Instruction> instructions)
+    {
+        if (method.AppContext.InstructionSet is not NewArmV8InstructionSet)
+            return false;
+
+        var phiDefinitions = new Dictionary<LocalVariable, (Instruction Phi, Block Block)>();
+        foreach (var block in method.ControlFlowGraph!.Blocks)
+            foreach (var instruction in block.Instructions)
+                if (instruction is { OpCode: OpCode.Phi, Operands: [LocalVariable destination, ..] })
+                    phiDefinitions[destination] = (instruction, block);
+
+        if (phiDefinitions.Count == 0)
+            return false;
+
+        var usedNumbers = new HashSet<int>(method.Locals.Select(local => local.Register.Number));
+        var nextNumber = 0;
+        bool changed = false;
+
+        foreach (var load in instructions.ToArray())
+        {
+            if (load is not { OpCode: OpCode.Move, MemoryAccessSize: { } accessSize,
+                    Operands: [LocalVariable destination, MemoryOperand { Base: LocalVariable receiver,
+                        Index: LocalVariable index, Scale: > 0 } memory] }
+                || receiver.Type is not { IsValueType: false } owner
+                || owner is GenericInstanceTypeAnalysisContext || owner.GenericParameters.Count != 0
+                || !phiDefinitions.TryGetValue(index, out var selection)
+                || !ReferenceEquals(selection.Block, method.ControlFlowGraph.Blocks.FirstOrDefault(block => block.Instructions.Contains(load)))
+                || selection.Phi.Operands.Count != selection.Block.Predecessors.Count + 1)
+                continue;
+
+            var selectedFields = new List<FieldAnalysisContext>(selection.Block.Predecessors.Count);
+            var compatibleType = (TypeAnalysisContext?)null;
+            var safe = true;
+            for (var input = 1; input < selection.Phi.Operands.Count; input++)
+            {
+                if (selection.Phi.Operands[input] is not Immediate { Value: >= 0 and <= int.MaxValue } fieldIndex)
+                {
+                    safe = false;
+                    break;
+                }
+
+                long offset;
+                try
+                {
+                    offset = checked(memory.Addend + checked(fieldIndex.Value * memory.Scale));
+                }
+                catch (OverflowException)
+                {
+                    safe = false;
+                    break;
+                }
+
+                if (offset is < 0 or > int.MaxValue
+                    || FindUniqueInstanceFieldAtOffset(owner, (int)offset) is not { } field
+                    || compatibleType != null && !IsSameType(compatibleType, field.FieldType))
+                {
+                    safe = false;
+                    break;
+                }
+
+                var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+                var fieldSize = field.FieldType.IsValueType
+                    ? TypeSizes.UnboxedSize(field.FieldType, pointerSize)
+                    : pointerSize;
+                if (fieldSize != accessSize)
+                {
+                    safe = false;
+                    break;
+                }
+
+                compatibleType ??= field.FieldType;
+                selectedFields.Add(field);
+            }
+
+            var destinationTypeMatches = compatibleType != null
+                && (destination.Type == null || IsSameType(destination.Type, compatibleType));
+
+            if (!safe || compatibleType == null || selectedFields.Count != selection.Block.Predecessors.Count
+                || !destinationTypeMatches)
+                continue;
+
+            while (!usedNumbers.Add(nextNumber))
+                nextNumber++;
+            var selectedValue = new LocalVariable($"phiField{nextNumber}",
+                new Register(nextNumber, $"phiField{nextNumber}"), compatibleType);
+            method.Locals.Add(selectedValue);
+
+            var fieldReads = selectedFields
+                .Select(field => (IOperand)new FieldReference(field, receiver, field.Offset))
+                .ToList();
+            var valuePhi = new Instruction(-1, OpCode.Phi, [selectedValue, .. fieldReads]);
+            var insertAt = selection.Block.Instructions.FindIndex(instruction => instruction.OpCode != OpCode.Phi);
+            selection.Block.Instructions.Insert(insertAt < 0 ? selection.Block.Instructions.Count : insertAt, valuePhi);
+
+            load.SetOperands(destination, selectedValue);
+            load.MemoryAccessSize = null;
+            load.OperandWidth = null;
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    private static FieldAnalysisContext? FindUniqueInstanceFieldAtOffset(TypeAnalysisContext owner, int offset)
+    {
+        FieldAnalysisContext? match = null;
+        for (var type = owner; type != null; type = type.BaseType)
+        {
+            foreach (var field in type.Fields)
+            {
+                if (field.IsStatic || (field.Attributes & FieldAttributes.Literal) != 0
+                    || field.BackingData?.FieldOffset != offset)
+                    continue;
+
+                if (match != null)
+                    return null;
+                match = field;
+            }
+        }
+        return match;
+    }
+
+    private static Dictionary<LocalVariable, (LocalVariable Base, long Offset)> FindFieldAddresses(List<Instruction> instructions)
+    {
+        var addresses = new Dictionary<LocalVariable, (LocalVariable, long)>();
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        var seen = new HashSet<LocalVariable>();
+        foreach (var instruction in instructions)
+        {
+            if (instruction.Destination is not LocalVariable destination)
+                continue;
+            if (!seen.Add(destination))
+                definitions.Remove(destination);
+            else
+                definitions[destination] = instruction;
+        }
+
+        var visited = new HashSet<LocalVariable>();
+        var unresolved = new HashSet<LocalVariable>();
+        foreach (var local in definitions.Keys)
+            if (definitions[local].OpCode is OpCode.Add or OpCode.Phi)
+                Resolve(local);
+        return addresses;
+
+        (LocalVariable Base, long Offset)? Resolve(LocalVariable local)
+        {
+            if (addresses.TryGetValue(local, out var known))
+                return known;
+            if (unresolved.Contains(local) || visited.Count >= 16 || !visited.Add(local))
+                return null;
+
+            (LocalVariable Base, long Offset)? address = null;
+            if (definitions.TryGetValue(local, out var definition) && definition.OperandWidth != 32)
+            {
+                if (definition is { OpCode: OpCode.Add, Operands: [_, LocalVariable baseLocal, Immediate offset] }
+                    && offset.Value >= 0 && Resolve(baseLocal) is { } parent
+                    && parent.Offset <= int.MaxValue - offset.Value)
+                    address = (parent.Base, parent.Offset + offset.Value);
+                else if (definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+                    address = Resolve(source);
+                else if (definition.OpCode == OpCode.Phi)
+                {
+                    for (var i = 1; i < definition.Operands.Count; i++)
+                    {
+                        if (definition.Operands[i] is not LocalVariable incoming || Resolve(incoming) is not { } resolved
+                            || address != null && address != resolved)
+                        {
+                            address = null;
+                            break;
+                        }
+                        address = resolved;
+                    }
+                }
+            }
+
+            if (address == null && local.Type is { } type && IlGenerator.IsManagedReference(type))
+                address = (local, 0);
+
+            visited.Remove(local);
+            if (address is { } found)
+                addresses.Add(local, found);
+            else
+                unresolved.Add(local);
+            return address;
+        }
     }
 
     /// <summary>
@@ -1325,10 +1536,18 @@ public static class MetadataResolver
                 continue;
 
             // A generic method RGCTX entry can provide the exact MethodInfo. Its method pointer
-            // is the first pointer-sized field, so only resolve a plain +0 load from a typed
-            // MethodInfo local; nearby fields (for example the invoker at +8) are different calls.
-            if (target is { Index: null, Scale: 0, Addend: 0,
-                    Base: LocalVariable { Type: RuntimeMethodInfoAnalysisContext { RepresentedMethod: { } representedMethod } } })
+            // is normally the first pointer-sized field. Some ARM64 generic tail calls use the
+            // adjacent entry instead; accept that only when its hidden MethodInfo argument
+            // independently confirms the represented method.
+            if (target is { Index: null, Scale: 0, Addend: var methodPointerOffset,
+                    Base: LocalVariable { Type: RuntimeMethodInfoAnalysisContext { RepresentedMethod: { } representedMethod } } }
+                && (methodPointerOffset == 0
+                    || isTailCall && methodPointerOffset == pointerSize && representedMethod.IsStatic
+                    && HiddenMethodInfoArgumentIndex(instruction, representedMethod) is var hiddenIndex
+                    && hiddenIndex < instruction.Operands.Count
+                    && ResolveMethodInfo(instruction.Operands[hiddenIndex], definitions, []) is
+                        { RepresentedMethod: { } hiddenMethod }
+                    && IsSameMethodInstantiation(representedMethod, hiddenMethod)))
             {
                 var callingConventions = representedMethod.AppContext.InstructionSet.CallingConventionResolver;
                 if (callingConventions == null || !callingConventions.HasRawArgumentLayout(instruction, representedMethod.AppContext))
@@ -1336,7 +1555,26 @@ public static class MetadataResolver
 
                 if (isTailCall)
                 {
+                    var indirectTargetLoad = instruction.Operands[0] is LocalVariable targetLocal
+                        && definitions.TryGetValue(targetLocal, out var targetDefinition)
+                        ? targetDefinition
+                        : null;
                     RewriteTailCall(instruction, representedMethod);
+                    if (methodPointerOffset == pointerSize)
+                    {
+                        // The resolved call no longer needs its hidden native MethodInfo slot.
+                        // Dropping it lets the unused RGCTX and function-pointer loads disappear
+                        // instead of becoming an emitted `nint x = 0` placeholder.
+                        var tailCallHiddenIndex = HiddenMethodInfoArgumentIndex(instruction, representedMethod);
+                        if (tailCallHiddenIndex < instruction.Operands.Count
+                            && ResolveMethodInfo(instruction.Operands[tailCallHiddenIndex], definitions, []) is
+                                { RepresentedMethod: { } tailCallHiddenMethod }
+                            && IsSameMethodInstantiation(representedMethod, tailCallHiddenMethod))
+                            instruction.RemoveOperandAt(tailCallHiddenIndex);
+
+                        if (indirectTargetLoad != null)
+                            discardableDispatchLoads.Add(indirectTargetLoad);
+                    }
                     changed = true;
                     continue;
                 }
@@ -1447,11 +1685,23 @@ public static class MetadataResolver
                 var candidate = block.Instructions[i];
                 if (candidate == targetRead || candidate == methodInfoRead || candidate.OpCode == OpCode.Nop
                     || candidate is { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable or Immediate] }
+                    || candidate is { OpCode: OpCode.Move, Operands: [LocalVariable, MemoryOperand] }
                     || checkedReceiver && candidate.OpCode == OpCode.PackFloatAggregate
                         && candidate.Operands.Skip(2).All(operand => operand is LocalVariable or FloatLiteral or DoubleLiteral)
                     || checkedReceiver && candidate is { OpCode: OpCode.Move, Operands: [LocalVariable,
                         FieldReference { Field.IsStatic: false, Field.FieldType: not CustomModifierTypeAnalysisContext }] })
                     continue;
+
+                // A resolved call can leave its vtable method-pointer and MethodInfo loads
+                // unused when the +8 entry was not matched as a hidden argument. Once a direct
+                // non-null guard dominates the call, these exact pointer-sized vtable reads are
+                // redundant; removing them also lets the class-header load die.
+                if (checkedReceiver && IsDeadVTableEntryLoad(candidate, klassRead.Destination as LocalVariable))
+                {
+                    discardableDispatchLoads.Add(candidate);
+                    continue;
+                }
+
                 return;
             }
 
@@ -1460,6 +1710,24 @@ public static class MetadataResolver
                 discardableDispatchLoads.Add(targetRead);
             if (methodInfoRead != null && homeBlocks.TryGetValue(methodInfoRead, out var methodInfoBlock) && methodInfoBlock == block)
                 discardableDispatchLoads.Add(methodInfoRead);
+        }
+
+        bool IsDeadVTableEntryLoad(Instruction candidate, LocalVariable? klassLocal)
+        {
+            if (klassLocal == null || candidate is not
+                { OpCode: OpCode.Move, Operands: [LocalVariable value, MemoryOperand
+                    { Base: LocalVariable baseLocal, Index: null, Scale: 0 } memory] }
+                || baseLocal != klassLocal
+                || candidate.MemoryAccessSize is int accessSize && accessSize != pointerSize)
+                return false;
+
+            var entryOffset = memory.Addend - vtableOffset;
+            var fieldOffset = entryOffset % invokeDataSize;
+            if (entryOffset < 0 || fieldOffset != 0 && fieldOffset != pointerSize)
+                return false;
+
+            return !instructions.Any(instruction => instruction != candidate
+                && DeadCodeEliminator.UsedLocals(instruction).Any(local => local == value));
         }
 
         bool HasDirectNonNullEdge(Block block, LocalVariable receiver)

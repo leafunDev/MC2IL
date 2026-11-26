@@ -83,6 +83,29 @@ public static class ConstantFolder
             return ToConstant(instruction, instruction.OpCode == OpCode.CheckEqual ? 0 : 1);
 
         // Binary constant folds.
+        if (instruction.Operands is [_, var floatLeft, var floatRight, FloatingPointPrecision precision]
+            && TryFloatConstant(floatLeft, precision.IsDouble, out var leftFloat)
+            && TryFloatConstant(floatRight, precision.IsDouble, out var rightFloat))
+        {
+            var unordered = double.IsNaN(leftFloat) || double.IsNaN(rightFloat);
+            bool? comparison = instruction.OpCode switch
+            {
+                OpCode.CheckEqual => leftFloat == rightFloat,
+                OpCode.CheckNotEqual => leftFloat != rightFloat,
+                OpCode.CheckLess => leftFloat < rightFloat,
+                OpCode.CheckLessOrEqual => leftFloat <= rightFloat,
+                OpCode.CheckGreater => leftFloat > rightFloat,
+                OpCode.CheckGreaterOrEqual => leftFloat >= rightFloat,
+                OpCode.CheckLessUnsigned => unordered || leftFloat < rightFloat,
+                OpCode.CheckLessOrEqualUnsigned => unordered || leftFloat <= rightFloat,
+                OpCode.CheckGreaterUnsigned => unordered || leftFloat > rightFloat,
+                OpCode.CheckGreaterOrEqualUnsigned => unordered || leftFloat >= rightFloat,
+                _ => null
+            };
+            if (comparison is { } comparisonResult)
+                return ToConstant(instruction, comparisonResult ? 1 : 0);
+        }
+
         if (BinaryConstants(instruction, out var a, out var b))
         {
             switch (instruction.OpCode)
@@ -140,6 +163,22 @@ public static class ConstantFolder
                 return Constant(instruction.Operands[2]) == 0 && ToMove(instruction, instruction.Operands[1]);
         }
 
+        return false;
+    }
+
+    private static bool TryFloatConstant(IOperand operand, bool isDouble, out double value)
+    {
+        if (operand is FloatLiteral single)
+        {
+            value = single.Value;
+            return true;
+        }
+        if (operand is DoubleLiteral wide)
+        {
+            value = isDouble ? wide.Value : (float)wide.Value;
+            return true;
+        }
+        value = 0;
         return false;
     }
 

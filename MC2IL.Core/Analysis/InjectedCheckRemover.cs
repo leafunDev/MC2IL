@@ -12,64 +12,69 @@ public static class InjectedCheckRemover
     public static void Run(MethodAnalysisContext method) => Run(method, true, true);
 
     public static void Run(MethodAnalysisContext method, bool removeNullChecks, bool removeBoundsChecks) =>
-        Run(method.ControlFlowGraph!, removeNullChecks, removeBoundsChecks, method.ParameterLocals);
+        Run(method.ControlFlowGraph!, removeNullChecks, removeBoundsChecks, method.ParameterLocals, method.DeclaringType);
 
     public static void Run(ISILControlFlowGraph cfg) => Run(cfg, true, true);
 
     private static void Run(ISILControlFlowGraph cfg, bool removeNullChecks, bool removeBoundsChecks,
-        IEnumerable<LocalVariable>? parameters = null)
+        IEnumerable<LocalVariable>? parameters = null, TypeAnalysisContext? callerType = null)
     {
-        var defOf = BuildDefMap(cfg, parameters, out var stableParameters, out var addressed);
-        var ignoredExceptionConstructions = FindUnusedExceptionConstructions(cfg);
-        var redundantLengthLoads = new HashSet<Instruction>();
-        var removedAny = false;
-
-        foreach (var block in cfg.Blocks)
+        while (true)
         {
-            if (block.BlockType != BlockType.TwoWay || block.Instructions.Count == 0)
-                continue;
+            var defOf = BuildDefMap(cfg, parameters, out var stableParameters, out var addressed);
+            var ignoredExceptionConstructions = FindUnusedExceptionConstructions(cfg);
+            var redundantLengthLoads = new HashSet<Instruction>();
+            var removedAny = false;
 
-            var terminator = block.Instructions[^1];
+            foreach (var block in cfg.Blocks)
+            {
+                if (block.BlockType != BlockType.TwoWay || block.Instructions.Count == 0)
+                    continue;
 
-            if (terminator.OpCode != OpCode.ConditionalJump)
-                continue;
+                var terminator = block.Instructions[^1];
 
-            if (terminator.Operands[0] is not Block trueTarget)
-                continue;
+                if (terminator.OpCode != OpCode.ConditionalJump)
+                    continue;
 
-            var falseTarget = block.Successors.FirstOrDefault(successor => successor != trueTarget);
-            if (falseTarget == null)
-                continue;
+                if (terminator.Operands[0] is not Block trueTarget)
+                    continue;
 
-            var trueThrow = GetInjectedThrow(trueTarget, ignoredExceptionConstructions);
-            var falseThrow = GetInjectedThrow(falseTarget, ignoredExceptionConstructions);
+                var falseTarget = block.Successors.FirstOrDefault(successor => successor != trueTarget);
+                if (falseTarget == null)
+                    continue;
 
-            // The same null guard can branch to the throw on either the true edge or the
-            // fallthrough edge, depending on how the native compare/branch pair was lifted.
-            // If both edges throw (or neither does), there is no safe check to remove.
-            if ((trueThrow == null) == (falseThrow == null))
-                continue;
+                var trueThrow = GetInjectedThrow(trueTarget, ignoredExceptionConstructions);
+                var falseThrow = GetInjectedThrow(falseTarget, ignoredExceptionConstructions);
 
-            var throwOnTrue = trueThrow != null;
-            var throwTarget = throwOnTrue ? trueTarget : falseTarget!;
-            var thrown = throwOnTrue ? trueThrow! : falseThrow!;
+                // The same null guard can branch to the throw on either the true edge or the
+                // fallthrough edge, depending on how the native compare/branch pair was lifted.
+                // If both edges throw (or neither does), there is no safe check to remove.
+                if ((trueThrow == null) == (falseThrow == null))
+                    continue;
 
-            if (terminator.Operands[1] is not LocalVariable condition
-                || !TryGetDefinitionBefore(block, terminator, condition, defOf, out var definition)
-                || !IsInjectedCheck(block, definition, thrown, throwOnTrue, defOf, stableParameters, addressed, throwOnTrue ? falseTarget : trueTarget,
-                    removeNullChecks, removeBoundsChecks, redundantLengthLoads))
-                continue;
+                var throwOnTrue = trueThrow != null;
+                var throwTarget = throwOnTrue ? trueTarget : falseTarget!;
+                var thrown = throwOnTrue ? trueThrow! : falseThrow!;
 
-            RemoveThrowEdge(block, throwTarget, throwOnTrue ? falseTarget : trueTarget);
-            removedAny = true;
+                if (terminator.Operands[1] is not LocalVariable condition
+                    || !TryGetDefinitionBefore(block, terminator, condition, defOf, out var definition)
+                    || !IsInjectedCheck(block, definition, thrown, throwOnTrue, defOf, stableParameters, addressed,
+                        throwOnTrue ? falseTarget : trueTarget, removeNullChecks, removeBoundsChecks,
+                        redundantLengthLoads, callerType))
+                    continue;
+
+                RemoveThrowEdge(block, throwTarget, throwOnTrue ? falseTarget : trueTarget);
+                removedAny = true;
+            }
+
+            if (!removedAny)
+                return;
+
+            // One guard can hide the implicit dereference that proves an earlier guard redundant.
+            // Rebuild data flow and retry after each batch of removed checks.
+            cfg.RemoveUnreachableBlocks();
+            DeadCodeEliminator.Run(cfg, redundantLengthLoads);
         }
-
-        if (!removedAny)
-            return;
-
-        // delete any throw blocks
-        cfg.RemoveUnreachableBlocks();
-        DeadCodeEliminator.Run(cfg, redundantLengthLoads);
     }
 
     private static void RemoveThrowEdge(Block block, Block throwTarget, Block continuation)
@@ -84,7 +89,7 @@ public static class InjectedCheckRemover
 
     private static bool IsInjectedCheck(Block checkedBlock, Instruction definition, InjectedThrow thrown, bool throwOnTrue,
         Dictionary<LocalVariable, Instruction> defOf, HashSet<LocalVariable> stableParameters, HashSet<LocalVariable> addressed, Block continuation,
-        bool removeNullChecks, bool removeBoundsChecks, HashSet<Instruction> redundantLengthLoads)
+        bool removeNullChecks, bool removeBoundsChecks, HashSet<Instruction> redundantLengthLoads, TypeAnalysisContext? callerType)
     {
         if (TryGetNullComparison(checkedBlock, definition, throwOnTrue, defOf,
                 out var nullComparison, out var comparisonBranchOnTrue, out var receiver)
@@ -96,13 +101,12 @@ public static class InjectedCheckRemover
             var knownNonNullThis = thrown.ExceptionType == "System.NullReferenceException"
                 ? GetCheckedReceiverOwner(checkedBlock, definition, receiver, defOf)
                 : null;
-
             // Some IL2CPP builds share the failure block between the null and length checks.
             if ((removeNullChecks || thrown.ExceptionType == "System.IndexOutOfRangeException")
                 && (HasImplicitNullCheck(continuation, receiver, defOf,
                         arraysOnly: thrown.ExceptionType == "System.IndexOutOfRangeException",
                         allowNonThrowingComputations: thrown.ExceptionType == "System.NullReferenceException" && receiver is LocalVariable,
-                        knownNonNullThis: knownNonNullThis)
+                        knownNonNullThis: knownNonNullThis, callerType: callerType)
                     || thrown.ExceptionType == "System.NullReferenceException"
                     && (IsObjectAllocationCheck(checkedBlock, definition, continuation, receiver, defOf)
                         || HasImplicitNullCheckAfterGuardCopies(checkedBlock, nullComparison, continuation, receiver, addressed)
@@ -113,7 +117,8 @@ public static class InjectedCheckRemover
         }
 
         return removeBoundsChecks && thrown.ExceptionType == "System.IndexOutOfRangeException"
-            && IsArrayBoundsCheck(checkedBlock, definition, throwOnTrue, continuation, defOf, removeNullChecks, redundantLengthLoads);
+            && IsArrayBoundsCheck(checkedBlock, definition, throwOnTrue, continuation, defOf, removeNullChecks,
+                redundantLengthLoads, callerType);
     }
 
     private static bool HasImplicitNullCheckAfterGuardCopies(Block guard, Instruction comparison,
@@ -415,11 +420,11 @@ public static class InjectedCheckRemover
 
     private static bool HasImplicitNullCheck(Block continuation, IOperand receiver,
         Dictionary<LocalVariable, Instruction> defOf, bool arraysOnly, bool allowNonThrowingComputations,
-        LocalVariable? knownNonNullThis)
+        LocalVariable? knownNonNullThis, TypeAnalysisContext? callerType)
     {
         var callsNeedingNullCheck = new HashSet<Instruction>();
         if (!HasImplicitNullCheckOnEveryPath(continuation, receiver, defOf, arraysOnly,
-                allowNonThrowingComputations, knownNonNullThis, [], [], callsNeedingNullCheck))
+                allowNonThrowingComputations, knownNonNullThis, callerType, [], [], callsNeedingNullCheck))
             return false;
 
         foreach (var call in callsNeedingNullCheck)
@@ -429,7 +434,7 @@ public static class InjectedCheckRemover
 
     private static bool HasImplicitNullCheckOnEveryPath(Block start, IOperand receiver,
         Dictionary<LocalVariable, Instruction> defOf, bool arraysOnly, bool allowNonThrowingComputations,
-        LocalVariable? knownNonNullThis, List<Instruction> pathInstructions, HashSet<Block> visitedPath,
+        LocalVariable? knownNonNullThis, TypeAnalysisContext? callerType, List<Instruction> pathInstructions, HashSet<Block> visitedPath,
         HashSet<Instruction> callsNeedingNullCheck)
     {
         // A native null guard can precede a conditional whose separate branches both
@@ -447,6 +452,12 @@ public static class InjectedCheckRemover
 
                 if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, var source] }
                     && (IsSimpleValue(source) || source is RuntimeMethodInfoAnalysisContext or TypeAnalysisContext))
+                {
+                    pathInstructions.Add(instruction);
+                    continue;
+                }
+
+                if (IsNativeVirtualDispatchLoad(instruction, receiver, pathInstructions, defOf))
                 {
                     pathInstructions.Add(instruction);
                     continue;
@@ -474,7 +485,7 @@ public static class InjectedCheckRemover
                     foreach (var successor in current.Successors)
                     {
                         if (!HasImplicitNullCheckOnEveryPath(successor, receiver, defOf, arraysOnly,
-                                allowNonThrowingComputations, knownNonNullThis, [.. pathInstructions],
+                                allowNonThrowingComputations, knownNonNullThis, callerType, [.. pathInstructions],
                                 [.. visitedPath], callsNeedingNullCheck))
                             return false;
                     }
@@ -482,7 +493,7 @@ public static class InjectedCheckRemover
                 }
 
                 return IsImplicitNullCheckOperation(instruction, receiver, defOf, arraysOnly,
-                    knownNonNullThis, pathInstructions, callsNeedingNullCheck);
+                    knownNonNullThis, callerType, pathInstructions, callsNeedingNullCheck);
             }
 
             if (current.Successors is not [var next])
@@ -496,6 +507,7 @@ public static class InjectedCheckRemover
 
     private static bool IsImplicitNullCheckOperation(Instruction operation, IOperand receiver,
         Dictionary<LocalVariable, Instruction> defOf, bool arraysOnly, LocalVariable? knownNonNullThis,
+        TypeAnalysisContext? callerType,
         List<Instruction> pathInstructions, HashSet<Instruction> callsNeedingNullCheck)
     {
         // A check proves the value held at the branch, not a later value written to
@@ -522,7 +534,8 @@ public static class InjectedCheckRemover
         if (!operation.IsCall
             || operation.Operands[0] is not MethodAnalysisContext { IsStatic: false, DeclaringType: { IsValueType: false } owner } target
             || target.Name == ".ctor"
-            || !operation.NullCheckReceiver && target.IsVirtual && !target.IsFinal && !owner.IsSealed)
+            || !operation.NullCheckReceiver && target.IsVirtual && !target.IsFinal && !owner.IsSealed
+                && CallerMayMakeBaseCall(callerType, owner))
             return false;
 
         var receiverIndex = operation.OpCode == OpCode.CallVoid ? 1 : 2;
@@ -535,6 +548,49 @@ public static class InjectedCheckRemover
         if (!operation.NullCheckReceiver)
             callsNeedingNullCheck.Add(operation);
         return true;
+    }
+
+    private static bool CallerMayMakeBaseCall(TypeAnalysisContext? callerType, TypeAnalysisContext owner)
+    {
+        // Without the containing type, keep the conservative behavior used by CFG-only callers.
+        if (callerType == null || owner.IsInterface)
+            return true;
+
+        // A callvirt can change dispatch when C# emitted a nonvirtual base-member call.
+        // If the owner is not in this type's class hierarchy, callvirt preserves dispatch
+        // while also providing the null check that replaces the IL2CPP guard.
+        for (var current = callerType; current != null; current = current.BaseType)
+            if (MetadataResolver.IsSameType(current, owner))
+                return true;
+
+        return false;
+    }
+
+    private static bool IsNativeVirtualDispatchLoad(Instruction instruction, IOperand receiver,
+        List<Instruction> pathInstructions, Dictionary<LocalVariable, Instruction> defOf)
+    {
+        if (instruction is not { OpCode: OpCode.Move, Operands: [LocalVariable destination, MemoryOperand memory] }
+            || memory.Base is not LocalVariable baseLocal || memory.Index != null || memory.Scale != 0)
+            return false;
+
+        // ARM code loads Il2CppClass from the guarded object, then reads the virtual method
+        // slot and method metadata from that class. These native dispatch loads are omitted
+        // from managed output; callvirt on the recovered receiver supplies the null check.
+        if (destination.Type is RuntimeClassTypeAnalysisContext)
+            return SameValueOnPath(receiver, baseLocal, pathInstructions, defOf);
+
+        return memory.Addend != 0 && IsRuntimeClassLoadedFromReceiver(baseLocal, receiver, pathInstructions, defOf);
+    }
+
+    private static bool IsRuntimeClassLoadedFromReceiver(LocalVariable local, IOperand receiver,
+        List<Instruction> pathInstructions, Dictionary<LocalVariable, Instruction> defOf)
+    {
+        if (local.Type is not RuntimeClassTypeAnalysisContext
+            || !TryGetPathDefinition(local, pathInstructions, pathInstructions.Count, out var definition, out _)
+            || definition is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: LocalVariable objectReference }] })
+            return false;
+
+        return SameValueOnPath(receiver, objectReference, pathInstructions, defOf);
     }
 
     private static Instruction? FirstManagedOperation(Block continuation,
@@ -647,9 +703,11 @@ public static class InjectedCheckRemover
         {
             { OpCode: OpCode.Call, IsLiftedFloatAbs: true, Operands: [MethodAnalysisContext { IsStatic: true },
                 LocalVariable destination, var input] } => defOf.ContainsKey(destination) && IsFloatValue(input),
+            // SSA lowering can give these results multiple definitions. The calculation
+            // on this path still cannot throw, even for a zero or NaN divisor.
             { OpCode: OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide,
-                Operands: [LocalVariable destination, var left, var right, FloatingPointPrecision] } =>
-                defOf.ContainsKey(destination) && IsFloatValue(left) && IsFloatValue(right),
+                Operands: [LocalVariable, var left, var right, FloatingPointPrecision] } =>
+                IsFloatValue(left) && IsFloatValue(right),
             { OpCode: >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned,
                 Operands: [LocalVariable, var left, var right, FloatingPointPrecision] } =>
                 IsFloatValue(left) && IsFloatValue(right),
@@ -705,7 +763,8 @@ public static class InjectedCheckRemover
     // corresponding element access. Otherwise the generated IL would have no operation left
     // to enforce the same bounds check.
     private static bool IsArrayBoundsCheck(Block guard, Instruction definition, bool throwOnTrue, Block continuation,
-        Dictionary<LocalVariable, Instruction> defOf, bool removeNullChecks, HashSet<Instruction> redundantLengthLoads)
+        Dictionary<LocalVariable, Instruction> defOf, bool removeNullChecks, HashSet<Instruction> redundantLengthLoads,
+        TypeAnalysisContext? callerType)
     {
         if (definition.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqualUnsigned
             || definition.Operands.Count < 3)
@@ -713,7 +772,7 @@ public static class InjectedCheckRemover
 
         var operation = FirstManagedOperation(continuation, defOf, out _);
         var access = operation != null ? AsArrayAccess(FirstAccess(operation)) : null;
-        var receiverGuard = access == null && removeNullChecks ? MatchGuardedArrayArgument(continuation) : null;
+        var receiverGuard = access == null && removeNullChecks ? MatchGuardedArrayArgument(continuation, callerType) : null;
         access ??= receiverGuard?.Access;
         if (access == null)
             return false;
@@ -778,7 +837,7 @@ public static class InjectedCheckRemover
 
     private sealed record GuardedArrayArgument(ArrayAccess Access, Instruction Call, Block Failure, Block Continuation);
 
-    private static GuardedArrayArgument? MatchGuardedArrayArgument(Block guard)
+    private static GuardedArrayArgument? MatchGuardedArrayArgument(Block guard, TypeAnalysisContext? callerType)
     {
         // IL2CPP can check the array bounds, load a receiver from this, check the receiver,
         // and only then load the previously checked element. The equivalent CIL loads the
@@ -804,7 +863,8 @@ public static class InjectedCheckRemover
                 [ { OpCode: OpCode.Move, Operands: [LocalVariable argument, ArrayAccess access] }, var call ]
             || !call.IsCall || call.Operands[0] is not MethodAnalysisContext
                 { IsStatic: false, DeclaringType: { IsValueType: false } owner, Parameters.Count: 1 } target
-            || target.Name == ".ctor" || !call.NullCheckReceiver && target.IsVirtual && !target.IsFinal && !owner.IsSealed)
+            || target.Name == ".ctor" || !call.NullCheckReceiver && target.IsVirtual && !target.IsFinal && !owner.IsSealed
+                && CallerMayMakeBaseCall(callerType, owner))
             return null;
 
         var receiverIndex = call.OpCode == OpCode.CallVoid ? 1 : 2;
@@ -970,38 +1030,51 @@ public static class InjectedCheckRemover
         return ignored;
     }
 
-    // Describes the throw performed by a block containing no other observable operation.
+    // Describes a throw reached through blocks containing no other observable operation.
     private static InjectedThrow? GetInjectedThrow(Block block, HashSet<Instruction> ignoredExceptionConstructions)
     {
-        InjectedThrow? thrown = null;
-
-        foreach (var instruction in block.Instructions)
+        var visited = new HashSet<Block>();
+        while (visited.Add(block))
         {
-            if (ignoredExceptionConstructions.Contains(instruction))
-                continue;
+            InjectedThrow? thrown = null;
 
-            switch (instruction.OpCode)
+            foreach (var instruction in block.Instructions)
             {
-                case OpCode.Nop or OpCode.Interrupt:
-                case OpCode.Return when thrown != null:
+                if (ignoredExceptionConstructions.Contains(instruction))
                     continue;
 
-                case OpCode.Throw when thrown == null
-                    && instruction.Operands is [TypeAnalysisContext { FullName: "System.NullReferenceException" or "System.IndexOutOfRangeException" } exception]:
-                    thrown = new InjectedThrow(exception.FullName, null);
-                    continue;
+                switch (instruction.OpCode)
+                {
+                    case OpCode.Nop or OpCode.Interrupt or OpCode.Jump or OpCode.Phi:
+                        // Branch trampolines and phi nodes add no observable work before the throw.
+                        continue;
 
-                case OpCode.Throw when thrown == null
-                    && instruction.Operands is [LocalVariable or FieldReference or MemoryOperand or Register]:
-                    thrown = new InjectedThrow(null, instruction.Operands.First());
-                    continue;
+                    case OpCode.Return when thrown != null:
+                        continue;
 
-                default:
-                    return null;
+                    case OpCode.Throw when thrown == null
+                        && instruction.Operands is [TypeAnalysisContext { FullName: "System.NullReferenceException" or "System.IndexOutOfRangeException" } exception]:
+                        thrown = new InjectedThrow(exception.FullName, null);
+                        continue;
+
+                    case OpCode.Throw when thrown == null
+                        && instruction.Operands is [LocalVariable or FieldReference or MemoryOperand or Register]:
+                        thrown = new InjectedThrow(null, instruction.Operands.First());
+                        continue;
+
+                    default:
+                        return null;
+                }
             }
+
+            if (thrown != null)
+                return thrown;
+            if (block.Successors is not [var next])
+                return null;
+            block = next;
         }
 
-        return thrown;
+        return null;
     }
 
     private static Dictionary<LocalVariable, Instruction> BuildDefMap(ISILControlFlowGraph cfg,

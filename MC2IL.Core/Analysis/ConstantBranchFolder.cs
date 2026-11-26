@@ -111,4 +111,99 @@ public static class ConstantBranchFolder
         if (merged)
             graph.RemoveUnreachableBlocks();
     }
+
+    internal static void NormalizeBooleanReturnPaths(MethodAnalysisContext method)
+    {
+        if (method.ReturnType != method.AppContext.SystemTypes.SystemBooleanType)
+            return;
+
+        var graph = method.ControlFlowGraph!;
+        var changed = false;
+        var loopExits = new List<Block>();
+        var earlyReturns = new Dictionary<Block, Block>();
+        DominatorInfo? dominance = null;
+        foreach (var join in graph.Blocks)
+        {
+            if (join.Predecessors.Count < 2 || join.Successors is not [var exit] || exit != graph.ExitBlock
+                || join.Instructions.Where(i => i.OpCode != OpCode.Nop).ToArray() is not
+                    [{ OpCode: OpCode.Return, Operands: [LocalVariable result] } sharedReturn]
+                || result.Type != method.ReturnType
+                || result.Register.Name.StartsWith("stack_", StringComparison.Ordinal))
+                continue;
+
+            var returns = new List<(Block Block, Instruction Store, Immediate Value)>();
+            foreach (var path in join.Predecessors)
+            {
+                if (path.Successors is not [var successor] || successor != join)
+                    continue;
+
+                var operations = path.Instructions.Where(i => i.OpCode != OpCode.Nop).ToArray();
+                if (operations is not [_]
+                    && !(operations is [_, { OpCode: OpCode.Jump, Operands: [Block target] }] && target == join))
+                    continue;
+                if (operations[0] is { OpCode: OpCode.Move, OperandWidth: null,
+                        Operands: [LocalVariable destination, Immediate { Value: 0 or 1 } value] } store && destination == result)
+                    returns.Add((path, store, value));
+            }
+
+            if (returns.Count < 2 || !returns.Any(path => path.Value.Value != returns[0].Value.Value)
+                || graph.Instructions.Any(i => i != sharedReturn && DeadCodeEliminator.UsedLocals(i).Contains(result)))
+                continue;
+
+            // Compilers share a return epilogue even across independent loop exits. Give
+            // each constant its own return so a decompiler can recover the loop condition.
+            foreach (var (path, store, value) in returns)
+            {
+                foreach (var header in path.Predecessors)
+                {
+                    if (header.BlockType != BlockType.TwoWay || header.Predecessors.Count < 2)
+                        continue;
+
+                    dominance ??= new DominatorInfo(graph);
+                    if (!header.Predecessors.Any(predecessor => dominance.Dominates(header, predecessor))
+                        || !returns.Any(other => other.Block != path && dominance.Dominates(header, other.Block)))
+                        continue;
+
+                    loopExits.Add(path);
+                    foreach (var (earlyReturn, _, _) in returns)
+                        if (earlyReturn != path && dominance.Dominates(header, earlyReturn)
+                            && earlyReturn.Predecessors is [var test] && test != header && test.BlockType == BlockType.TwoWay)
+                            earlyReturns[earlyReturn] = test;
+                    break;
+                }
+
+                store.OpCode = OpCode.Return;
+                store.SetOperands(value);
+                var afterStore = path.Instructions.IndexOf(store) + 1;
+                path.Instructions.RemoveRange(afterStore, path.Instructions.Count - afterStore);
+                graph.RemoveEdge(path, join);
+                path.Successors.Add(exit);
+                exit.Predecessors.Add(path);
+                path.CalculateBlockType();
+            }
+
+            changed = true;
+        }
+
+        // Let an early return fall through from its test, with the other branch
+        // continuing around the loop.
+        foreach (var pair in earlyReturns)
+        {
+            var earlyReturn = pair.Key;
+            var test = pair.Value;
+            graph.Blocks.Remove(earlyReturn);
+            graph.Blocks.Insert(graph.Blocks.IndexOf(test) + 1, earlyReturn);
+        }
+
+        // Lay out the condition's exit after the early returns in the loop body.
+        // The C# decompiler uses IL offsets to choose which exit goes after the loop.
+        foreach (var exit in loopExits)
+        {
+            graph.Blocks.Remove(exit);
+            graph.Blocks.Add(exit);
+        }
+
+        if (changed)
+            graph.RemoveUnreachableBlocks();
+    }
 }

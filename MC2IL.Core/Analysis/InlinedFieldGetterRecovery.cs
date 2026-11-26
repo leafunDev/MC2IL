@@ -10,6 +10,27 @@ namespace MC2IL.Core.Analysis;
 
 internal static class InlinedFieldGetterRecovery
 {
+    internal static bool IsVerifiedDirectGetter(MethodAnalysisContext getter)
+    {
+        if (getter.AppContext.InstructionSet is not NewArmV8InstructionSet instructionSet
+            || getter.DeclaringType is not { } declaringType
+            || getter.IsStatic || getter.IsVoid || getter.Parameters.Count != 0
+            || getter.UnderlyingPointer == 0)
+            return false;
+
+        foreach (var field in declaringType.Fields)
+        {
+            if (field.IsStatic || !MetadataResolver.IsSameType(getter.ReturnType, field.FieldType))
+                continue;
+
+            var size = TypeSizes.UnboxedSize(field.FieldType, 8);
+            if (size is > 0 and <= int.MaxValue && FindDirectGetter(field, (int)size, instructionSet) == getter)
+                return true;
+        }
+
+        return false;
+    }
+
     internal static void Run(MethodAnalysisContext method)
     {
         if (method.AppContext.InstructionSet is not NewArmV8InstructionSet instructionSet

@@ -70,8 +70,8 @@ public class SimplifierTests
         var aLocal = new LocalVariable("a", new Register(null, "a"));
         var bLocal = new LocalVariable("b", new Register(null, "b"));
 
-        // a := [0xAAAA]; f(a); b := [0xBBBB]; g(b).  Inlining a's constant load must not touch the
-        // unrelated constant address [0xBBBB] - they are distinct absolute addresses.
+        // a := [0xAAAA]; f(a); b := [0xBBBB]; g(b). These distinct reads must keep their
+        // addresses and evaluation order. Memory loads are intentionally not duplicated into calls.
         var instructions = new List<Instruction>
         {
             new(0, OpCode.Move, aLocal, new MemoryOperand(null, null, 0xAAAA, 0)),
@@ -88,15 +88,19 @@ public class SimplifierTests
 
         var live = graph.Blocks.SelectMany(b => b.Instructions).ToList();
 
-        var gCall = live.Single(i => i.OpCode == OpCode.CallVoid && i.Operands[0] is StringLiteral { Value: "g" });
-        Assert.That(gCall.Operands[1], Is.InstanceOf<MemoryOperand>());
-        Assert.That(((MemoryOperand)gCall.Operands[1]).Addend, Is.EqualTo(0xBBBBL),
+        var aLoad = live.Single(i => i.OpCode == OpCode.Move && ReferenceEquals(i.Destination, aLocal));
+        var bLoad = live.Single(i => i.OpCode == OpCode.Move && ReferenceEquals(i.Destination, bLocal));
+        Assert.That(((MemoryOperand)aLoad.Operands[1]).Addend, Is.EqualTo(0xAAAAL));
+        Assert.That(((MemoryOperand)bLoad.Operands[1]).Addend, Is.EqualTo(0xBBBBL),
             "an unrelated constant address must not be rewritten by another inline");
 
-        // The intended inline still happens.
         var fCall = live.Single(i => i.OpCode == OpCode.CallVoid && i.Operands[0] is StringLiteral { Value: "f" });
-        Assert.That(fCall.Operands[1], Is.InstanceOf<MemoryOperand>());
-        Assert.That(((MemoryOperand)fCall.Operands[1]).Addend, Is.EqualTo(0xAAAAL));
+        var gCall = live.Single(i => i.OpCode == OpCode.CallVoid && i.Operands[0] is StringLiteral { Value: "g" });
+        Assert.That(fCall.Operands[1], Is.SameAs(aLocal));
+        Assert.That(gCall.Operands[1], Is.SameAs(bLocal));
+        Assert.That(live.IndexOf(aLoad), Is.LessThan(live.IndexOf(fCall)));
+        Assert.That(live.IndexOf(fCall), Is.LessThan(live.IndexOf(bLoad)));
+        Assert.That(live.IndexOf(bLoad), Is.LessThan(live.IndexOf(gCall)));
     }
 
     [Test]

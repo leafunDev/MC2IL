@@ -36,3 +36,17 @@ The CLI discovers the IL2CPP binary and metadata from supported inputs. `LibMC2I
 - Add an output format or input extension in the relevant plugin project, following the existing plugin structure.
 
 Test fixtures live under `TestFiles/`. Only add files that can be redistributed. Never add proprietary game binaries or metadata without permission; see [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+## ARMv7 stack transfers
+
+The ARMv7 lifter expands `LDM` and `STM` with `sp` as the base into four-byte ISIL stack loads and stores. IA, IB, DA, and DB addressing modes place registers in ascending address order. Writeback changes the tracked stack only after all transfers; conditional instructions use the existing predicate handling. This preserves outgoing stack arguments that compilers pack into a single native instruction. Both ARM and Thumb decoding feed this path.
+
+Transfers through other base registers remain explicitly unsupported until packed value-type field recovery can preserve their managed layout. User-mode register banks and non-alias transfers involving `pc` or `sp` in the register list also retain a diagnostic. Existing `PUSH` and `POP` aliases keep their dedicated handling.
+
+`ArmV7BlockTransferTests` uses synthetic machine instructions to check addressing modes, widths, stack writeback, predicates, Thumb decoding, and unsupported cases without requiring a game binary.
+
+The ARMv7 lifter models `ADC`, `SBC`, and `RSC` using the incoming carry flag, including carry/borrow propagation across 32-bit words. Their flag-setting forms also derive `N`, `Z`, `C`, and `V` from the wrapped 32-bit result so following conditional instructions retain their meaning. This covers common compiler output for 64-bit integer arithmetic on ARM32.
+
+It also expands `SBFX`, `BFI`, and `BFC` into shifts and masks, preserving signed extraction and unaffected destination bits without adding architecture-specific IL opcodes.
+
+`ROR` and `RRX` are emitted as 32-bit rotates, including register-controlled `ROR` and rotated operands. Flag-setting rotates preserve the prior carry for a zero register count and otherwise write the bit shifted out into `C`.

@@ -162,5 +162,11 @@ public enum OpCode
     Convert,
 
     /// <summary>Constructs a value type from the floating-point ABI registers carrying its fields.</summary>
-    PackFloatAggregate
+    PackFloatAggregate,
+
+    /// <summary>Tests op 2 against the reference type op 3, storing the typed reference or null in op 1.</summary>
+    IsInstance,
+
+    /// <summary>Stores op 3 or op 4 into op 1 according to the boolean op 2.</summary>
+    Select
 }

@@ -24,7 +24,6 @@ public static class MetadataInitGuardRemover
     // Byte holding Il2CppClass's bitfield, of which bit 0 is initialized_and_no_error.
     // TODO this is almost certainly not correct on every version... but which?
     private const long InitialisedFlagOffset64 = 0x135;
-    private const long InitialisedFlagOffset32 = 0xBD;
 
     // Other Unity layouts expose the equivalent class-initialization state as cctor_finished.
     private const long CctorFinishedOffset64 = 0xE0;
@@ -38,17 +37,15 @@ public static class MetadataInitGuardRemover
     {
         var cfg = method.ControlFlowGraph!;
         var supportsClassReloads = SupportsClassReloads(method);
-        var armV7ClassLayout = method.AppContext.InstructionSet is ArmV7InstructionSet
-            && method.AppContext.MetadataVersion == 24.5f;
-        // These Il2CppClass offsets are only verified for the ARM64 metadata-v29 layout.
-        // Keep class-init guards in unknown layouts instead of treating an unrelated byte as
-        // the initialized flag. Metadata-init guards are independently recognized by their
-        // matching absolute flag store.
+        var isArmV7 = method.AppContext.InstructionSet is ArmV7InstructionSet;
+        var armV7ClassLayout = isArmV7 && method.AppContext.MetadataVersion == 24.5f;
+        // Only accept class offsets from known layouts. ARMv7 v29 checks cctor_finished
+        // at 0x74 before calling the class initializer.
         var flagOffsets = supportsClassReloads
-            ? method.AppContext.Binary.is32Bit
-                ? new[] { InitialisedFlagOffset32, CctorFinishedOffset32 }
-                : new[] { InitialisedFlagOffset64, CctorFinishedOffset64 }
-            : Array.Empty<long>();
+            ? new[] { InitialisedFlagOffset64, CctorFinishedOffset64 }
+            : isArmV7 && method.AppContext.MetadataVersion == 29
+                ? new[] { CctorFinishedOffset32 }
+                : Array.Empty<long>();
         if (supportsClassReloads)
             RemoveArm64ClassMetadataGuards(method, cfg);
         if (armV7ClassLayout)
@@ -776,6 +773,9 @@ public static class MetadataInitGuardRemover
         var merge = initEntry == first ? second : first;
         Excise(cfg, guard, initEntry, merge, region);
 
+        if (metadataFlagAddress.HasValue && flagLoad != null)
+            discardedGuardLoads.Add(flagLoad);
+
         // These reads can be discarded only for the class pointer consumed by the recognized
         // initializer. The same offsets can occur in ordinary managed objects.
         if (flagLoad?.Operands[1] is MemoryOperand
@@ -964,7 +964,7 @@ public static class MetadataInitGuardRemover
         }
 
         return dynamicLoads.All(instruction => runtimeLoads.Contains(instruction)
-            || allowStaticFieldReloads && IsEquivalentStaticFieldReload(instruction, guard, merge, region, definitions));
+            || allowStaticFieldReloads && IsEquivalentGuardReload(instruction, guard, merge, region, definitions));
 
         // Accept bounded copies and +0 indirections rooted in an absolute metadata slot. A
         // random object-field read in the same region must retain its possible null exception.
@@ -988,16 +988,19 @@ public static class MetadataInitGuardRemover
         }
     }
 
-    private static bool IsEquivalentStaticFieldReload(Instruction reload, Block guard, Block merge,
+    private static bool IsEquivalentGuardReload(Instruction reload, Block guard, Block merge,
         HashSet<Block> region, Dictionary<LocalVariable, Instruction> definitions)
     {
+        var staticOwner = StaticFieldOwner(reload);
+        var receiverField = ReceiverFieldLoad(reload);
         var fastIndex = merge.Predecessors.IndexOf(guard) + 1;
         if (fastIndex == 0 || reload.Destination is not LocalVariable local
-            || StaticFieldOwner(reload) is not { } owner)
+            || staticOwner == null && receiverField == null)
             return false;
 
-        // Only discard a reload if the surviving edge already supplies the same
-        // class's storage to the merge. An arbitrary object read can still throw.
+        // The surviving edge must already supply the same load to each phi. Native
+        // metadata initialization can cause the compiler to reload a field of this after
+        // the helper call, just as it can reload a class's static storage pointer.
         var replaced = false;
         foreach (var phi in merge.Instructions)
         {
@@ -1013,13 +1016,26 @@ public static class MetadataInitGuardRemover
 
             if (FollowCopies(phi.Operands[fastIndex], definitions) is not LocalVariable fastValue
                 || !definitions.TryGetValue(fastValue, out var fastLoad)
-                || StaticFieldOwner(fastLoad) is not { } fastOwner
-                || !MetadataResolver.IsSameType(owner, fastOwner))
+                || !SameLoad(fastLoad))
                 return false;
 
             replaced = true;
         }
         return replaced;
+
+        bool SameLoad(Instruction fastLoad) => staticOwner != null
+            ? MetadataResolver.IsSameType(staticOwner, StaticFieldOwner(fastLoad))
+            : receiverField == ReceiverFieldLoad(fastLoad);
+
+        (LocalVariable Receiver, long Offset, int Size, int? Width)? ReceiverFieldLoad(Instruction load)
+        {
+            if (load is not { OpCode: OpCode.Move, MemoryAccessSize: int size, Operands: [LocalVariable,
+                    MemoryOperand { Base: LocalVariable pointer, Index: null, Scale: 0, Addend: > 0 } address] }
+                || FollowCopies(pointer, definitions) is not LocalVariable { IsThis: true } receiver)
+                return null;
+
+            return (receiver, address.Addend, size, load.OperandWidth);
+        }
 
         TypeAnalysisContext? StaticFieldOwner(Instruction load)
         {

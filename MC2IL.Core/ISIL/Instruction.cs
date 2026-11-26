@@ -22,6 +22,8 @@ public class Instruction : IOperand
 
     // Number of identical floating-point lanes written by a native SIMD splat.
     public int? VectorElementCount;
+    // Provenance needed to separate the two low S lanes before managed type propagation.
+    internal Arm64PackedFloatOperation Arm64PackedFloat;
 
     // This immediate address came from a PC-relative native instruction, not an integer literal.
     public bool IsPcRelativeAddress;
@@ -29,8 +31,15 @@ public class Instruction : IOperand
     // A removed native receiver guard must still be enforced by the emitted CIL call.
     public bool NullCheckReceiver;
 
+    // Preserve generic interface dispatch as a CIL constrained call when the receiver type
+    // comes from a generic parameter constraint.
+    public TypeAnalysisContext? ConstrainedCallType;
+
     // A scalar native absolute value emitted as a managed math call.
     public bool IsLiftedFloatAbs;
+
+    // Native instruction address, retained through early analysis for architecture-specific recovery.
+    internal ulong? NativeAddress;
 
     // Scalar FMIN has native NaN semantics and can be part of an inlined clamp.
     public bool IsLiftedFloatMin;
@@ -119,7 +128,8 @@ public class Instruction : IOperand
             or OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess or OpCode.CheckNotEqual
             or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual or OpCode.CheckGreaterUnsigned
             or OpCode.CheckLessUnsigned or OpCode.CheckGreaterOrEqualUnsigned or OpCode.CheckLessOrEqualUnsigned
-            or OpCode.Newobj or OpCode.Box or OpCode.CastClass or OpCode.IsInst => 0,
+            or OpCode.Newobj or OpCode.Box or OpCode.CastClass or OpCode.IsInst
+            or OpCode.IsInstance or OpCode.Select => 0,
         OpCode.Call or OpCode.IndirectCall when _operands.Count > 1 => 1,
         _ => -1
     };
@@ -145,12 +155,17 @@ public class Instruction : IOperand
     {
         var sources = OpCode switch
         {
+            OpCode.Move when _operands.Count == 3 && Arm64PackedFloat is Arm64PackedFloatOperation.ExtractLow
+                or Arm64PackedFloatOperation.ExtractHigh or Arm64PackedFloatOperation.InsertLow or Arm64PackedFloatOperation.InsertHigh
+                => [_operands[1], _operands[2]],
+
             OpCode.Move or OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
                 or OpCode.Newobj
                 => [_operands[1]],
 
-            OpCode.Convert => [_operands[1]],
+            OpCode.Convert or OpCode.IsInstance => [_operands[1]],
+            OpCode.Select => [_operands[1], _operands[2], _operands[3]],
 
             OpCode.PackFloatAggregate => _operands.Skip(2).ToList(),
 

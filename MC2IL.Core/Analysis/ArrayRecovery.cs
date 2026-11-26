@@ -27,8 +27,171 @@ public static class ArrayRecovery
         var cfg = method.ControlFlowGraph!;
         var instructions = cfg.Instructions;
         RecoverAccesses(method, instructions);
+        RecoverArrayAllocationLengthTypes(method, instructions);
         RecoverStructElementAddresses(method, instructions);
+        RecoverNullGenericArrayReturns(cfg);
         GroupInitialisers(cfg);
+    }
+
+    private static void RecoverArrayAllocationLengthTypes(MethodAnalysisContext method, List<Instruction> instructions)
+    {
+        var int32 = method.AppContext.SystemTypes.SystemInt32Type;
+        var definitions = SingleDefinitions(instructions);
+        foreach (var arithmetic in instructions)
+            if (arithmetic is { OpCode: OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.And,
+                    OperandWidth: 32, Destination: LocalVariable destination })
+                ConstrainInt32(destination, []);
+
+        foreach (var allocation in instructions)
+        {
+            if (allocation is { OpCode: OpCode.NewArr, Operands: [_, SzArrayTypeAnalysisContext, LocalVariable length] })
+                ConstrainInt32(length, []);
+        }
+
+        var uses = CollectUses(instructions);
+        foreach (var instruction in instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Convert,
+                    Operands: [LocalVariable { Type.FullName: "System.Int64" } destination,
+                        LocalVariable { Type.FullName: "System.Int32" } source,
+                        NumericConversion { Kind: NumericConversionKind.I64ExtendI32Signed or NumericConversionKind.I64ExtendI32Unsigned }] }
+                || !uses.TryGetValue(destination, out var destinationUses)
+                || destinationUses.Count == 0
+                || !destinationUses.All(use => IsArrayBoundComparison(use.Instruction, destination)))
+                continue;
+
+            // An Int32 array length widened only for native comparison can stay Int32
+            // once its bounds-check uses have been recovered.
+            destination.Type = int32;
+            instruction.OpCode = OpCode.Move;
+            instruction.SetOperands(destination, source);
+            instruction.OperandWidth = null;
+        }
+
+        foreach (var instruction in instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Move,
+                    Operands: [LocalVariable { Type.FullName: "System.Int64" } destination, LocalVariable source] }
+                || !ConstrainInt32(source, [])
+                || !uses.TryGetValue(destination, out var destinationUses)
+                || destinationUses.Count == 0
+                || !destinationUses.All(use => IsArrayBoundComparison(use.Instruction, destination)))
+                continue;
+
+            // A widened copy of an array length stays within Int32. When it is only used
+            // for comparisons against Int32 array indices, keep it as an Int32 local.
+            destination.Type = int32;
+        }
+
+        foreach (var instruction in instructions)
+        {
+            if (instruction is not { OpCode: OpCode.And, OperandWidth: null or 32,
+                    Operands: [LocalVariable { Type.FullName: "System.Int32" or "System.UInt32" } destination, var left, var right] })
+                continue;
+
+            var source = left is Immediate { Value: 0xFFFFFFFF } ? right
+                : right is Immediate { Value: 0xFFFFFFFF } ? left
+                : null;
+            if (source is not LocalVariable { Type.FullName: "System.Int32" or "System.UInt32" })
+                continue;
+
+            // In a 32-bit operation, AND with all ones is an identity. ARM64 emits this
+            // when it normalizes array lengths for unsigned bounds checks.
+            instruction.OpCode = OpCode.Move;
+            instruction.SetOperands(destination, source);
+            instruction.OperandWidth = null;
+        }
+
+        bool ConstrainInt32(LocalVariable local, HashSet<LocalVariable> seen)
+        {
+            if (local.Type?.FullName == "System.Int32")
+                return true;
+            if (local.Type != null && local.Type.FullName != "System.Object")
+                return false;
+            if (!seen.Add(local) || !definitions.TryGetValue(local, out var definition) || definition == null)
+                return false;
+
+            var isInt32 = definition switch
+            {
+                { OpCode: OpCode.Move, Operands: [_, ArrayLength] } => true,
+                { OpCode: OpCode.Move, OperandWidth: 32, Operands: [_, Immediate { Value: >= int.MinValue and <= int.MaxValue }] } => true,
+                { OpCode: OpCode.Move, Operands: [_, LocalVariable source] } => ConstrainInt32(source, seen),
+                { OpCode: OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.And, OperandWidth: 32 }
+                    when definition.Operands.Skip(1).All(operand => operand switch
+                    {
+                        Immediate { Value: >= int.MinValue and <= int.MaxValue } => true,
+                        ArrayLength => true,
+                        LocalVariable input => ConstrainInt32(input, seen),
+                        _ => false,
+                    }) => true,
+                _ => false,
+            };
+
+            if (isInt32)
+                local.Type = int32;
+            return isInt32;
+        }
+
+        static bool IsArrayBoundComparison(Instruction comparison, LocalVariable value)
+        {
+            if (comparison.OpCode is not (>= OpCode.CheckEqual and <= OpCode.CheckLessOrEqualUnsigned))
+                return false;
+
+            return comparison.Operands.Skip(1).Any(operand => !ReferenceEquals(operand, value)
+                && operand is LocalVariable { Type.FullName: "System.Int32" or "System.UInt32" }
+                    or ArrayLength or Immediate);
+        }
+    }
+
+    private static void RecoverNullGenericArrayReturns(ISILControlFlowGraph cfg)
+    {
+        foreach (var block in cfg.Blocks)
+        foreach (var move in block.Instructions)
+        {
+            if (move is not { OpCode: OpCode.Move,
+                    Operands: [LocalVariable { Type: GenericParameterTypeAnalysisContext generic },
+                        LocalVariable { Type: SzArrayTypeAnalysisContext { ElementType: { } elementType } } source] }
+                || !MetadataResolver.IsSameType(generic, elementType)
+                || !IsNullOnIncomingEdge(block, move, source))
+                continue;
+
+            // The native null branch returns the same zero pointer held by the array argument.
+            // In the generic managed signature, that value is default(T), not a T[]-to-T cast.
+            move.SetOperand(1, new DefaultValue(generic));
+        }
+    }
+
+    private static bool IsNullOnIncomingEdge(Block block, Instruction use, LocalVariable value)
+    {
+        if (block.Predecessors is not [var predecessor]
+            || predecessor.Successors.Count != 2
+            || predecessor.Instructions.LastOrDefault() is not
+                { OpCode: OpCode.ConditionalJump, Operands: [Block taken, LocalVariable condition] }
+            || !predecessor.Successors.Contains(taken))
+            return false;
+
+        var comparison = predecessor.Instructions.LastOrDefault(instruction =>
+            ReferenceEquals(instruction.Destination, condition));
+        if (comparison is not { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual,
+                Operands: [_, var left, var right] }
+            || !((ReferenceEquals(left, value) && right is Immediate { Value: 0 })
+                || (ReferenceEquals(right, value) && left is Immediate { Value: 0 })))
+            return false;
+
+        var nullOnTakenEdge = comparison.OpCode == OpCode.CheckEqual;
+        if (nullOnTakenEdge != ReferenceEquals(taken, block))
+            return false;
+
+        var comparisonIndex = predecessor.Instructions.IndexOf(comparison);
+        var branchIndex = predecessor.Instructions.Count - 1;
+        if (comparisonIndex < 0 || predecessor.Instructions.Skip(comparisonIndex + 1)
+                .Take(branchIndex - comparisonIndex - 1)
+                .Any(instruction => ReferenceEquals(instruction.Destination, value)))
+            return false;
+
+        var useIndex = block.Instructions.IndexOf(use);
+        return useIndex >= 0 && !block.Instructions.Take(useIndex)
+            .Any(instruction => ReferenceEquals(instruction.Destination, value));
     }
 
     internal static void MergeReloadedLoopArrayLengths(ISILControlFlowGraph cfg)
@@ -136,6 +299,15 @@ public static class ArrayRecovery
                 if (instruction.Operands[i] is not MemoryOperand memory)
                     continue;
 
+                if (instruction is { OpCode: OpCode.Move,
+                        Operands: [LocalVariable loadedValue, MemoryOperand { Base: LocalVariable pointer, Index: null, Scale: 0, Addend: 0 }] }
+                    && TryRecoverSelectedArrayPointerRead(method, loadedValue, pointer, memory, instruction,
+                        cfg, instructions, definitions, ref dominators))
+                {
+                    changed = true;
+                    continue;
+                }
+
                 // Some AArch64 sequences keep the array header bias in the index register
                 // (for example, address index = logical index + 4) while using the array
                 // object itself as the base. Recover the logical index only when the matching
@@ -174,17 +346,35 @@ public static class ArrayRecovery
                     continue;
                 }
 
+                if (TryRecoverPointerLoopArrayAccess(method, address, memory, instruction, cfg, instructions,
+                    definitions, ref dominators) is { } pointerAccess)
+                {
+                    instruction.SetOperand(i, pointerAccess);
+                    if (instruction.OpCode == OpCode.Move && i == 1
+                        && instruction.Destination is LocalVariable pointerDestination)
+                        LocalVariables.PropagateProducedType(pointerDestination,
+                            pointerAccess.Array.Type is SzArrayTypeAnalysisContext pointerArrayType
+                                ? pointerArrayType.ElementType : null);
+                    changed = true;
+                    continue;
+                }
+
+                // Keep generic accesses as ArrayAccess<T>; the emitted ldelem T carries the
+                // runtime instantiation. The exact native width/stride checks below still gate recovery.
                 if (SplitArrayAddress(address, definitions, pointerSize, 0) is not { } split
                     || ReferenceEquals(split.Array, address)
-                    || split.Array.Type is not SzArrayTypeAnalysisContext { ElementType: var elementType }
-                    || elementType is GenericParameterTypeAnalysisContext)
+                    || split.Array.Type is not SzArrayTypeAnalysisContext { ElementType: var elementType })
                     continue;
 
                 var displacement = Sum(split.Displacement, new Affine(null, 0, memory.Addend));
                 if (memory.Index is LocalVariable index)
                 {
-                    if (memory.Scale <= 0 || !IsArrayIndex(index))
+                    if (memory.Scale <= 0
+                        || !IsArrayIndex(index) && !IsCheckedArrayIndexOnEveryPath(index, split.Array,
+                            pointerSize, instruction, cfg, instructions, definitions))
                         continue;
+
+                    TypeAsInt32(index, method.AppContext.SystemTypes.SystemInt32Type);
                     displacement = Sum(displacement, new Affine(index, memory.Scale, 0));
                 }
                 else if (memory.Index != null || memory.Scale != 0)
@@ -203,6 +393,16 @@ public static class ArrayRecovery
                 {
                     if (offset.Multiplier != stride || dataOffset != 0)
                         continue;
+
+                    var isInt32Index = dynamicIndex.Type?.FullName == "System.Int32";
+                    var isPathChecked = IsCheckedArrayIndexOnEveryPath(dynamicIndex, split.Array, pointerSize,
+                        instruction, cfg, instructions, definitions);
+                    var isDominatedByCheck = IsCheckedArrayIndex(dynamicIndex, split.Array, pointerSize, instruction,
+                        cfg, instructions, definitions, requireInt32: false, ref dominators);
+                    if (!isInt32Index && !isPathChecked && !isDominatedByCheck)
+                        continue;
+
+                    TypeAsInt32(dynamicIndex, method.AppContext.SystemTypes.SystemInt32Type);
                     elementIndex = FindEquivalentCheckedIndex(dynamicIndex, split.Array, pointerSize,
                         instruction, cfg, instructions, definitions, ref dominators) ?? dynamicIndex;
                 }
@@ -227,6 +427,179 @@ public static class ArrayRecovery
         DeadCodeEliminator.Run(cfg);
         // Element types can be the missing input for field and virtual-call resolution.
         LocalVariables.ResolveTypesAndFields(method);
+    }
+
+    // A merge of two native array element addresses is still a managed value selection. Resolve
+    // each incoming address to array[index], then let phi removal emit the conditional value copy.
+    private static bool TryRecoverSelectedArrayPointerRead(MethodAnalysisContext method,
+        LocalVariable value, LocalVariable pointer, MemoryOperand memory, Instruction read,
+        ISILControlFlowGraph cfg, List<Instruction> instructions,
+        Dictionary<LocalVariable, Instruction?> definitions, ref DominatorInfo? dominators)
+    {
+        if (!definitions.TryGetValue(pointer, out var phi)
+            || phi is not { OpCode: OpCode.Phi, Operands.Count: 3 }
+            || cfg.FindBlockByInstruction(phi) is not { Predecessors.Count: 2 }
+            || !CollectUses(instructions).TryGetValue(pointer, out var uses)
+            || uses.Any(use => !ReferenceEquals(use.Instruction, read)))
+            return false;
+
+        var recovered = new ArrayAccess[2];
+        for (var i = 0; i < recovered.Length; i++)
+        {
+            if (phi.Operands[i + 1] is not LocalVariable sourcePointer)
+                return false;
+
+            var access = TryRecoverPointerLoopArrayAccess(method, sourcePointer, memory, read,
+                    cfg, instructions, definitions, ref dominators, requireBoundsCheck: false)
+                ?? TryRecoverArrayElementAddress(sourcePointer, memory, method, definitions);
+            if (access == null)
+                return false;
+            recovered[i] = access;
+        }
+
+        if (recovered[0].Array.Type is not SzArrayTypeAnalysisContext firstArray
+            || recovered[1].Array.Type is not SzArrayTypeAnalysisContext secondArray
+            || !MetadataResolver.IsSameType(firstArray.ElementType, secondArray.ElementType))
+            return false;
+
+        var elementType = firstArray.ElementType;
+        for (var i = 0; i < recovered.Length; i++)
+            phi.SetOperand(i + 1, recovered[i]);
+
+        pointer.Type = elementType;
+        value.Type ??= elementType;
+        read.SetOperand(1, pointer);
+        LocalVariables.PropagateProducedType(value, elementType);
+        return true;
+    }
+
+    private static ArrayAccess? TryRecoverArrayElementAddress(LocalVariable address,
+        MemoryOperand memory, MethodAnalysisContext method,
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        if (SplitArrayAddress(address, definitions, pointerSize, 0) is not { } split
+            || split.Array.Type is not SzArrayTypeAnalysisContext arrayType)
+            return null;
+
+        var stride = ElementSize(arrayType.ElementType, pointerSize);
+        if (stride <= 0
+            || Sum(split.Displacement, new Affine(null, 0, memory.Addend)) is not { } displacement)
+            return null;
+
+        long dataOffset;
+        try
+        {
+            dataOffset = checked(displacement.Offset - ElementsOffset(pointerSize));
+        }
+        catch (OverflowException)
+        {
+            return null;
+        }
+
+        if (displacement.Root is { } index)
+        {
+            if (displacement.Multiplier != stride || dataOffset != 0)
+                return null;
+
+            TypeAsInt32(index, method.AppContext.SystemTypes.SystemInt32Type);
+            return new ArrayAccess(split.Array, index);
+        }
+
+        return dataOffset >= 0 && dataOffset % stride == 0
+            ? new ArrayAccess(split.Array, new Immediate(dataOffset / stride))
+            : null;
+    }
+
+    // IL2CPP sometimes walks an array by carrying a pointer to its current element rather than
+    // using [array + index * stride]. Recover the pointer phi as array[index] when its seed,
+    // stride, and matching bounded integer induction variable prove that relationship.
+    private static ArrayAccess? TryRecoverPointerLoopArrayAccess(MethodAnalysisContext method,
+        LocalVariable address, MemoryOperand memory, Instruction access, ISILControlFlowGraph cfg,
+        List<Instruction> instructions, Dictionary<LocalVariable, Instruction?> definitions,
+        ref DominatorInfo? dominators, bool requireBoundsCheck = true)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        if (memory.Index != null || memory.Scale != 0 || memory.Addend != 0
+            || !definitions.TryGetValue(address, out var addressPhi)
+            || addressPhi is not { OpCode: OpCode.Phi, Operands.Count: 3 }
+            || cfg.FindBlockByInstruction(addressPhi) is not { } loopHeader)
+            return null;
+
+        foreach (var (seed, backEdge) in new[]
+        {
+            (addressPhi.Operands[1], addressPhi.Operands[2]),
+            (addressPhi.Operands[2], addressPhi.Operands[1]),
+        })
+        {
+            if (seed is not LocalVariable seedAddress
+                || backEdge is not LocalVariable nextAddress
+                || !definitions.TryGetValue(seedAddress, out var seedDefinition)
+                || seedDefinition is not { OpCode: OpCode.Add, Operands.Count: 3 }
+                || !definitions.TryGetValue(nextAddress, out var increment)
+                || increment is not { OpCode: OpCode.Add, Operands.Count: 3 }
+                || !TryGetArraySeed(seedAddress, out var array, out var stride)
+                || !IsPointerIncrement(increment, address, stride)
+                || cfg.FindBlockByInstruction(increment) is not { } incrementBlock)
+                continue;
+
+            foreach (var (index, indexPhi) in definitions)
+            {
+                if (indexPhi is not { OpCode: OpCode.Phi, Operands.Count: 3 }
+                    || cfg.FindBlockByInstruction(indexPhi) != loopHeader)
+                    continue;
+
+                foreach (var (indexSeed, indexBackEdge) in new[]
+                {
+                    (indexPhi.Operands[1], indexPhi.Operands[2]),
+                    (indexPhi.Operands[2], indexPhi.Operands[1]),
+                })
+                {
+                    if (indexSeed is not Immediate { Value: 0 }
+                        || indexBackEdge is not LocalVariable nextIndex
+                        || !definitions.TryGetValue(nextIndex, out var indexIncrement)
+                        || indexIncrement is not { OpCode: OpCode.Add, Operands.Count: 3 }
+                        || !IsIncrementOf(indexIncrement, index)
+                        || cfg.FindBlockByInstruction(indexIncrement) != incrementBlock
+                        || requireBoundsCheck && !IsCheckedArrayIndex(index, array, pointerSize, access,
+                            cfg, instructions, definitions, requireInt32: false, ref dominators, requireUnsigned: true))
+                        continue;
+
+                    TypeAsInt32(index, method.AppContext.SystemTypes.SystemInt32Type);
+                    return new ArrayAccess(array, index);
+                }
+            }
+
+            bool TryGetArraySeed(LocalVariable seedLocal, out LocalVariable array, out long stride)
+            {
+                array = null!;
+                stride = 0;
+                if (SplitArrayAddress(seedLocal, definitions, pointerSize, 0) is not { } split
+                    || split.Array.Type is not SzArrayTypeAnalysisContext arrayType
+                    || split.Displacement.Root != null
+                    || split.Displacement.Offset != ElementsOffset(pointerSize))
+                    return false;
+
+                stride = ElementSize(arrayType.ElementType, pointerSize);
+                if (stride <= 0)
+                    return false;
+
+                array = split.Array;
+                return true;
+            }
+        }
+
+        return null;
+
+        static bool IsPointerIncrement(Instruction increment, LocalVariable pointerPhi, long stride)
+        {
+            if (increment.Operands is not [LocalVariable destination, var left, var right]
+                || !ReferenceEquals(destination, increment.Destination))
+                return false;
+
+            return ReferenceEquals(left, pointerPhi) && right is Immediate rightStep && rightStep.Value == stride
+                || ReferenceEquals(right, pointerPhi) && left is Immediate leftStep && leftStep.Value == stride;
+        }
     }
 
     private static ArrayAccess? TryRecoverShiftedLoopArrayAccess(MethodAnalysisContext method,
@@ -336,7 +709,7 @@ public static class ArrayRecovery
                 || comparison is not { OpCode: OpCode.CheckGreaterOrEqual or OpCode.CheckLess
                     or OpCode.CheckGreaterOrEqualUnsigned or OpCode.CheckLessUnsigned,
                     Operands: [_, LocalVariable index, var length] }
-                || index.Type != null && index.Type != int32
+                || !IsInt32Compatible(index.Type, int32)
                 || !definitions.TryGetValue(index, out var phi)
                 || phi is not { OpCode: OpCode.Phi, Operands: [_, var firstInput, var secondInput] }
                 || cfg.FindBlockByInstruction(phi) is not { Predecessors: [var firstPredecessor, var secondPredecessor] } header)
@@ -373,7 +746,7 @@ public static class ArrayRecovery
                         && seedDefinition is { OpCode: OpCode.Move,
                             Operands: [_, Immediate { Value: >= 0 and <= int.MaxValue }] };
                 if (!hasNonnegativeSeed
-                    || backEdge is not LocalVariable next || next.Type != null && next.Type != int32
+                    || backEdge is not LocalVariable next || !IsInt32Compatible(next.Type, int32)
                     || !definitions.TryGetValue(next, out var increment)
                     || increment is not { OpCode: OpCode.Add, Operands.Count: 3 }
                     || !IsIncrementOf(increment, index)
@@ -388,6 +761,11 @@ public static class ArrayRecovery
                 return true;
             }
         }
+
+        static bool IsInt32Compatible(TypeAnalysisContext? type, TypeAnalysisContext int32) =>
+            type == null || type == int32 || type.FullName == "System.Object";
+
+        TypeIncrementedLoopCounters(method, cfg, definitions, nonnegativeInductionValues, ref dominators);
 
         // Native code can repeat a bounds check after a branch or after reloading Length.
         // Once the induction proof establishes the index and its increment as nonnegative,
@@ -411,6 +789,107 @@ public static class ArrayRecovery
                 OpCode.CheckLessOrEqualUnsigned => OpCode.CheckLessOrEqual,
                 _ => comparison.OpCode,
             };
+        }
+    }
+
+    private static void TypeIncrementedLoopCounters(MethodAnalysisContext method, ISILControlFlowGraph cfg,
+        Dictionary<LocalVariable, Instruction?> definitions, HashSet<LocalVariable> knownNonnegative,
+        ref DominatorInfo? dominators)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var int32 = method.AppContext.SystemTypes.SystemInt32Type;
+        var instructions = cfg.Instructions;
+        foreach (var (counter, phi) in definitions)
+        {
+            if (phi is not { OpCode: OpCode.Phi, Operands.Count: 3 }
+                || cfg.FindBlockByInstruction(phi) is not { } header)
+                continue;
+
+            foreach (var (seed, backEdge) in new[]
+            {
+                (phi.Operands[1], phi.Operands[2]),
+                (phi.Operands[2], phi.Operands[1]),
+            })
+            {
+                if (!IsNonnegativeInt32Value(seed, pointerSize, definitions, knownNonnegative, [], 0)
+                    || backEdge is not LocalVariable next
+                    || !definitions.TryGetValue(next, out var increment)
+                    || increment is not { OpCode: OpCode.Add, OperandWidth: 32, Operands.Count: 3 }
+                    || !IsIncrementOf(increment, counter)
+                    || cfg.FindBlockByInstruction(increment) is not { } incrementBlock)
+                    continue;
+
+                foreach (var branch in instructions)
+                {
+                    if (branch is not { OpCode: OpCode.ConditionalJump,
+                            Operands: [Block taken, LocalVariable condition] }
+                        || !definitions.TryGetValue(condition, out var comparison)
+                        || comparison is not { Operands: [_, LocalVariable testedIndex, var length] }
+                        || !ReferenceEquals(testedIndex, counter) && !ReferenceEquals(testedIndex, next)
+                        || ResolveLengthArray(length, definitions, pointerSize) is not { } array
+                        || !IsNonnegativeInt32Value(length, pointerSize, definitions, knownNonnegative, [], 0)
+                        || !TryGetInRangeTruth(comparison, testedIndex, array, pointerSize, definitions,
+                            out var trueIsInRange)
+                        || cfg.FindBlockByInstruction(branch) is not { Successors.Count: 2 } guard)
+                        continue;
+
+                    var fallthrough = guard.Successors.FirstOrDefault(successor => successor != taken);
+                    if (fallthrough == null)
+                        continue;
+
+                    var inRange = trueIsInRange ? taken : fallthrough;
+                    var outOfRange = trueIsInRange ? fallthrough : taken;
+                    dominators ??= new DominatorInfo(cfg);
+                    if (!dominators.Dominates(header, guard)
+                        || !CanReach(inRange, incrementBlock)
+                        || CanReach(outOfRange, incrementBlock))
+                        continue;
+
+                    counter.Type = int32;
+                    next.Type = int32;
+                    knownNonnegative.Add(counter);
+                    knownNonnegative.Add(next);
+                    break;
+                }
+            }
+        }
+
+        LocalVariable? ResolveLengthArray(IOperand operand,
+            Dictionary<LocalVariable, Instruction?> defs, int size, HashSet<LocalVariable>? seen = null)
+        {
+            switch (operand)
+            {
+                case ArrayLength { Array: LocalVariable array }:
+                    return array;
+                case MemoryOperand { Base: LocalVariable array, Index: null, Scale: 0, Addend: var offset }
+                    when offset == LengthOffset(size):
+                    return array;
+                case LocalVariable local when (seen ??= []).Add(local)
+                    && defs.TryGetValue(local, out var definition)
+                    && definition is { OpCode: OpCode.Move, Operands: [_, var source] }:
+                    return ResolveLengthArray(source, defs, size, seen);
+                default:
+                    return null;
+            }
+        }
+
+        static bool CanReach(Block start, Block target)
+        {
+            var pending = new Stack<Block>();
+            var visited = new HashSet<Block>();
+            pending.Push(start);
+            while (pending.Count > 0)
+            {
+                var current = pending.Pop();
+                if (current == target)
+                    return true;
+                if (!visited.Add(current))
+                    continue;
+                foreach (var successor in current.Successors)
+                    pending.Push(successor);
+            }
+
+            return false;
         }
     }
 
@@ -824,6 +1303,76 @@ public static class ArrayRecovery
         return false;
     }
 
+    private static bool IsCheckedArrayIndexOnEveryPath(LocalVariable candidate, LocalVariable array,
+        int pointerSize, Instruction access, ISILControlFlowGraph cfg, List<Instruction> instructions,
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        if (cfg.FindBlockByInstruction(access) is not { } accessBlock)
+            return false;
+
+        var guards = new HashSet<Block>();
+        foreach (var branch in instructions)
+        {
+            if (branch is not { OpCode: OpCode.ConditionalJump, Operands: [Block taken, LocalVariable condition] }
+                || !definitions.TryGetValue(condition, out var comparison)
+                || comparison is not { Operands.Count: >= 3 }
+                || !TryGetInRangeTruth(comparison, candidate, array, pointerSize, definitions, out var trueIsInRange)
+                || cfg.FindBlockByInstruction(branch) is not { Successors.Count: 2 } guard)
+                continue;
+
+            var fallthrough = guard.Successors.FirstOrDefault(successor => successor != taken);
+            if (fallthrough == null)
+                continue;
+
+            var inRange = trueIsInRange ? taken : fallthrough;
+            var outOfRange = trueIsInRange ? fallthrough : taken;
+            if (CanReach(inRange, accessBlock) && !CanReach(outOfRange, accessBlock))
+                guards.Add(guard);
+        }
+
+        return guards.Count > 0 && !CanReachWithoutGuard(cfg.EntryBlock, accessBlock);
+
+        bool CanReach(Block start, Block target)
+        {
+            var pending = new Stack<Block>();
+            var visited = new HashSet<Block>();
+            pending.Push(start);
+            while (pending.Count > 0)
+            {
+                var current = pending.Pop();
+                if (current == target)
+                    return true;
+                if (!visited.Add(current))
+                    continue;
+                foreach (var successor in current.Successors)
+                    pending.Push(successor);
+            }
+
+            return false;
+        }
+
+        bool CanReachWithoutGuard(Block start, Block target)
+        {
+            var pending = new Stack<Block>();
+            var visited = new HashSet<Block>();
+            pending.Push(start);
+            while (pending.Count > 0)
+            {
+                var current = pending.Pop();
+                if (guards.Contains(current))
+                    continue;
+                if (current == target)
+                    return true;
+                if (!visited.Add(current))
+                    continue;
+                foreach (var successor in current.Successors)
+                    pending.Push(successor);
+            }
+
+            return false;
+        }
+    }
+
     private static bool TryGetInRangeTruth(Instruction comparison, LocalVariable candidate, LocalVariable array,
         int pointerSize, Dictionary<LocalVariable, Instruction?> definitions, out bool trueIsInRange)
     {
@@ -876,10 +1425,36 @@ public static class ArrayRecovery
             return ReferenceEquals(baseArray, array) && offset == LengthOffset(pointerSize);
 
         if (operand is LocalVariable local && seen.Add(local)
-            && definitions.TryGetValue(local, out var definition)
-            && definition is { OpCode: OpCode.Move, Operands: [_, var source] }
-            && source is IOperand sourceOperand)
-            return IsLengthOf(sourceOperand, array, pointerSize, definitions, seen, depth + 1);
+            && definitions.TryGetValue(local, out var definition))
+        {
+            if (definition is { OpCode: OpCode.Move, Operands: [_, var source] })
+                return IsLengthOf(source, array, pointerSize, definitions, seen, depth + 1);
+
+            // AArch64 commonly narrows an array length to uint with `and 0xffffffff`
+            // before an unsigned bounds check. This preserves the length value.
+            if (definition is { OpCode: OpCode.And, Operands: [_, var left, Immediate { Value: 0xFFFFFFFF }] })
+                return IsLengthOf(left, array, pointerSize, definitions, seen, depth + 1);
+
+            if (definition is { OpCode: OpCode.And, Operands: [_, Immediate { Value: 0xFFFFFFFF }, var right] })
+                return IsLengthOf(right, array, pointerSize, definitions, seen, depth + 1);
+
+            if (definition is { OpCode: OpCode.Phi, Operands.Count: > 1 })
+            {
+                var foundLength = false;
+                foreach (var phiSource in definition.Operands.Skip(1))
+                {
+                    if (phiSource is LocalVariable sourceLocal && seen.Contains(sourceLocal))
+                        continue;
+
+                    foundLength = true;
+                    if (!IsLengthOf(phiSource, array, pointerSize, definitions,
+                            new HashSet<LocalVariable>(seen), depth + 1))
+                        return false;
+                }
+
+                return foundLength;
+            }
+        }
 
         return false;
     }
@@ -892,7 +1467,11 @@ public static class ArrayRecovery
 
         definitions.TryGetValue(local, out var definition);
         if (definition is { OpCode: OpCode.Add, Operands: [_, var left, var right] }
-            && (pointerSize == 4 || definition.OperandWidth != 32))
+            && (pointerSize == 4 || definition.OperandWidth != 32
+                || left is LocalVariable { Type: SzArrayTypeAnalysisContext }
+                || right is LocalVariable { Type: SzArrayTypeAnalysisContext }
+                || left is LocalVariable leftAddress && SplitArrayAddress(leftAddress, definitions, pointerSize, depth + 1) != null
+                || right is LocalVariable rightAddress && SplitArrayAddress(rightAddress, definitions, pointerSize, depth + 1) != null))
             return ExtendAddress(left, right) ?? ExtendAddress(right, left);
         if (local.Type is SzArrayTypeAnalysisContext)
             return (local, new Affine(null, 0, 0));
@@ -933,10 +1512,18 @@ public static class ArrayRecovery
                 NumericConversion { Kind: NumericConversionKind.I64ExtendI32Signed or NumericConversionKind.I64ExtendI32Unsigned }] })
             local = narrowed;
 
-        return IsArrayIndex(local) ? new Affine(local, multiplier, 0) : null;
+        return IsArrayIndex(local) || local.Type == null || local.Type.FullName == "System.Object"
+            ? new Affine(local, multiplier, 0)
+            : null;
     }
 
     private static bool IsArrayIndex(LocalVariable local) => local.Type?.FullName is "System.Int32" or "System.UInt32";
+
+    private static void TypeAsInt32(LocalVariable local, TypeAnalysisContext int32)
+    {
+        if (local.Type == null || local.Type.FullName == "System.Object")
+            local.Type = int32;
+    }
 
     private static void RecoverAccesses(MethodAnalysisContext method, List<Instruction> instructions)
     {

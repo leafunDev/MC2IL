@@ -433,6 +433,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         DumpMethodIr("after locals");
         if (AppContext.InstructionSet is NewArmV8InstructionSet)
             PcRelativeMemoryRecovery.Run(ControlFlowGraph);
+        PackedInt32PairArgumentRecovery.Run(this);
+        Arm64FloatPairRecovery.Run(this);
+        FloatLiteralRecovery.RecoverPackedFieldInitializers(this);
         FloatLiteralRecovery.RecoverNativeLoads(this);
 
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
@@ -496,6 +499,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
         // make joins explicit, so forwarding a value is an unconditional global substitution.
         SsaSimplifier.Run(this);
+        if (AppContext.InstructionSet is NewArmV8InstructionSet)
+            MetadataResolver.ResolveFieldOffsets(this);
+        FloatLiteralRecovery.RecoverTypedBitCopies(this);
+        Arm64FloatFieldAddressRecovery.Run(this);
         ValueTypeReceiverRecovery.ResolveRefArgumentFieldAddresses(this);
         FloatAggregateRecovery.RecoverByRefArgumentLanes(this);
         BooleanFlagSimplifier.TypeMaskedReturnMerges(this);
@@ -537,6 +544,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Fix float literals
         FloatLiteralRecovery.Run(this);
+        FloatLiteralRecovery.RecoverArmV7FloatAbsoluteValues(this);
 
         // Runs late so the array type and length reach the allocation call as operands after copy propagation has inlined them
         ArrayRecovery.Run(this);
@@ -563,13 +571,16 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ConstantBranchFolder.Run(this);
         Arm64ClampRecovery.Run(this);
         ConstantBranchFolder.MergeConstantReturnPaths(this);
+        ConstantBranchFolder.NormalizeBooleanReturnPaths(this);
         FloatConditionRecovery.SimplifyOrderedInequalityBranches(ControlFlowGraph, AppContext.SystemTypes);
 
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);
+        ClassHierarchyTestRecovery.Run(this);
 
         StructReturnFieldRecovery.Run(this);
         StructArgumentFieldRecovery.Run(this);
+        FloatAggregateRecovery.RecoverComputedInstanceStores(this);
         DeadCodeEliminator.Run(ControlFlowGraph!, MetadataResolver.FindMethodMetadataReads(this),
             discardUnusedCallResults: true);
 

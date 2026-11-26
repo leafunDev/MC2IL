@@ -186,6 +186,10 @@ public static class IlGenerator
 
         // Keep simple temporaries out of logging calls, conditions, and returns. Run this after
         // generating every block so a single-use value can also be traced across a call's fallthrough.
+        // Recover direct field expressions when IL2CPP kept one field value alive across
+        // a null guard and an immediate member read. Calls and writes form barriers.
+        InlineRepeatedFieldReads(graph, instructionMap, locals, body);
+        RemoveDominatedStackSlotInitializers(graph, instructionMap);
         var inlineLocals = FindSingleUseCilLocals(body, locals);
         foreach (var block in graph.Blocks)
         {
@@ -284,6 +288,8 @@ public static class IlGenerator
         if (isIteratorMoveNext)
             IteratorReceiverInliner.Run(context, body, instructionMap);
         CilBranchCleanup.Run(body);
+        // The expression passes can leave their original constant stack-slot initializer unread.
+        RemoveUnreadSimpleLocalStores(body);
         SetRecoveredMaxStack(body);
     }
 
@@ -308,6 +314,257 @@ public static class IlGenerator
         return locals.Where(pair => readOnce.Contains(pair.Value) && !ineligible.Contains(pair.Value))
             .ToDictionary(pair => pair.Key, pair => pair.Value);
     }
+
+    private static void InlineRepeatedFieldReads(ISILControlFlowGraph graph,
+        Dictionary<Instruction, List<CilInstruction>> instructionMap,
+        Dictionary<LocalVariable, CilLocalVariable> locals, CilMethodBody body)
+    {
+        foreach (var producer in graph.Instructions.ToArray())
+        {
+            if (producer is not { OpCode: OpCode.Move, Operands:
+                    [LocalVariable { Type: { } valueType } value, FieldReference { Parent: null } field] }
+                || !(field.Field.IsStatic && field.Field.Name == "Instance"
+                    || !field.Field.IsStatic && field.Local.IsThis)
+                || !IsManagedReference(valueType)
+                || !MetadataResolver.IsSameType(valueType, field.Field.FieldType)
+                || CountLocalUses(graph, value) != 2
+                || graph.Instructions.Count(instruction => ReferenceEquals(instruction.Destination, value)) != 1
+                || graph.Instructions.Any(instruction => instruction.Destination is FieldReference destination
+                    && destination.Field == field.Field))
+                continue;
+
+            var uses = graph.Instructions.Where(instruction => ReadsLocal(instruction, value)).ToArray();
+            if (uses.Length < 2)
+                continue;
+
+            var nullChecks = uses.Where(instruction => instruction is
+                    { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual,
+                        Operands: [_, LocalVariable checkedValue, Immediate { Value: 0 }] }
+                    && checkedValue == value)
+                .ToArray();
+            var memberReads = uses.Where(instruction => IsInstanceMemberRead(instruction, value)).ToArray();
+            if (nullChecks.Length != 1 || memberReads.Length != 1)
+                continue;
+
+            var nullCheck = nullChecks[0];
+            var memberRead = memberReads[0];
+            var hiddenReads = uses.Where(instruction => instruction != nullCheck && instruction != memberRead).ToArray();
+            var dominates = InstructionDominates(graph, nullCheck, memberRead);
+            var safeProducer = CanRepeatFieldReadBetween(graph, producer, nullCheck);
+            var safeUse = CanRepeatFieldReadBetween(graph, nullCheck, memberRead);
+            if (nullCheck == memberRead || !dominates || !safeProducer || !safeUse
+                || hiddenReads.Any(instruction => !IsDiscardableInstanceHeaderRead(graph, instruction, value)))
+                continue;
+
+            if (!locals.TryGetValue(value, out var ilLocal)
+                || !instructionMap.TryGetValue(producer, out var producerIl)
+                || !TryGetFieldLoadExpression(field, producerIl, ilLocal, out var fieldLoads))
+                continue;
+
+            var sourceUses = new[] { nullCheck, memberRead };
+            var localLoads = sourceUses.SelectMany(use => instructionMap.TryGetValue(use, out var useIl)
+                    ? useIl.Select((instruction, index) => (UseIl: useIl, Index: index, Instruction: instruction))
+                    : [])
+                .Where(item => item.Instruction.OpCode is var opcode
+                    && (opcode == CilOpCodes.Ldloc || opcode == CilOpCodes.Ldloc_S)
+                    && ReferenceEquals(item.Instruction.Operand, ilLocal))
+                .ToArray();
+            if (localLoads.Length != sourceUses.Sum(use => CountInstructionLocalReads(use, value)))
+                continue;
+
+            foreach (var item in localLoads)
+            {
+                var bodyIndex = body.Instructions.IndexOf(item.Instruction);
+                if (bodyIndex < 0)
+                    continue;
+
+                item.Instruction.OpCode = fieldLoads[0].OpCode;
+                item.Instruction.Operand = fieldLoads[0].Operand;
+                for (var i = 1; i < fieldLoads.Length; i++)
+                {
+                    var additionalLoad = new CilInstruction(fieldLoads[i].OpCode, fieldLoads[i].Operand);
+                    body.Instructions.Insert(bodyIndex + i, additionalLoad);
+                    item.UseIl.Insert(item.Index + i, additionalLoad);
+                }
+            }
+            // A resolved ARM64 virtual call may leave an unused class-header read. It has no
+            // managed consumer after its dispatch loads have been removed by analysis.
+            foreach (var hiddenRead in hiddenReads)
+                SuppressGeneratedInstructions(hiddenRead, instructionMap);
+            SuppressGeneratedInstructions(producer, instructionMap);
+        }
+    }
+
+    private static bool TryGetFieldLoadExpression(FieldReference field, List<CilInstruction> producerIl,
+        CilLocalVariable ilLocal, out CilInstruction[] fieldLoads)
+    {
+        var fieldDescriptor = field.Field.ToFieldDescriptor();
+        fieldLoads = field.Field.IsStatic
+            ? [new CilInstruction(CilOpCodes.Ldsfld, fieldDescriptor)]
+            : [new CilInstruction(CilOpCodes.Ldarg_0), new CilInstruction(CilOpCodes.Ldfld, fieldDescriptor)];
+        var emitted = producerIl.Where(instruction => instruction.OpCode != CilOpCodes.Nop).ToArray();
+        if (emitted.Length != fieldLoads.Length + 1
+            || emitted[^1].OpCode != CilOpCodes.Stloc || emitted[^1].Operand != ilLocal)
+            return false;
+
+        for (var i = 0; i < fieldLoads.Length; i++)
+            if (emitted[i].OpCode != fieldLoads[i].OpCode || emitted[i].Operand != fieldLoads[i].Operand)
+                return false;
+        return true;
+    }
+
+    private static bool ReadsLocal(Instruction instruction, LocalVariable local)
+    {
+        var destinationIndex = instruction.DestinationOperandIndex;
+        for (var i = 0; i < instruction.Operands.Count; i++)
+        {
+            var operand = instruction.Operands[i];
+            if (i == destinationIndex && operand is LocalVariable)
+                continue;
+            if (CountLocalReads(operand, local) > 0)
+                return true;
+        }
+        return false;
+    }
+
+    private static int CountInstructionLocalReads(Instruction instruction, LocalVariable local)
+    {
+        var destinationIndex = instruction.DestinationOperandIndex;
+        var count = 0;
+        for (var i = 0; i < instruction.Operands.Count; i++)
+        {
+            var operand = instruction.Operands[i];
+            if (i != destinationIndex || operand is not LocalVariable)
+                count += CountLocalReads(operand, local);
+        }
+        return count;
+    }
+
+    private static bool IsDiscardableInstanceHeaderRead(ISILControlFlowGraph graph, Instruction instruction,
+        LocalVariable local) => instruction is
+        { OpCode: OpCode.Move, Operands: [LocalVariable { Type: RuntimeClassTypeAnalysisContext } header,
+            MemoryOperand { Base: LocalVariable receiver, Index: null, Scale: 0, Addend: 0 }] }
+        && receiver == local && CountLocalUses(graph, header) == 0;
+
+    private static bool IsInstanceMemberRead(Instruction instruction, LocalVariable local) => instruction switch
+    {
+        { OpCode: OpCode.Call, Operands: [MethodAnalysisContext { IsStatic: false }, _, LocalVariable receiver, ..] }
+            => receiver == local,
+        { OpCode: OpCode.CallVoid, Operands: [MethodAnalysisContext { IsStatic: false }, LocalVariable receiver, ..] }
+            => receiver == local,
+        { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.IsStatic: false, Local: var receiver }] }
+            => receiver == local,
+        _ => false
+    };
+
+    private static bool CanRepeatFieldReadBetween(ISILControlFlowGraph graph, Instruction producer,
+        Instruction use)
+    {
+        Block? producerBlock = null;
+        Block? useBlock = null;
+        var producerIndex = -1;
+        var useIndex = -1;
+        foreach (var block in graph.Blocks)
+        {
+            var index = block.Instructions.IndexOf(producer);
+            if (index >= 0)
+                (producerBlock, producerIndex) = (block, index);
+            index = block.Instructions.IndexOf(use);
+            if (index >= 0)
+                (useBlock, useIndex) = (block, index);
+        }
+        if (producerBlock == null || useBlock == null || producerIndex < 0 || useIndex < 0)
+            return false;
+
+        var canReachUse = new HashSet<Block> { useBlock };
+        var reverse = new Stack<Block>();
+        reverse.Push(useBlock);
+        while (reverse.Count > 0)
+        {
+            var block = reverse.Pop();
+            foreach (var predecessor in block.Predecessors)
+                if (canReachUse.Add(predecessor))
+                    reverse.Push(predecessor);
+        }
+
+        var active = new HashSet<Block>();
+        var completed = new HashSet<Block>();
+        return CheckPath(producerBlock, producerIndex + 1);
+
+        bool CheckPath(Block block, int startIndex)
+        {
+            if (block == useBlock)
+                return useIndex >= startIndex
+                    && block.Instructions.Skip(startIndex).Take(useIndex - startIndex)
+                        .All(IsSafeBetweenFieldReads);
+            if (completed.Contains(block))
+                return true;
+            if (!active.Add(block))
+                return false;
+
+            if (block.Instructions.Skip(startIndex).Any(instruction => !IsSafeBetweenFieldReads(instruction)))
+                return false;
+
+            var successors = block.Successors.Where(canReachUse.Contains).ToArray();
+            if (successors.Length == 0 || successors.Any(successor => !CheckPath(successor, 0)))
+                return false;
+
+            active.Remove(block);
+            completed.Add(block);
+            return true;
+        }
+    }
+
+    private static bool InstructionDominates(ISILControlFlowGraph graph, Instruction first, Instruction second)
+    {
+        Block? firstBlock = null;
+        Block? secondBlock = null;
+        var firstIndex = -1;
+        var secondIndex = -1;
+        foreach (var block in graph.Blocks)
+        {
+            var index = block.Instructions.IndexOf(first);
+            if (index >= 0)
+                (firstBlock, firstIndex) = (block, index);
+            index = block.Instructions.IndexOf(second);
+            if (index >= 0)
+                (secondBlock, secondIndex) = (block, index);
+        }
+
+        if (firstBlock == null || secondBlock == null || firstIndex < 0 || secondIndex < 0)
+            return false;
+        return firstBlock == secondBlock
+            ? firstIndex < secondIndex
+            : new DominatorInfo(graph).Dominates(firstBlock, secondBlock);
+    }
+
+    private static bool IsSafeBetweenFieldReads(Instruction instruction)
+    {
+        if (instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall)
+        {
+            if (instruction.OpCode != OpCode.Call
+                || instruction.Operands.FirstOrDefault() is not MethodAnalysisContext method
+                || !InlinedFieldGetterRecovery.IsVerifiedDirectGetter(method)
+                    && !IsPrimitiveToString(method))
+                return false;
+        }
+
+        if (instruction.OpCode is OpCode.Newobj or OpCode.NewArr or OpCode.Throw or OpCode.Return or OpCode.IndirectJump
+            or OpCode.DivideUnsigned or OpCode.Modulo or OpCode.ModuloUnsigned
+            || instruction.OpCode == OpCode.Divide && !IsNonThrowingFloatDivision(instruction)
+            || instruction.Destination is FieldReference or ArrayAccess or MemoryOperand
+            || instruction.Operands.Any(operand => operand is ArrayAccess))
+            return false;
+
+        return true;
+    }
+
+    private static bool IsPrimitiveToString(MethodAnalysisContext method) =>
+        !method.IsStatic && method.Name == "ToString" && method.Parameters.Count == 0
+        && method.DeclaringType?.FullName == "System.Int32";
+
+    private static bool IsNonThrowingFloatDivision(Instruction instruction) =>
+        instruction.Destination is LocalVariable { Type.FullName: "System.Single" or "System.Double" };
 
     private static void SetRecoveredMaxStack(CilMethodBody body)
     {
@@ -454,8 +711,23 @@ public static class IlGenerator
         {
             var store = instructions[i];
             var load = instructions[i - 1];
-            if (!store.IsStloc() || reads.Contains(store.GetLocalVariable(body.LocalVariables)) || targets.Contains(store)
-                || i >= 2 && instructions[i - 2].OpCode.OpCodeType == CilOpCodeType.Prefix
+            if (!store.IsStloc() || reads.Contains(store.GetLocalVariable(body.LocalVariables)) || targets.Contains(store))
+                continue;
+
+            if (i >= 2
+                && instructions[i - 2].IsLdcI4()
+                && load.OpCode.Code is CilCode.Conv_I or CilCode.Conv_U
+                && !targets.Contains(instructions[i - 2])
+                && !targets.Contains(load))
+            {
+                instructions[i - 2].ReplaceWithNop();
+                load.ReplaceWithNop();
+                store.ReplaceWithNop();
+                removed++;
+                continue;
+            }
+
+            if (i >= 2 && instructions[i - 2].OpCode.OpCodeType == CilOpCodeType.Prefix
                 || !(load.IsLdloc() || load.IsLdarg() || load.IsLdcI4()
                     || load.OpCode.Code is CilCode.Ldc_I8 or CilCode.Ldc_R4 or CilCode.Ldc_R8 or CilCode.Ldnull))
                 continue;
@@ -529,9 +801,56 @@ public static class IlGenerator
             var isReceiver = consumer.IsCall && consumer.Operands[0] is MethodAnalysisContext { IsStatic: false }
                 && consumer.Operands.Count > ConstructorReceiverIndex(consumer)
                 && ReferenceEquals(consumer.Operands[ConstructorReceiverIndex(consumer)], localEntry.Key);
+            Func<Instruction, bool>? canCross = isReceiver
+                ? candidate => IsStackNeutralArgumentProducer(candidate, consumer, instructionMap, locals)
+                : candidate => IsStackNeutralThisFieldRead(candidate, instructionMap, locals);
             InlineSingleUseTemporary(block, consumerIndex, consumer, localEntry.Key, graph, instructionMap, locals,
-                isReceiver ? candidate => IsStackNeutralArgumentProducer(candidate, consumer, instructionMap, locals) : null);
+                canCross);
             return;
+        }
+    }
+
+    private static bool IsStackNeutralThisFieldRead(Instruction candidate,
+        Dictionary<Instruction, List<CilInstruction>> instructionMap,
+        Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        if (candidate is not { OpCode: OpCode.Move, Operands: [LocalVariable destination,
+                FieldReference { Field.IsStatic: false, Local.IsThis: true }] }
+            || !instructionMap.TryGetValue(candidate, out var emitted))
+            return false;
+
+        var meaningful = emitted.Where(instruction => instruction.OpCode != CilOpCodes.Nop).ToArray();
+        if (meaningful.Length == 0)
+            return true;
+
+        if (!locals.TryGetValue(destination, out var ilLocal))
+            return false;
+
+        return meaningful is
+            [{ OpCode: var receiverOpcode }, { OpCode: var fieldOpcode, Operand: var field },
+                { OpCode: var storeOpcode, Operand: var storedLocal }]
+            && receiverOpcode == CilOpCodes.Ldarg_0 && fieldOpcode == CilOpCodes.Ldfld
+            && field is IFieldDescriptor && storeOpcode == CilOpCodes.Stloc
+            && ReferenceEquals(storedLocal, ilLocal);
+    }
+
+    private static void RemoveDominatedStackSlotInitializers(ISILControlFlowGraph graph,
+        Dictionary<Instruction, List<CilInstruction>> instructionMap)
+    {
+        foreach (var initializer in graph.Instructions.ToArray())
+        {
+            if (initializer is not { OpCode: OpCode.Move, Operands:
+                    [LocalVariable { Register.Name: var name } local, Immediate { Value: 0 }] }
+                || !name.StartsWith("stack_", StringComparison.Ordinal))
+                continue;
+
+            var uses = graph.Instructions.Where(instruction => ReadsLocal(instruction, local)).ToArray();
+            if (!graph.Instructions.Any(definition => definition != initializer
+                    && ReferenceEquals(definition.Destination, local)
+                    && uses.All(use => InstructionDominates(graph, definition, use))))
+                continue;
+
+            SuppressGeneratedInstructions(initializer, instructionMap);
         }
     }
 
@@ -1417,6 +1736,9 @@ public static class IlGenerator
                                 instructions.Add(CilOpCodes.Conv_I4);
                                 break;
                             case NumericConversionKind.I64ExtendI32Signed:
+                                // ARM64 W registers share storage with X registers in ISIL.
+                                // Narrow first so stale upper bits cannot change the sign.
+                                instructions.Add(CilOpCodes.Conv_I4);
                                 instructions.Add(CilOpCodes.Conv_I8);
                                 break;
                             case NumericConversionKind.I64ExtendI32Unsigned:
@@ -1559,7 +1881,8 @@ public static class IlGenerator
                     // the constructor declares (i.e. drop methodInfo)
                     var constructorArgs = constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1).Take(constructor.Parameters.Count).ToList();
 
-                    if (IsDelegateConstructor(constructor) && constructorArgs.Count == 2)
+                    var isDelegateConstructor = IsDelegateConstructor(constructor);
+                    if (isDelegateConstructor && constructorArgs.Count == 2)
                     {
                         if (instruction.Operands[1] is GenericInstanceTypeAnalysisContext allocatedDelegate
                             && MatchesDelegateAllocation(constructor, allocatedDelegate)
@@ -1589,12 +1912,14 @@ public static class IlGenerator
                         }
                     }
 
-                    if (IsDelegateConstructor(constructor) && constructorArgs is
-                        [var receiver, RuntimeMethodInfoAnalysisContext { IsVirtualDelegateTarget: true } virtualTarget])
+                    if (isDelegateConstructor && constructorArgs is [var receiver, RuntimeMethodInfoAnalysisContext binding])
                     {
+                        // A proven delegate binding uses a managed method token even on ARM64.
                         LoadOperand(receiver, method, locals, writeLine, constructor.Parameters[0].ParameterType);
-                        instructions.Add(CilOpCodes.Dup);
-                        instructions.Add(CilOpCodes.Ldvirtftn, virtualTarget.RepresentedMethod.ToMethodDescriptor());
+                        if (binding.IsVirtualDelegateTarget)
+                            instructions.Add(CilOpCodes.Dup);
+                        instructions.Add(binding.IsVirtualDelegateTarget ? CilOpCodes.Ldvirtftn : CilOpCodes.Ldftn,
+                            binding.RepresentedMethod.ToMethodDescriptor());
                     }
                     else
                     {
@@ -1650,6 +1975,13 @@ public static class IlGenerator
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
+            case OpCode.IsInstance:
+                var targetType = (TypeAnalysisContext)instruction.Operands[2];
+                LoadOperand(instruction.Operands[1], method, locals, writeLine, context.AppContext.SystemTypes.SystemObjectType);
+                instructions.Add(CilOpCodes.Isinst, targetType.ToTypeSignature().ToTypeDefOrRef());
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
             case OpCode.Throw:
                 if (instruction.Operands is [TypeAnalysisContext exceptionType]
                     && exceptionType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0) is { } exceptionCtor)
@@ -1671,6 +2003,10 @@ public static class IlGenerator
             case OpCode.CallVoid:
                 if (instruction.Operands[0] is not MethodAnalysisContext targetMethod)
                 {
+                    if (instruction.Operands[0] is Immediate sinCosTarget
+                        && TryEmitArm64SinCos(sinCosTarget.UnsignedValue, instruction, context, method, locals, writeLine))
+                        break;
+
                     if (instruction.Operands[0] is Immediate targetAddress)
                         instructions.Add(CilOpCodes.Ldstr, $"Method not found @{targetAddress.UnsignedValue:X}");
                     else // Probably key function. Just the target, the full operand dump is huge and blows the 16MB #US heap limit
@@ -1715,8 +2051,17 @@ public static class IlGenerator
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
-                        LoadOperand(instruction.Operands[thisParamIndex], method, locals, writeLine,
-                            targetMethod.DeclaringType, isReceiver: true);
+                    {
+                        var receiver = instruction.Operands[thisParamIndex];
+                        if (instruction.ConstrainedCallType != null && receiver is LocalVariable constrainedReceiver)
+                            receiver = new AddressOf(constrainedReceiver);
+
+                        if (IsOptimizedCurrentInstanceReceiver(receiver, context, targetMethod))
+                            instructions.Add(CilOpCodes.Ldarg_0);
+                        else
+                            LoadOperand(receiver, method, locals, writeLine,
+                                targetMethod.DeclaringType, isReceiver: true);
+                    }
                     else
                     {
                         instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Non static method called without 'this' param ({instruction})"));
@@ -1751,6 +2096,9 @@ public static class IlGenerator
                         PushDefaultOf(parameterType, method);
                     }
                 }
+
+                if (instruction.ConstrainedCallType is { } constrainedCallType)
+                    instructions.Add(CilOpCodes.Constrained, constrainedCallType.ToTypeSignature().ToTypeDefOrRef());
 
                 instructions.Add(instruction.NullCheckReceiver ? CilOpCodes.Callvirt : CilOpCodes.Call, importedMethod);
 
@@ -1874,7 +2222,8 @@ public static class IlGenerator
 
                 // klass pointer read => GetType
                 if (instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual
-                    && TryEmitExactTypeComparison(instruction, method, locals, writeLine))
+                    && (TryEmitExactTypeComparison(instruction, method, locals, writeLine)
+                        || TryEmitOverloadedReferenceEquals(instruction, context, method, locals, writeLine)))
                     break;
 
                 var leftOperand = instruction.Operands[1];
@@ -2000,6 +2349,21 @@ public static class IlGenerator
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
+            case OpCode.Select:
+            {
+                var startFalse = new CilInstruction(CilOpCodes.Nop);
+                var store = new CilInstruction(CilOpCodes.Nop);
+                var type = OperandType(instruction.Operands[0]);
+                LoadOperand(instruction.Operands[1], method, locals, writeLine, context.AppContext.SystemTypes.SystemBooleanType);
+                instructions.Add(CilOpCodes.Brfalse, new CilInstructionLabel(startFalse));
+                LoadOperand(instruction.Operands[2], method, locals, writeLine, type);
+                instructions.Add(CilOpCodes.Br, new CilInstructionLabel(store));
+                instructions.Add(startFalse);
+                LoadOperand(instruction.Operands[3], method, locals, writeLine, type);
+                instructions.Add(store);
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+            }
             case OpCode.Not:
             case OpCode.Negate:
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, OperandType(instruction.Operands[0]));
@@ -2111,6 +2475,31 @@ public static class IlGenerator
         ReferenceEquals(first, second)
         || first.FullName == second.FullName
         && first.DeclaringAssembly.CleanAssemblyName == second.DeclaringAssembly.CleanAssemblyName;
+
+    private static bool IsOptimizedCurrentInstanceReceiver(IOperand receiver,
+        MethodAnalysisContext caller, MethodAnalysisContext target)
+    {
+        if (receiver is not TypeAnalysisContext receiverType
+            || receiverType is RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
+                or RuntimeFieldInfoAnalysisContext or RgctxTableTypeAnalysisContext
+                or MethodRgctxTableTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext
+            || caller.IsStatic
+            || caller.DeclaringType is not { } callerType
+            || target.DeclaringType is not { } targetType
+            || !SameType(receiverType, targetType))
+            return false;
+
+        // IL2CPP can leave a class metadata pointer in the receiver register when an
+        // instance method never reads `this`. In that case, use the caller's live `this`
+        // only when it is assignable to the target method's declaring type.
+        for (var current = callerType; current != null; current = current.BaseType)
+        {
+            if (SameType(current, targetType))
+                return true;
+        }
+
+        return false;
+    }
 
     private static int ConstructorReceiverIndex(Instruction constructorCall) => constructorCall.OpCode == OpCode.CallVoid ? 1 : 2;
 
@@ -2366,6 +2755,14 @@ public static class IlGenerator
 
         var module = method.DeclaringModule!;
 
+        // An unconstrained T can be either a value or reference type. Native zero in a
+        // generic value slot therefore means default(T), not an object null literal.
+        if (expectedType is GenericParameterTypeAnalysisContext genericType && IsZeroConstant(operand))
+        {
+            PushDefaultOf(genericType, method);
+            return;
+        }
+
         // A null reference reaches us as an integer zero, which would otherwise be emitted as a literal 0
         // and read back as a cast from a number.
         if (expectedType is { IsValueType: false } && IsZeroConstant(operand))
@@ -2480,6 +2877,11 @@ public static class IlGenerator
                 break;
             case LocalVariable local:
                 LoadLocal(local, method, locals);
+                if (expectedType is GenericParameterTypeAnalysisContext expectedGeneric
+                    && local.Type is { IsValueType: false } sourceType
+                    && !MetadataResolver.IsSameType(sourceType, expectedGeneric))
+                    instructions.Add(CilOpCodes.Unbox_Any,
+                        expectedGeneric.ToTypeSignature().ToTypeDefOrRef());
                 break;
             case AddressOf { Target: LocalVariable addressed } when !isReceiver
                 && expectedType is { IsValueType: true } and not ByRefTypeAnalysisContext
@@ -2532,8 +2934,17 @@ public static class IlGenerator
             case ArrayAccess arrayAccess:
                 LoadLocal(arrayAccess.Array, method, locals);
                 LoadOperand(arrayAccess.Index, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Ldelem,
-                    ((SzArrayTypeAnalysisContext)arrayAccess.Array.Type!).ElementType.ToTypeSignature().ToTypeDefOrRef());
+                var elementType = ((SzArrayTypeAnalysisContext)arrayAccess.Array.Type!).ElementType;
+                instructions.Add(CilOpCodes.Ldelem, elementType.ToTypeSignature().ToTypeDefOrRef());
+                if (elementType is GenericParameterTypeAnalysisContext genericElement
+                    && expectedType is { IsValueType: false } expectedReferenceType
+                    && !MetadataResolver.IsSameType(genericElement, expectedReferenceType))
+                {
+                    instructions.Add(CilOpCodes.Box, genericElement.ToTypeSignature().ToTypeDefOrRef());
+                    if (expectedReferenceType.FullName != "System.Object")
+                        instructions.Add(CilOpCodes.Castclass,
+                            expectedReferenceType.ToTypeSignature().ToTypeDefOrRef());
+                }
                 break;
             case FieldReference field:
                 if (StringLengthGetter(field.Field) is { } stringLengthGetter)
@@ -2586,7 +2997,6 @@ public static class IlGenerator
                 }
                 break;
             case RuntimeMethodInfoAnalysisContext runtimeMethod:
-                // A delegate constructor takes its target as a native pointer, which is exactly ldftn.
                 if (expectedType?.FullName == "System.IntPtr")
                 {
                     var targetPointer = GetNativeMethodPointer(runtimeMethod.RepresentedMethod);
@@ -2702,6 +3112,60 @@ public static class IlGenerator
 
         StoreToOperand(instruction.Operands[0], method, locals, writeLine);
         return true;
+    }
+
+    private static bool TryEmitOverloadedReferenceEquals(Instruction instruction, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        var left = instruction.Operands[1];
+        var right = instruction.Operands[2];
+        IOperand value;
+        TypeAnalysisContext? valueType;
+
+        if (IsZeroConstant(left) && (valueType = ReferenceComparisonType(right)) != null)
+            value = right;
+        else if (IsZeroConstant(right) && (valueType = ReferenceComparisonType(left)) != null)
+            value = left;
+        else
+            return false;
+
+        if (!HasOverloadedReferenceEquality(valueType))
+            return false;
+
+        // Keep the native reference comparison semantics while avoiding a cast that only
+        // exists to suppress a class's overloaded == / != operators in generated C#.
+        var factory = method.DeclaringModule!.CorLibTypeFactory;
+        var objectType = factory.CorLibScope.CreateTypeReference("System", "Object");
+        var referenceEquals = objectType.CreateMemberReference("ReferenceEquals", MethodSignature.CreateStatic(
+            factory.Boolean, [factory.Object, factory.Object]));
+
+        LoadOperand(value, method, locals, writeLine, context.AppContext.SystemTypes.SystemObjectType);
+        method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldnull);
+        method.CilMethodBody.Instructions.Add(CilOpCodes.Call, referenceEquals);
+
+        if (instruction.OpCode == OpCode.CheckNotEqual)
+        {
+            method.CilMethodBody.Instructions.Add(CilOpCodes.Ldc_I4_0);
+            method.CilMethodBody.Instructions.Add(CilOpCodes.Ceq);
+        }
+
+        StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+        return true;
+    }
+
+    private static bool HasOverloadedReferenceEquality(TypeAnalysisContext? type)
+    {
+        var visited = new HashSet<TypeAnalysisContext>();
+        for (var current = type; current != null && visited.Add(current); current = current.BaseType)
+        {
+            if (current is { FullName: "UnityEngine.Object", DeclaringAssembly.CleanAssemblyName: "UnityEngine.CoreModule" or "UnityEngine" }
+                || current.Methods.Any(method => method is
+                    { Name: "op_Equality" or "op_Inequality", IsStatic: true, ReturnType.FullName: "System.Boolean", Parameters.Count: 2 }
+                    && method.Parameters.Any(parameter => ReferenceEquals(parameter.ParameterType, current))))
+                return true;
+        }
+
+        return false;
     }
 
     private static bool IsKlassPointerLoad(IOperand operand, out LocalVariable local)
@@ -3109,5 +3573,46 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Pop);
                 break;
         }
+    }
+
+    private static bool TryEmitArm64SinCos(ulong target, Instruction call, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        if (context.AppContext.Binary is not LibMC2IL.Elf.ElfFile elf)
+            return false;
+
+        var import = elf.GetArm64PltImport(target);
+        if (import is not ("sincosf" or "sincos") || call.Operands.Count < 18)
+            return false;
+
+        var typeName = import == "sincosf" ? "System.Single" : "System.Double";
+
+        // The AArch64 C ABI passes the two output pointers in X0/X1 and the
+        // scalar angle in V0. Unknown calls retain all eight integer and FP
+        // argument registers after the call result.
+        var sineOutput = call.Operands[2] is AddressOf { Target: var sineLocation } ? sineLocation : null;
+        var cosineOutput = call.Operands[3] is AddressOf { Target: var cosineLocation } ? cosineLocation : null;
+        var angle = call.Operands[10]; // 2 call operands + 8 integer argument registers
+        if (sineOutput is not (LocalVariable or FieldReference or ArrayAccess)
+            || cosineOutput is not (LocalVariable or FieldReference or ArrayAccess)
+            || OperandType(sineOutput)?.FullName != typeName
+            || OperandType(cosineOutput)?.FullName != typeName
+            || OperandType(angle)?.FullName != typeName)
+            return false;
+
+        var sine = NewArmV8InstructionSet.FindFloatMathMethod(context.AppContext, typeName, "Sin", 1);
+        var cosine = NewArmV8InstructionSet.FindFloatMathMethod(context.AppContext, typeName, "Cos", 1);
+        if (sine == null || cosine == null)
+            return false;
+
+        var instructions = method.CilMethodBody!.Instructions;
+        LoadOperand(angle, method, locals, writeLine, sine.Parameters[0].ParameterType);
+        instructions.Add(CilOpCodes.Call, sine.ToMethodDescriptor());
+        StoreToOperand(sineOutput, method, locals, writeLine);
+
+        LoadOperand(angle, method, locals, writeLine, cosine.Parameters[0].ParameterType);
+        instructions.Add(CilOpCodes.Call, cosine.ToMethodDescriptor());
+        StoreToOperand(cosineOutput, method, locals, writeLine);
+        return true;
     }
 }

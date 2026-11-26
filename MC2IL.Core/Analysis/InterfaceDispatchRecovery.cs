@@ -62,7 +62,8 @@ public static class InterfaceDispatchRecovery
         Instruction InvokeDataPhi,
         Block Merge,
         Instruction SlowCall,
-        LocalVariable KlassLocal);
+        LocalVariable KlassLocal,
+        TypeAnalysisContext? ConstrainedReceiverType);
 
     private static Match? MatchDispatch(MethodAnalysisContext method, Instruction dispatch, Dictionary<LocalVariable, Instruction> definitions, Dictionary<Instruction, Block> homeBlock)
     {
@@ -92,31 +93,66 @@ public static class InterfaceDispatchRecovery
         if (slowCall is not { Operands: [Immediate, _, _, LocalVariable interfaceArg, LocalVariable slotArg, ..] })
             return null;
 
-        if (ChaseCopies(definitions, interfaceArg) is not { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext declaringInterface] })
-            return null;
-
-        if (declaringInterface is RuntimeMethodInfoAnalysisContext
-            || !(declaringInterface is GenericInstanceTypeAnalysisContext { GenericType.IsInterface: true } || declaringInterface.IsInterface))
-            return null;
-
         if (ChaseCopies(definitions, slotArg) is not { OpCode: OpCode.Move, Operands: [_, Immediate slotImmediate] }
             || slotImmediate.Value is < 0 or > ushort.MaxValue)
             return null;
 
         var slot = (int)slotImmediate.Value;
 
+        var declaringInterface = ChaseCopies(definitions, interfaceArg) is
+            { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext resolvedInterface] }
+            ? resolvedInterface
+            : null;
+
+        // Generic interface handles often flow through an RGCTX phi instead of a literal
+        // `TypeAnalysisContext`. In that case, the constrained generic parameter identifies
+        // the interface whose slot the native dispatch is resolving.
+        var genericParameters = method.GenericParameters.Cast<GenericParameterTypeAnalysisContext>()
+            .Concat(method.DeclaringType?.GenericParameters ?? [])
+            .ToArray();
+
+        var matchingConstraints = genericParameters
+            .SelectMany(parameter => parameter.ConstraintTypes
+                .Where(type => IsInterfaceType(type)
+                    && ResolveInterfaceSlot(type, slot) != null
+                    && (declaringInterface == null || MetadataResolver.IsSameType(type, declaringInterface)))
+                .Select(type => (Interface: type, Receiver: (TypeAnalysisContext)parameter)))
+            .ToArray();
+
+        var inferredInterfaceFromConstraint = !IsInterfaceType(declaringInterface);
+        if (inferredInterfaceFromConstraint)
+        {
+            var candidates = matchingConstraints.Select(candidate => candidate.Interface).Distinct().ToArray();
+            declaringInterface = candidates.Length == 1 ? candidates[0] : null;
+        }
+
+        if (!IsInterfaceType(declaringInterface))
+            return null;
+
+        var constrainedReceiverTypes = matchingConstraints
+            .Where(candidate => MetadataResolver.IsSameType(candidate.Interface, declaringInterface!))
+            .Select(candidate => candidate.Receiver)
+            .Distinct()
+            .ToArray();
+        var constrainedReceiverType = inferredInterfaceFromConstraint && constrainedReceiverTypes.Length == 1
+            ? constrainedReceiverTypes[0]
+            : null;
+
         // fast path computes klass + vtableOffset + ((entryOffset + slot) << 4) (the +slot folds away for slot 0)
         var vtableOffset = Il2CppClassUsefulOffsets.GetVtableOffset(method.AppContext.MetadataVersion, is32Bit: false);
         if (MatchVTableEntryChain(definitions, vtableEntry, slot, vtableOffset) is not { } klassLocal)
             return null;
 
-        if (ResolveInterfaceSlot(declaringInterface, slot) is not { } resolved)
+        if (ResolveInterfaceSlot(declaringInterface!, slot) is not { } resolved)
             return null;
 
         if (!homeBlock.TryGetValue(phi, out var merge))
             return null;
 
-        return new Match(resolved, phi, merge, slowCall, klassLocal);
+        return new Match(resolved, phi, merge, slowCall, klassLocal, constrainedReceiverType);
+
+        static bool IsInterfaceType(TypeAnalysisContext? type) => type is not RuntimeMethodInfoAnalysisContext
+            && (type is GenericInstanceTypeAnalysisContext { GenericType.IsInterface: true } || type?.IsInterface == true);
     }
 
     private static LocalVariable? MatchVTableEntryChain(Dictionary<LocalVariable, Instruction> definitions,
@@ -237,7 +273,15 @@ public static class InterfaceDispatchRecovery
 
         dispatch.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
         dispatch.NullCheckReceiver = true;
+        dispatch.ConstrainedCallType = match.ConstrainedReceiverType;
         callingConventions?.RemapRawArguments(dispatch, resolved, method);
+
+        if (match.ConstrainedReceiverType is { } constrainedReceiverType
+            && dispatch.Operands[(dispatch.OpCode == OpCode.CallVoid ? 1 : 2)] is LocalVariable receiver
+            && (receiver.Type == null
+                || receiver.Type.FullName == "System.Object"
+                || resolved.DeclaringType is { } interfaceType && MetadataResolver.IsSameType(receiver.Type, interfaceType)))
+            receiver.Type = constrainedReceiverType;
 
         // name [phi+8] as the hidden MethodInfo param, like ResolveVirtualCalls. A tail call's target
         // register doubles as an argument slot, so a stale [phi] load can turn up as an argument too,

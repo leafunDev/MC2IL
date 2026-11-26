@@ -23,6 +23,12 @@ internal static class Arm64ReferenceCastRecovery
         var changed = false;
         foreach (var guard in graph.Blocks)
         {
+            if (TryRecoverReceiverCast(graph, guard))
+            {
+                changed = true;
+                continue;
+            }
+
             if (guard.BlockType != BlockType.TwoWay
                 || guard.Instructions.Where(IsOperation).ToArray() is not [.., var nullTest, var branch]
                 || nullTest.Operands is not [LocalVariable, LocalVariable { Type: { } sourceType } value, Immediate { Value: 0 }]
@@ -85,6 +91,70 @@ internal static class Arm64ReferenceCastRecovery
             graph.RemoveUnreachableBlocks();
             DeadCodeEliminator.Run(graph);
         }
+    }
+
+    private static bool TryRecoverReceiverCast(ISILControlFlowGraph graph, Block guard)
+    {
+        if (guard.BlockType != BlockType.TwoWay
+            || guard.Instructions.Where(IsOperation).ToArray() is not [.., var nullTest, var nullBranch]
+            || nullTest.Operands is not [LocalVariable nullCondition, LocalVariable { Type: { } sourceType } value, Immediate { Value: 0 }]
+            || !IlGenerator.IsManagedReference(sourceType)
+            || !TryGetEdges(guard, nullTest, nullBranch, out var nullEdge, out var nonNullEdge)
+            || SkipForwarders(nullEdge, guard, out _).Instructions.Where(IsOperation).ToArray() is not
+                [{ OpCode: OpCode.Throw, Operands: [TypeAnalysisContext { FullName: "System.NullReferenceException" }] }])
+            return false;
+
+        var check = SkipForwarders(nonNullEdge, guard, out var checkPredecessor);
+        if (check.Predecessors is not [var entry] || entry != checkPredecessor
+            || check.Instructions.Where(IsOperation).ToArray() is not
+                [{ OpCode: OpCode.IsInst, Operands: [LocalVariable castResult, TypeAnalysisContext targetType, LocalVariable castSource] } cast,
+                    var typeTest, var typeBranch]
+            || castSource != value || castResult == value || !MetadataResolver.IsSameType(castResult.Type, targetType)
+            || !IlGenerator.IsManagedReference(targetType)
+            || typeTest.Operands is not [LocalVariable typeCondition, LocalVariable tested, Immediate { Value: 0 }] || tested != castResult
+            || !TryGetEdges(check, typeTest, typeBranch, out var invalidEdge, out var successEdge)
+            || SkipForwarders(invalidEdge, check, out _).Instructions.Where(IsOperation).ToArray() is not [var thrown]
+            || !IsInvalidCastThrow(thrown))
+            return false;
+
+        var success = SkipForwarders(successEdge, check, out var successPredecessor);
+        if (success.Predecessors is not [var successEntry] || successEntry != successPredecessor
+            || success.Instructions.FirstOrDefault(IsOperation) is not { IsCall: true } call
+            || call.Operands[0] is not MethodAnalysisContext { IsStatic: false, DeclaringType: { IsValueType: false } owner } method
+            || !MetadataResolver.IsSameType(owner, targetType) || method.Name == ".ctor"
+            || call.OpCode == OpCode.Call && call.Destination is not LocalVariable
+            || !call.NullCheckReceiver && method.IsVirtual && !method.IsFinal && !owner.IsSealed)
+            return false;
+
+        var receiverIndex = call.OpCode == OpCode.CallVoid ? 1 : 2;
+        if (call.Operands.Count <= receiverIndex + method.Parameters.Count || call.Operands[receiverIndex] != value
+            || call.Operands.Skip(receiverIndex + 1).Take(method.Parameters.Count)
+                .Any(argument => argument is not (LocalVariable or Immediate or StringLiteral or FloatLiteral or DoubleLiteral)))
+            return false;
+
+        // The native isinst result belongs only to the guard. Materialize a cast
+        // at the call so it cannot affect the reader calls or other argument evaluation.
+        if (graph.Instructions.Any(instruction => instruction != typeTest && instruction != typeBranch && instruction != nullBranch
+                && DeadCodeEliminator.UsedLocals(instruction).Any(local => local == castResult || local == nullCondition || local == typeCondition)))
+            return false;
+
+        check.Instructions.Remove(cast);
+        cast.OpCode = OpCode.CastClass;
+        cast.OperandWidth = null;
+        success.Instructions.Insert(success.Instructions.IndexOf(call), cast);
+        call.SetOperand(receiverIndex, castResult);
+        call.NullCheckReceiver = true;
+        RemoveGuard(graph, guard, nullBranch, nonNullEdge, nullEdge);
+        RemoveGuard(graph, check, typeBranch, successEdge, invalidEdge);
+        return true;
+    }
+
+    private static void RemoveGuard(ISILControlFlowGraph graph, Block guard, Instruction branch, Block success, Block failure)
+    {
+        branch.OpCode = OpCode.Jump;
+        branch.SetOperands(success);
+        graph.RemoveEdge(guard, failure);
+        guard.CalculateBlockType();
     }
 
     private static bool MatchesDuplicateStore(Block success, Block predecessor, Block failure, Block nullStore,
