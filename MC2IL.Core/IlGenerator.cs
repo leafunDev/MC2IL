@@ -211,9 +211,15 @@ public static class IlGenerator
                 InlineReferenceComparisonInputs(block, i, graph, instructionMap, inlineLocals, body);
                 // Keep the field and ldlen together so the comparison can inline the full expression.
                 InlineSingleUseArrayLengthReceiver(block, i, graph, instructionMap, inlineLocals, body);
+                var vectorOperator = block.Instructions[i] is { IsCall: true, Operands:
+                    [MethodAnalysisContext { IsStatic: true, Name: "op_Multiply" or "op_Addition" or "op_Subtraction" } op, ..] }
+                    && UnityVectorArithmeticRecovery.IsVector(op.DeclaringType);
+                if (vectorOperator && !InlineVectorOperands(block, i, graph, instructionMap, inlineLocals, body))
+                    InlineSingleUseCallArguments(block, i, graph, instructionMap, inlineLocals, body);
                 InlineSingleUseFirstInput(block, i, graph, instructionMap, inlineLocals);
                 InlineSingleUseComparisonInput(block, i, graph, instructionMap, inlineLocals, body);
-                InlineSingleUseCallArguments(block, i, graph, instructionMap, inlineLocals, body);
+                if (!vectorOperator)
+                    InlineSingleUseCallArguments(block, i, graph, instructionMap, inlineLocals, body);
                 if (fieldReadLocals != null)
                     InlineSingleUseFieldReceiver(block, i, graph, fieldReadLocals, instructionMap, inlineLocals, body);
                 InlineSingleUseLogArgument(block, i, graph, instructionMap, inlineLocals);
@@ -354,7 +360,9 @@ public static class IlGenerator
             var generated = pair.Value;
             if (source is not { OpCode: OpCode.Move, Operands: [LocalVariable destination, var value] }
                 || !locals.TryGetValue(destination, out var cilLocal)
-                || readLocals.Contains(cilLocal))
+                || readLocals.Contains(cilLocal)
+                // Stack forwarding can remove the store while its value is still consumed.
+                || !generated.Any(i => i.OpCode == CilOpCodes.Stloc && ReferenceEquals(i.Operand, cilLocal)))
                 continue;
 
             var pureValue = value is LocalVariable or Immediate or StringLiteral or FloatLiteral or DoubleLiteral or TypeAnalysisContext;
@@ -885,14 +893,59 @@ public static class IlGenerator
                 || !name.StartsWith("stack_", StringComparison.Ordinal))
                 continue;
 
-            var uses = graph.Instructions.Where(instruction => ReadsLocal(instruction, local)).ToArray();
-            if (!graph.Instructions.Any(definition => definition != initializer
-                    && ReferenceEquals(definition.Destination, local)
-                    && uses.All(use => InstructionDominates(graph, definition, use))))
-                continue;
-
-            SuppressGeneratedInstructions(initializer, instructionMap);
+            if (graph.FindBlockByInstruction(initializer) is { } block
+                && IsOverwrittenBeforeRead(block, initializer, local))
+                SuppressGeneratedInstructions(initializer, instructionMap);
         }
+    }
+
+    private static bool IsOverwrittenBeforeRead(Block start, Instruction initializer, LocalVariable local)
+    {
+        var pending = new Stack<(Block Block, int Start)>();
+        var seen = new HashSet<Block>();
+        pending.Push((start, start.Instructions.IndexOf(initializer) + 1));
+        while (pending.Count != 0)
+        {
+            var (block, position) = pending.Pop();
+            for (; position < block.Instructions.Count; position++)
+            {
+                var instruction = block.Instructions[position];
+                if (instruction == initializer)
+                    continue;
+                if (WritesOutParameter(instruction, local))
+                    break;
+                if (ReadsLocal(instruction, local))
+                    return false;
+                if (ReferenceEquals(instruction.Destination, local))
+                    break;
+            }
+            if (position != block.Instructions.Count)
+                continue;
+            foreach (var successor in block.Successors)
+                if (seen.Add(successor))
+                    pending.Push((successor, 0));
+        }
+        return true;
+    }
+
+    private static bool WritesOutParameter(Instruction instruction, LocalVariable local)
+    {
+        if (!instruction.IsCall || instruction.Operands[0] is not MethodAnalysisContext target)
+            return false;
+
+        var firstParameter = (instruction.OpCode == OpCode.Call ? 2 : 1) + (target.IsStatic ? 0 : 1);
+        for (var i = 0; i < target.Parameters.Count && firstParameter + i < instruction.Operands.Count; i++)
+        {
+            var parameter = target.Parameters[i];
+            if (parameter.Attributes.HasFlag(ParameterAttributes.Out)
+                && !parameter.Attributes.HasFlag(ParameterAttributes.In)
+                && parameter.ParameterType is ByRefTypeAnalysisContext { ElementType: var type }
+                && MetadataResolver.IsSameType(type, local.Type)
+                && instruction.Operands[firstParameter + i] is AddressOf { Target: LocalVariable address }
+                && address == local)
+                return CountInstructionLocalReads(instruction, local) == 1;
+        }
+        return false;
     }
 
     private static void InlineReferenceComparisonInputs(Block block, int comparisonIndex, ISILControlFlowGraph graph,
@@ -1120,6 +1173,51 @@ public static class IlGenerator
             return;
 
         RelocateSingleUseExpression(producer, producerIl, accessIl, loadIndex, instructionMap, body);
+    }
+
+    private static bool InlineVectorOperands(Block block, int consumerIndex, ISILControlFlowGraph graph,
+        Dictionary<Instruction, List<CilInstruction>> instructionMap,
+        Dictionary<LocalVariable, CilLocalVariable> locals, CilMethodBody body)
+    {
+        var consumer = block.Instructions[consumerIndex];
+        if (consumer is not { OpCode: OpCode.Call, Operands: [_, _, LocalVariable left, LocalVariable right] }
+            || left == right || !UnityVectorArithmeticRecovery.IsVector(left.Type) || right.Type != left.Type
+            || !locals.TryGetValue(left, out var leftSlot) || !locals.TryGetValue(right, out var rightSlot)
+            || CountLocalUses(graph, left) != 1 || CountLocalUses(graph, right) != 1
+            || !instructionMap.TryGetValue(consumer, out var consumerIl)
+            || consumerIl.Count < 2 || consumerIl[0].OpCode != CilOpCodes.Ldloc || consumerIl[0].Operand != leftSlot
+            || consumerIl[1].OpCode != CilOpCodes.Ldloc || consumerIl[1].Operand != rightSlot
+            || !TryFindSingleUseProducer(block, consumerIndex, right, out _, out _, out var rightProducer))
+            return false;
+
+        var intervening = new List<Instruction>();
+        if (!TryFindSingleUseProducer(block, consumerIndex, left, out _, out _, out var leftProducer, candidate =>
+            {
+                if (!candidate.IsFallThrough || intervening.Count >= 32 || !instructionMap.ContainsKey(candidate))
+                    return false;
+                intervening.Add(candidate);
+                return true;
+            })
+            || intervening.Count == 0 || intervening[0] != rightProducer
+            || !instructionMap.TryGetValue(leftProducer, out var leftIl)
+            || leftIl.Count == 0 || leftIl[^1].OpCode != CilOpCodes.Stloc || leftIl[^1].Operand != leftSlot
+            || !instructionMap.TryGetValue(rightProducer, out var rightIl)
+            || rightIl.Count == 0 || rightIl[^1].OpCode != CilOpCodes.Stloc || rightIl[^1].Operand != rightSlot)
+            return false;
+
+        // Walk only single-entry edges and prove the entire right expression is
+        // independent. The already evaluated left value can stay under it on the stack.
+        intervening.Reverse();
+        var rightExpression = intervening.SelectMany(operation => instructionMap[operation]).ToList();
+        if (rightExpression.LastOrDefault() != rightIl[^1] || !ProducesStandaloneStackValue(rightExpression, body))
+            return false;
+
+        foreach (var instruction in new[] { leftIl[^1], rightIl[^1], consumerIl[0], consumerIl[1] })
+        {
+            instruction.OpCode = CilOpCodes.Nop;
+            instruction.Operand = null;
+        }
+        return true;
     }
 
     private static void InlineSingleUseFieldReceiver(Block block, int consumerIndex, ISILControlFlowGraph graph,
